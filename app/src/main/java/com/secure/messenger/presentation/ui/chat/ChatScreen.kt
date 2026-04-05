@@ -69,7 +69,7 @@ import com.secure.messenger.utils.isSameDay
 @Composable
 fun ChatScreen(
     onBack: () -> Unit,
-    onCallClick: (userId: String, isVideo: Boolean) -> Unit,
+    onCallClick: (userId: String, isVideo: Boolean, peerName: String) -> Unit,
     viewModel: ChatViewModel = hiltViewModel(),
 ) {
     val messages by viewModel.messages.collectAsStateWithLifecycle()
@@ -98,6 +98,7 @@ fun ChatScreen(
         topBar = {
             ChatTopBar(
                 chatInfo = chatInfo,
+                currentUserId = currentUserId,
                 onBack = onBack,
                 onCallClick = onCallClick,
             )
@@ -141,9 +142,15 @@ fun ChatScreen(
 @Composable
 private fun ChatTopBar(
     chatInfo: Chat?,
+    currentUserId: String?,
     onBack: () -> Unit,
-    onCallClick: (userId: String, isVideo: Boolean) -> Unit,
+    onCallClick: (userId: String, isVideo: Boolean, peerName: String) -> Unit,
 ) {
+    // Для прямого чата — собеседник это участник, который не является текущим пользователем
+    val peer = chatInfo?.members?.firstOrNull { it.id != currentUserId }
+    val peerId   = peer?.id ?: ""
+    val peerName = chatInfo?.title ?: peer?.displayName ?: ""
+
     CompactTopBar(
         navigationIcon = {
             IconButton(onClick = onBack) {
@@ -183,11 +190,13 @@ private fun ChatTopBar(
             }
         },
         actions = {
-            IconButton(onClick = { onCallClick("other_user_id", false) }) {
-                Icon(Icons.Default.Call, "Аудиозвонок", tint = MaterialTheme.colorScheme.onPrimary)
-            }
-            IconButton(onClick = { onCallClick("other_user_id", true) }) {
-                Icon(Icons.Default.Videocam, "Видеозвонок", tint = MaterialTheme.colorScheme.onPrimary)
+            if (peerId.isNotEmpty()) {
+                IconButton(onClick = { onCallClick(peerId, false, peerName) }) {
+                    Icon(Icons.Default.Call, "Аудиозвонок", tint = MaterialTheme.colorScheme.onPrimary)
+                }
+                IconButton(onClick = { onCallClick(peerId, true, peerName) }) {
+                    Icon(Icons.Default.Videocam, "Видеозвонок", tint = MaterialTheme.colorScheme.onPrimary)
+                }
             }
         },
     )

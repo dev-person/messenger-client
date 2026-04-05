@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.CallEnd
 import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.Mic
@@ -27,7 +28,6 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -40,6 +40,7 @@ import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.secure.messenger.data.remote.webrtc.WebRtcCallState
+import com.secure.messenger.domain.model.CallState
 import com.secure.messenger.domain.model.CallType
 import com.secure.messenger.presentation.viewmodel.CallViewModel
 import io.getstream.webrtc.android.compose.VideoRenderer
@@ -47,29 +48,44 @@ import org.webrtc.RendererCommon
 
 @Composable
 fun CallScreen(
+    userId: String,
+    isVideo: Boolean,
+    peerName: String,
     onCallEnd: () -> Unit,
     viewModel: CallViewModel = hiltViewModel(),
 ) {
-    val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val uiState     by viewModel.uiState.collectAsStateWithLifecycle()
     val webRtcState by viewModel.webRtcState.collectAsStateWithLifecycle()
-    val remoteVideoTrack by viewModel.remoteVideoTrack.collectAsStateWithLifecycle()
-    val localVideoTrack by viewModel.localVideoTrack.collectAsStateWithLifecycle()
+    val remoteVideo by viewModel.remoteVideoTrack.collectAsStateWithLifecycle()
+    val localVideo  by viewModel.localVideoTrack.collectAsStateWithLifecycle()
 
-    // Закрыть экран по завершении звонка
+    // Запустить исходящий звонок один раз при открытии экрана.
+    // Для входящих звонков (RINGING) звонок уже есть в activeCall — не стартуем повторно.
+    LaunchedEffect(userId) {
+        if (userId.isNotEmpty() && uiState.call?.state != CallState.RINGING) {
+            viewModel.startCall(userId, if (isVideo) CallType.VIDEO else CallType.AUDIO)
+        }
+    }
+
+    // Закрыть экран когда звонок завершился
     LaunchedEffect(webRtcState) {
         if (webRtcState == WebRtcCallState.ENDED) onCallEnd()
     }
+
+    val isVideoCall  = uiState.call?.type == CallType.VIDEO || isVideo
+    val isRinging    = uiState.call?.state == CallState.RINGING
+    val displayName  = peerName.ifBlank { uiState.call?.callerId ?: uiState.call?.calleeId ?: "..." }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color(0xFF1A1A1A)),
     ) {
-        // Видео собеседника (на весь экран)
-        val isVideoCall = uiState.call?.type == CallType.VIDEO
-        if (isVideoCall && remoteVideoTrack != null) {
+
+        // ── Видео собеседника (на весь экран) ─────────────────────────────────
+        if (isVideoCall && remoteVideo != null) {
             VideoRenderer(
-                videoTrack = remoteVideoTrack!!,
+                videoTrack = remoteVideo!!,
                 modifier = Modifier.fillMaxSize(),
                 eglBaseContext = viewModel.webRtcManager.eglBase.eglBaseContext,
                 rendererEvents = object : RendererCommon.RendererEvents {
@@ -79,18 +95,18 @@ fun CallScreen(
             )
         }
 
-        // Своё видео (картинка в картинке, правый верхний угол)
+        // ── Своё видео (PiP, правый верхний угол) ─────────────────────────────
         AnimatedVisibility(
-            visible = isVideoCall && localVideoTrack != null && uiState.isCameraOn,
+            visible = isVideoCall && localVideo != null && uiState.isCameraOn,
             enter = fadeIn(),
             exit = fadeOut(),
             modifier = Modifier
                 .align(Alignment.TopEnd)
-                .padding(16.dp)
-                .size(120.dp, 160.dp)
+                .padding(top = 56.dp, end = 16.dp)
+                .size(110.dp, 150.dp)
                 .clip(MaterialTheme.shapes.medium),
         ) {
-            localVideoTrack?.let { track ->
+            localVideo?.let { track ->
                 VideoRenderer(
                     videoTrack = track,
                     modifier = Modifier.fillMaxSize(),
@@ -103,26 +119,25 @@ fun CallScreen(
             }
         }
 
-        // Статус звонка (поверх видео)
+        // ── Имя и статус (сверху по центру) ───────────────────────────────────
         Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
-                .padding(top = 80.dp),
+                .padding(top = 72.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Text(
-                text = uiState.call?.calleeId ?: "Unknown",
-                style = MaterialTheme.typography.titleMedium,
+                text = displayName,
+                style = MaterialTheme.typography.headlineSmall,
                 color = Color.White,
-                fontSize = 24.sp,
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = when (webRtcState) {
-                    WebRtcCallState.CALLING -> "Звоним..."
-                    WebRtcCallState.RINGING -> "Вызов..."
-                    WebRtcCallState.CONNECTING -> "Подключение..."
-                    WebRtcCallState.CONNECTED -> "Соединено"
+                text = when {
+                    isRinging -> "Входящий звонок..."
+                    webRtcState == WebRtcCallState.CALLING     -> "Вызов..."
+                    webRtcState == WebRtcCallState.CONNECTING  -> "Подключение..."
+                    webRtcState == WebRtcCallState.CONNECTED   -> "Соединено"
                     else -> ""
                 },
                 style = MaterialTheme.typography.bodyMedium,
@@ -130,61 +145,89 @@ fun CallScreen(
             )
         }
 
-        // Кнопки управления (снизу)
-        Row(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 56.dp),
-            horizontalArrangement = Arrangement.spacedBy(24.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            if (isVideoCall) {
+        // ── Управление (снизу) ────────────────────────────────────────────────
+        if (isRinging) {
+            // Входящий звонок: принять / отклонить
+            Row(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 64.dp),
+                horizontalArrangement = Arrangement.spacedBy(64.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
                 CallControlButton(
-                    icon = if (uiState.isCameraOn) Icons.Default.Videocam else Icons.Default.VideocamOff,
-                    label = if (uiState.isCameraOn) "Камера" else "Камера выкл",
+                    icon = Icons.Default.CallEnd,
+                    label = "Отклонить",
                     tint = Color.White,
-                    background = Color.White.copy(alpha = 0.2f),
-                    onClick = viewModel::toggleCamera,
+                    background = Color.Red,
+                    size = 72,
+                    onClick = {
+                        viewModel.declineCall()
+                        onCallEnd()
+                    },
                 )
                 CallControlButton(
-                    icon = Icons.Default.Cameraswitch,
-                    label = "Перевернуть",
+                    icon = Icons.Default.Call,
+                    label = "Принять",
                     tint = Color.White,
-                    background = Color.White.copy(alpha = 0.2f),
-                    onClick = viewModel::switchCamera,
+                    background = Color(0xFF1DB954),
+                    size = 72,
+                    onClick = {
+                        uiState.call?.id?.let { viewModel.acceptCall(it) }
+                    },
                 )
             }
-
-            // Mute
-            CallControlButton(
-                icon = if (uiState.isMuted) Icons.Default.MicOff else Icons.Default.Mic,
-                label = if (uiState.isMuted) "Включить микр." else "Выключить микр.",
-                tint = Color.White,
-                background = Color.White.copy(alpha = 0.2f),
-                onClick = viewModel::toggleMute,
-            )
-
-            // Громкая связь
-            CallControlButton(
-                icon = Icons.Default.VolumeUp,
-                label = "Громкая",
-                tint = if (uiState.isSpeakerOn) MaterialTheme.colorScheme.primary else Color.White,
-                background = Color.White.copy(alpha = 0.2f),
-                onClick = viewModel::toggleSpeaker,
-            )
-
-            // Завершить звонок (всегда видна)
-            CallControlButton(
-                icon = Icons.Default.CallEnd,
-                label = "Завершить",
-                tint = Color.White,
-                background = Color.Red,
-                size = 72,
-                onClick = {
-                    viewModel.hangUp()
-                    onCallEnd()
-                },
-            )
+        } else {
+            // Активный звонок: управление медиа + завершить
+            Row(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 56.dp),
+                horizontalArrangement = Arrangement.spacedBy(20.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (isVideoCall) {
+                    CallControlButton(
+                        icon = if (uiState.isCameraOn) Icons.Default.Videocam else Icons.Default.VideocamOff,
+                        label = if (uiState.isCameraOn) "Камера" else "Камера выкл",
+                        tint = Color.White,
+                        background = Color.White.copy(alpha = 0.2f),
+                        onClick = viewModel::toggleCamera,
+                    )
+                    CallControlButton(
+                        icon = Icons.Default.Cameraswitch,
+                        label = "Перевернуть",
+                        tint = Color.White,
+                        background = Color.White.copy(alpha = 0.2f),
+                        onClick = viewModel::switchCamera,
+                    )
+                }
+                CallControlButton(
+                    icon = if (uiState.isMuted) Icons.Default.MicOff else Icons.Default.Mic,
+                    label = if (uiState.isMuted) "Включить микр." else "Выкл. микр.",
+                    tint = Color.White,
+                    background = Color.White.copy(alpha = 0.2f),
+                    onClick = viewModel::toggleMute,
+                )
+                CallControlButton(
+                    icon = Icons.Default.VolumeUp,
+                    label = "Громкая",
+                    tint = if (uiState.isSpeakerOn) MaterialTheme.colorScheme.primary else Color.White,
+                    background = Color.White.copy(alpha = 0.2f),
+                    onClick = viewModel::toggleSpeaker,
+                )
+                CallControlButton(
+                    icon = Icons.Default.CallEnd,
+                    label = "Завершить",
+                    tint = Color.White,
+                    background = Color.Red,
+                    size = 72,
+                    onClick = {
+                        viewModel.hangUp()
+                        onCallEnd()
+                    },
+                )
+            }
         }
     }
 }

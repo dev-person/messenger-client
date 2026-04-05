@@ -77,21 +77,33 @@ class WebRtcManager @Inject constructor(
     private val _localVideoTrack = MutableStateFlow<VideoTrack?>(null)
     val localVideoTrackFlow: StateFlow<VideoTrack?> = _localVideoTrack.asStateFlow()
 
+    private var factoryInitialized = false
+
+    // Signaling listener starts immediately on construction so that incoming
+    // offers are buffered even before the user initiates or accepts a call.
+    init {
+        listenToSignalingEvents()
+    }
+
     // ── Initialisation ────────────────────────────────────────────────────────
 
-    fun initialize() {
+    /**
+     * Lazily initialises [PeerConnectionFactory] on first call.
+     * Must be called on the thread that owns the EGL context (any thread is fine
+     * for the factory itself; EGL context is created once in [eglBase]).
+     */
+    private fun ensureFactoryInitialized() {
+        if (factoryInitialized) return
         PeerConnectionFactory.initialize(
             PeerConnectionFactory.InitializationOptions.builder(context)
                 .setEnableInternalTracer(false)
                 .createInitializationOptions()
         )
-
         peerConnectionFactory = PeerConnectionFactory.builder()
             .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true))
             .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglBase.eglBaseContext))
             .createPeerConnectionFactory()
-
-        listenToSignalingEvents()
+        factoryInitialized = true
     }
 
     // ── Signaling listener ────────────────────────────────────────────────────
@@ -113,6 +125,7 @@ class WebRtcManager @Inject constructor(
     // ── Outgoing call ─────────────────────────────────────────────────────────
 
     fun startOutgoingCall(callId: String, peerId: String, isVideo: Boolean) {
+        ensureFactoryInitialized()
         _callState.value = WebRtcCallState.CALLING
         buildPeerConnection(callId)
         if (isVideo) addVideoTrack()
@@ -144,6 +157,7 @@ class WebRtcManager @Inject constructor(
      * Otherwise, it will be processed as soon as it arrives via [handleRemoteOffer].
      */
     fun acceptIncomingCall(callId: String, isVideo: Boolean) {
+        ensureFactoryInitialized()
         _callState.value = WebRtcCallState.CONNECTING
         buildPeerConnection(callId)
         if (isVideo) addVideoTrack()
@@ -346,7 +360,7 @@ class WebRtcManager @Inject constructor(
 
     fun dispose() {
         endCall()
-        peerConnectionFactory.dispose()
+        if (factoryInitialized) peerConnectionFactory.dispose()
         eglBase.release()
     }
 }
