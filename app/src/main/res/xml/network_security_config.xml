@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Network security config:
+    - Enforces HTTPS/TLS for all connections in production.
+    - Only allow cleartext on localhost for local development/testing.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <!-- Allow HTTP to the dev server and localhost -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">82.22.187.136</domain>
+        <domain includeSubdomains="true">10.0.2.2</domain>
+        <domain includeSubdomains="true">localhost</domain>
+        <domain includeSubdomains="true">127.0.0.1</domain>
+    </domain-config>
+</network-security-config>

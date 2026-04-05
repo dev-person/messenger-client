@@ -1,0 +1,32 @@
+# Android build artifacts
+**/build/
+*.apk
+*.aab
+*.dex
+
+# Gradle cache (NOT the wrapper — gradle/ dir should be committed)
+.gradle/
+
+# Local machine configs (contains SDK path — never commit)
+local.properties
+
+# IDE files
+.idea/
+*.iml
+
+# Kotlin incremental compilation cache
+.kotlin/
+
+# macOS
+.DS_Store
+
+# Signing keys
+*.keystore
+*.jks
+*.p12
+
+# Server — separate git repo, has its own history
+server/
+
+# Local scratch / task reference files
+forTask/
