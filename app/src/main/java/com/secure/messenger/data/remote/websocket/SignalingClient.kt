@@ -1,12 +1,9 @@
 package com.secure.messenger.data.remote.websocket
 
 import com.squareup.moshi.Moshi
-import kotlinx.coroutines.channels.awaitClose
-import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
-import kotlinx.coroutines.flow.callbackFlow
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.WebSocket
@@ -17,7 +14,7 @@ import javax.inject.Singleton
 
 /** Events emitted from the signaling WebSocket to the rest of the app. */
 sealed class SignalingEvent {
-    data class Offer(val callId: String, val sdp: String) : SignalingEvent()
+    data class Offer(val callId: String, val from: String, val sdp: String) : SignalingEvent()
     data class Answer(val sdp: String) : SignalingEvent()
     data class IceCandidate(
         val candidate: String,
@@ -36,6 +33,10 @@ sealed class SignalingEvent {
  *
  * All messages are JSON envelopes: { "type": "...", "payload": { ... } }
  * The connection is authenticated via Bearer token in the HTTP header.
+ *
+ * Routing: every signaling message (offer/answer/ice_candidate/end_call) must include
+ * a "to" field with the target user ID. The server forwards the message and injects "from".
+ * [peerUserId] is set automatically when sending an offer or receiving one.
  */
 @Singleton
 class SignalingClient @Inject constructor(
@@ -43,6 +44,10 @@ class SignalingClient @Inject constructor(
     private val moshi: Moshi,
 ) {
     private var webSocket: WebSocket? = null
+
+    // The user we are currently in a call with. Set when sending an offer (caller side)
+    // or when receiving an offer / incoming_call (callee side).
+    private var peerUserId: String? = null
     private var currentCallId: String? = null
 
     private val _events = MutableSharedFlow<SignalingEvent>(extraBufferCapacity = 64)
@@ -53,7 +58,6 @@ class SignalingClient @Inject constructor(
     // ── Connection lifecycle ──────────────────────────────────────────────────
 
     fun connect(serverUrl: String, authToken: String) {
-        // Не создаём новое подключение, если уже есть активное
         if (webSocket != null) return
 
         val request = Request.Builder()
@@ -99,10 +103,16 @@ class SignalingClient @Inject constructor(
         val payload = msg.payload ?: return
 
         val event = when (msg.type) {
-            "offer" -> SignalingEvent.Offer(
-                callId = payload["callId"] as? String ?: "",
-                sdp = payload["sdp"] as? String ?: return,
-            )
+            "offer" -> {
+                // Server injects "from" = callerId when forwarding the offer
+                val from = payload["from"] as? String ?: ""
+                if (from.isNotEmpty()) peerUserId = from
+                SignalingEvent.Offer(
+                    callId = payload["callId"] as? String ?: "",
+                    from = from,
+                    sdp = payload["sdp"] as? String ?: return,
+                )
+            }
             "answer" -> SignalingEvent.Answer(
                 sdp = payload["sdp"] as? String ?: return,
             )
@@ -111,11 +121,16 @@ class SignalingClient @Inject constructor(
                 sdpMid = payload["sdpMid"] as? String,
                 sdpMLineIndex = (payload["sdpMLineIndex"] as? Double)?.toInt() ?: 0,
             )
-            "incoming_call" -> SignalingEvent.IncomingCall(
-                callId = payload["callId"] as? String ?: "",
-                callerId = payload["callerId"] as? String ?: "",
-                isVideo = payload["isVideo"] as? Boolean ?: false,
-            )
+            "incoming_call" -> {
+                // Set peer so answer/ICE can be routed back even before the offer arrives
+                val callerId = payload["callerId"] as? String ?: ""
+                if (callerId.isNotEmpty()) peerUserId = callerId
+                SignalingEvent.IncomingCall(
+                    callId = payload["callId"] as? String ?: "",
+                    callerId = callerId,
+                    isVideo = payload["isVideo"] as? Boolean ?: false,
+                )
+            }
             "call_ended" -> SignalingEvent.CallEnded(
                 callId = payload["callId"] as? String ?: "",
             )
@@ -137,17 +152,30 @@ class SignalingClient @Inject constructor(
         webSocket?.send(json)
     }
 
-    fun sendOffer(callId: String, sdp: String) {
+    /**
+     * Send a WebRTC offer to [toUserId]. Stores [toUserId] as the current peer so that
+     * subsequent answer/ICE/end_call messages are routed to the correct recipient.
+     */
+    fun sendOffer(callId: String, toUserId: String, isVideo: Boolean, sdp: String) {
         currentCallId = callId
-        send("offer", mapOf("callId" to callId, "sdp" to sdp))
+        peerUserId = toUserId
+        send("offer", mapOf(
+            "to" to toUserId,
+            "callId" to callId,
+            "isVideo" to isVideo,
+            "sdp" to sdp,
+        ))
     }
 
     fun sendAnswer(sdp: String) {
-        send("answer", mapOf("sdp" to sdp))
+        val peer = peerUserId ?: run { Timber.w("sendAnswer: peerUserId not set"); return }
+        send("answer", mapOf("to" to peer, "sdp" to sdp))
     }
 
     fun sendIceCandidate(callId: String, candidate: String, sdpMid: String?, sdpMLineIndex: Int) {
+        val peer = peerUserId ?: run { Timber.w("sendIceCandidate: peerUserId not set"); return }
         send("ice_candidate", mapOf(
+            "to" to peer,
             "callId" to callId,
             "candidate" to candidate,
             "sdpMid" to sdpMid,
@@ -156,7 +184,12 @@ class SignalingClient @Inject constructor(
     }
 
     fun sendEndCall(callId: String) {
-        send("end_call", mapOf("callId" to callId))
+        val peer = peerUserId
+        peerUserId = null
+        currentCallId = null
+        if (peer != null) {
+            send("end_call", mapOf("to" to peer, "callId" to callId))
+        }
     }
 
     fun sendChatMessage(chatId: String, encryptedContent: String, messageId: String) {

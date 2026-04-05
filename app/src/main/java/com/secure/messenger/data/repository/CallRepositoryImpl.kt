@@ -32,7 +32,7 @@ class CallRepositoryImpl @Inject constructor(
         )
         _activeCall.value = call
 
-        webRtcManager.startOutgoingCall(callId, isVideo = type == CallType.VIDEO)
+        webRtcManager.startOutgoingCall(callId, peerId = userId, isVideo = type == CallType.VIDEO)
         call
     }
 

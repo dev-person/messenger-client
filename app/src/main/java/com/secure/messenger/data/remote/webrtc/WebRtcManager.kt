@@ -39,6 +39,15 @@ import javax.inject.Singleton
  *   - DTLS-SRTP is enforced by default in the WebRTC library (all media is encrypted).
  *   - ICE credentials are exchanged over the encrypted WebSocket signaling channel.
  *   - Only TURN/STUN with TLS endpoints should be used in production.
+ *
+ * Call flow — outgoing:
+ *   startOutgoingCall(callId, peerId, isVideo)
+ *     → builds PeerConnection → adds tracks → creates offer → sends via SignalingClient
+ *
+ * Call flow — incoming:
+ *   1. [SignalingEvent.Offer] arrives → offer SDP is buffered; peerUserId set in SignalingClient
+ *   2. acceptIncomingCall(callId, isVideo)
+ *        → builds PeerConnection → adds tracks → processes buffered offer → creates answer
  */
 @Singleton
 class WebRtcManager @Inject constructor(
@@ -55,6 +64,9 @@ class WebRtcManager @Inject constructor(
     private var localVideoTrack: VideoTrack? = null
     private var localAudioTrack: AudioTrack? = null
     private var videoCapturer: VideoCapturer? = null
+
+    // Offer SDP buffered while waiting for the user to accept the incoming call
+    private var pendingOfferSdp: String? = null
 
     private val _callState = MutableStateFlow(WebRtcCallState.IDLE)
     val callState: StateFlow<WebRtcCallState> = _callState.asStateFlow()
@@ -88,7 +100,7 @@ class WebRtcManager @Inject constructor(
         scope.launch {
             signalingClient.events.collect { event ->
                 when (event) {
-                    is SignalingEvent.Offer -> handleRemoteOffer(event.sdp)
+                    is SignalingEvent.Offer -> handleRemoteOffer(event)
                     is SignalingEvent.Answer -> handleRemoteAnswer(event.sdp)
                     is SignalingEvent.IceCandidate -> addRemoteIceCandidate(event.candidate, event.sdpMid, event.sdpMLineIndex)
                     is SignalingEvent.CallEnded -> endCall()
@@ -100,15 +112,15 @@ class WebRtcManager @Inject constructor(
 
     // ── Outgoing call ─────────────────────────────────────────────────────────
 
-    fun startOutgoingCall(callId: String, isVideo: Boolean) {
+    fun startOutgoingCall(callId: String, peerId: String, isVideo: Boolean) {
         _callState.value = WebRtcCallState.CALLING
         buildPeerConnection(callId)
         if (isVideo) addVideoTrack()
         addAudioTrack()
-        createOffer(callId)
+        createOffer(callId, peerId, isVideo)
     }
 
-    private fun createOffer(callId: String) {
+    private fun createOffer(callId: String, peerId: String, isVideo: Boolean) {
         val constraints = MediaConstraints().apply {
             mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "true"))
             mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "true"))
@@ -117,25 +129,51 @@ class WebRtcManager @Inject constructor(
         peerConnection?.createOffer(object : SimpleSdpObserver() {
             override fun onCreateSuccess(sdp: SessionDescription) {
                 peerConnection?.setLocalDescription(SimpleSdpObserver(), sdp)
-                scope.launch { signalingClient.sendOffer(callId, sdp.description) }
+                scope.launch { signalingClient.sendOffer(callId, peerId, isVideo, sdp.description) }
             }
         }, constraints)
     }
 
     // ── Incoming call ─────────────────────────────────────────────────────────
 
+    /**
+     * Called when the user taps "Accept" on an incoming call.
+     *
+     * Builds the PeerConnection and adds local media tracks. If the remote offer has
+     * already arrived (buffered in [pendingOfferSdp]), it is processed immediately.
+     * Otherwise, it will be processed as soon as it arrives via [handleRemoteOffer].
+     */
     fun acceptIncomingCall(callId: String, isVideo: Boolean) {
         _callState.value = WebRtcCallState.CONNECTING
+        buildPeerConnection(callId)
         if (isVideo) addVideoTrack()
         addAudioTrack()
-        // Answer is created after remote offer is set — handled in handleRemoteOffer
+
+        val buffered = pendingOfferSdp
+        if (buffered != null) {
+            pendingOfferSdp = null
+            processRemoteOffer(buffered)
+        }
     }
 
-    private fun handleRemoteOffer(remoteSdp: String) {
-        if (peerConnection == null) {
-            buildPeerConnection(callId = "")  // callId is already known to signaling client
+    /**
+     * Handles an incoming offer from the remote peer.
+     *
+     * If the user has already accepted (PeerConnection exists), the offer is processed
+     * immediately. Otherwise, the SDP is buffered until [acceptIncomingCall] is called.
+     * The peer ID (callerId) has already been stored in [SignalingClient] by [parseAndEmit].
+     */
+    private fun handleRemoteOffer(event: SignalingEvent.Offer) {
+        if (peerConnection != null) {
+            // User accepted before the offer arrived — process immediately
+            processRemoteOffer(event.sdp)
+        } else {
+            // Buffer until the user accepts
+            pendingOfferSdp = event.sdp
         }
+    }
 
+    private fun processRemoteOffer(remoteSdp: String) {
         val offer = SessionDescription(SessionDescription.Type.OFFER, remoteSdp)
         peerConnection?.setRemoteDescription(SimpleSdpObserver(), offer)
         createAnswer()
@@ -151,7 +189,7 @@ class WebRtcManager @Inject constructor(
             override fun onCreateSuccess(sdp: SessionDescription) {
                 peerConnection?.setLocalDescription(SimpleSdpObserver(), sdp)
                 scope.launch { signalingClient.sendAnswer(sdp.description) }
-                _callState.value = WebRtcCallState.CONNECTED
+                // CONNECTED state is set by onConnectionChange when the ICE handshake completes
             }
         }, constraints)
     }
@@ -159,7 +197,7 @@ class WebRtcManager @Inject constructor(
     private fun handleRemoteAnswer(remoteSdp: String) {
         val answer = SessionDescription(SessionDescription.Type.ANSWER, remoteSdp)
         peerConnection?.setRemoteDescription(SimpleSdpObserver(), answer)
-        _callState.value = WebRtcCallState.CONNECTED
+        // CONNECTED state is set by onConnectionChange when the ICE handshake completes
     }
 
     private fun addRemoteIceCandidate(candidate: String, sdpMid: String?, sdpMLineIndex: Int) {
@@ -284,6 +322,8 @@ class WebRtcManager @Inject constructor(
     // ── Teardown ──────────────────────────────────────────────────────────────
 
     fun endCall() {
+        pendingOfferSdp = null
+
         videoCapturer?.stopCapture()
         videoCapturer?.dispose()
         videoCapturer = null
