@@ -171,9 +171,16 @@ private fun UpdateDialog(updateManager: UpdateManager) {
     val scope = rememberCoroutineScope()
     val context = androidx.compose.ui.platform.LocalContext.current
 
-    // Проверяем обновление при запуске
+    // Проверяем обновление при запуске и каждые 5 минут
     LaunchedEffect(Unit) {
-        updateInfo = updateManager.checkForUpdate()
+        while (true) {
+            val info = updateManager.checkForUpdate()
+            if (info != null) {
+                updateInfo = info
+                dismissed = false // Показать снова если появилось новое обновление
+            }
+            kotlinx.coroutines.delay(5 * 60 * 1000L) // 5 минут
+        }
     }
 
     if (updateInfo != null && !dismissed) {
@@ -197,7 +204,9 @@ private fun UpdateDialog(updateManager: UpdateManager) {
                         if (!isDownloading) {
                             isDownloading = true
                             scope.launch {
-                                updateManager.downloadAndInstall(info.downloadUrl!!, context)
+                                runCatching {
+                                    updateManager.downloadAndInstall(info.downloadUrl!!, context)
+                                }
                                 isDownloading = false
                             }
                         }
