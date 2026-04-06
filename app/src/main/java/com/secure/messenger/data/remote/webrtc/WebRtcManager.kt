@@ -72,6 +72,10 @@ class WebRtcManager @Inject constructor(
     // SDP-предложение, буферизованное до принятия входящего звонка пользователем
     private var pendingOfferSdp: String? = null
 
+    // ICE-кандидаты, пришедшие до создания PeerConnection или установки remote description
+    private val pendingIceCandidates = mutableListOf<IceCandidate>()
+    private var remoteDescriptionSet = false
+
     // Завершает звонок, если ICE-согласование не завершилось за 30 секунд.
     // Без TURN-сервера симметричный NAT может привести к бесконечному зависанию.
     private var connectionTimeoutJob: Job? = null
@@ -140,6 +144,8 @@ class WebRtcManager @Inject constructor(
         ensureFactoryInitialized()
         setAudioMode(active = true)
         _callState.value = WebRtcCallState.CALLING
+        pendingIceCandidates.clear()
+        remoteDescriptionSet = false
         startConnectionTimeout()
         buildPeerConnection(callId)
         if (isVideo) addVideoTrack()
@@ -204,7 +210,12 @@ class WebRtcManager @Inject constructor(
 
     private fun processRemoteOffer(remoteSdp: String) {
         val offer = SessionDescription(SessionDescription.Type.OFFER, remoteSdp)
-        peerConnection?.setRemoteDescription(SimpleSdpObserver(), offer)
+        peerConnection?.setRemoteDescription(object : SimpleSdpObserver() {
+            override fun onSetSuccess() {
+                remoteDescriptionSet = true
+                drainPendingIceCandidates()
+            }
+        }, offer)
         createAnswer()
     }
 
@@ -225,12 +236,32 @@ class WebRtcManager @Inject constructor(
 
     private fun handleRemoteAnswer(remoteSdp: String) {
         val answer = SessionDescription(SessionDescription.Type.ANSWER, remoteSdp)
-        peerConnection?.setRemoteDescription(SimpleSdpObserver(), answer)
-        // CONNECTED state is set by onConnectionChange when the ICE handshake completes
+        peerConnection?.setRemoteDescription(object : SimpleSdpObserver() {
+            override fun onSetSuccess() {
+                remoteDescriptionSet = true
+                drainPendingIceCandidates()
+            }
+        }, answer)
     }
 
     private fun addRemoteIceCandidate(candidate: String, sdpMid: String?, sdpMLineIndex: Int) {
-        peerConnection?.addIceCandidate(IceCandidate(sdpMid, sdpMLineIndex, candidate))
+        val ice = IceCandidate(sdpMid, sdpMLineIndex, candidate)
+        if (peerConnection != null && remoteDescriptionSet) {
+            peerConnection?.addIceCandidate(ice)
+        } else {
+            // Буферизуем до момента, когда PeerConnection и remote description будут готовы
+            Timber.d("Буферизуем ICE-кандидат (pc=${peerConnection != null}, rd=$remoteDescriptionSet)")
+            pendingIceCandidates.add(ice)
+        }
+    }
+
+    /** Применяет все буферизованные ICE-кандидаты к PeerConnection */
+    private fun drainPendingIceCandidates() {
+        if (pendingIceCandidates.isNotEmpty()) {
+            Timber.d("Применяем ${pendingIceCandidates.size} буферизованных ICE-кандидатов")
+            pendingIceCandidates.forEach { peerConnection?.addIceCandidate(it) }
+            pendingIceCandidates.clear()
+        }
     }
 
     // ── Построение PeerConnection ─────────────────────────────────────────────
@@ -428,6 +459,8 @@ class WebRtcManager @Inject constructor(
         val pc = peerConnection
         peerConnection = null   // null first — suppresses spurious ENDED from onConnectionChange
         pendingOfferSdp = null
+        pendingIceCandidates.clear()
+        remoteDescriptionSet = false
 
         videoCapturer?.stopCapture()
         videoCapturer?.dispose()
@@ -459,6 +492,8 @@ class WebRtcManager @Inject constructor(
         val pc = peerConnection
         peerConnection = null
         pendingOfferSdp = null
+        pendingIceCandidates.clear()
+        remoteDescriptionSet = false
 
         videoCapturer?.stopCapture()
         videoCapturer?.dispose()

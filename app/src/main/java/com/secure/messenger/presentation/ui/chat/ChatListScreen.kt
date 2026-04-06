@@ -241,17 +241,37 @@ private fun SupportAuthorDialog(onDismiss: () -> Unit) {
                 isLoading -> Text("Загрузка...")
                 error != null -> Text("Не удалось загрузить: $error")
                 else -> {
+                    val context = androidx.compose.ui.platform.LocalContext.current
                     Column {
-                        supportInfo?.message?.let { msg ->
+                        supportInfo?.message?.takeIf { it.isNotBlank() }?.let { msg ->
                             Text(text = msg, style = MaterialTheme.typography.bodyMedium)
                         }
-                        supportInfo?.links?.let { linksJson ->
+                        // Парсим JSON-ссылки и показываем как кликабельные элементы
+                        val links = remember(supportInfo?.links) {
+                            runCatching {
+                                val json = org.json.JSONArray(supportInfo?.links ?: "[]")
+                                (0 until json.length()).map { i ->
+                                    val obj = json.getJSONObject(i)
+                                    obj.optString("title", "") to obj.optString("url", "")
+                                }.filter { it.first.isNotBlank() && it.second.isNotBlank() }
+                            }.getOrDefault(emptyList())
+                        }
+                        if (links.isNotEmpty()) {
                             Spacer(modifier = Modifier.height(12.dp))
-                            Text(
-                                text = linksJson,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.primary,
-                            )
+                            links.forEach { (title, url) ->
+                                Text(
+                                    text = title,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier
+                                        .clickable {
+                                            context.startActivity(
+                                                android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url))
+                                            )
+                                        }
+                                        .padding(vertical = 4.dp),
+                                )
+                            }
                         }
                     }
                 }

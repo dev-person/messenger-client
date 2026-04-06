@@ -2,7 +2,9 @@ package com.secure.messenger.presentation.ui.settings
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.widget.Toast
 import androidx.lifecycle.ViewModel
+import com.secure.messenger.utils.UpdateManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -18,17 +20,16 @@ data class SettingsUiState(
 
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
-    @ApplicationContext context: Context,
+    @ApplicationContext private val appContext: Context,
+    private val updateManager: UpdateManager,
 ) : ViewModel() {
 
-    // Хранилище настроек — простой SharedPreferences
     private val prefs: SharedPreferences =
-        context.getSharedPreferences("app_settings", Context.MODE_PRIVATE)
+        appContext.getSharedPreferences("app_settings", Context.MODE_PRIVATE)
 
     private val _uiState = MutableStateFlow(loadFromPrefs())
     val uiState: StateFlow<SettingsUiState> = _uiState.asStateFlow()
 
-    // Читаем сохранённые настройки при старте
     private fun loadFromPrefs() = SettingsUiState(
         notificationsEnabled = prefs.getBoolean(KEY_NOTIFICATIONS, true),
         soundEnabled         = prefs.getBoolean(KEY_SOUND, true),
@@ -51,6 +52,18 @@ class SettingsViewModel @Inject constructor(
         val newValue = !_uiState.value.vibrationEnabled
         prefs.edit().putBoolean(KEY_VIBRATION, newValue).apply()
         _uiState.value = _uiState.value.copy(vibrationEnabled = newValue)
+    }
+
+    /** Проверяет обновление вручную и показывает Toast с результатом */
+    suspend fun checkForUpdate(activityContext: Context) {
+        val info = updateManager.checkForUpdate()
+        if (info != null) {
+            // Обновление найдено — скачиваем и устанавливаем
+            Toast.makeText(activityContext, "Скачивание v${info.versionName}…", Toast.LENGTH_SHORT).show()
+            updateManager.downloadAndInstall(info.downloadUrl!!, activityContext)
+        } else {
+            Toast.makeText(activityContext, "У вас последняя версия", Toast.LENGTH_SHORT).show()
+        }
     }
 
     companion object {

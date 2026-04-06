@@ -2,35 +2,48 @@ package com.secure.messenger.presentation.ui.settings
 
 import android.content.Intent
 import android.net.Uri
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowForwardIos
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.filled.Campaign
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.NotificationsOff
-import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.PhoneAndroid
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material.icons.filled.SystemUpdate
+import androidx.compose.material.icons.filled.Vibration
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
-import com.secure.messenger.presentation.ui.components.CompactTopBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -38,11 +51,11 @@ import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.secure.messenger.BuildConfig
+import kotlinx.coroutines.launch
 
 // URL политики конфиденциальности — замените на реальный
 private const val PRIVACY_POLICY_URL = "https://example.com/privacy"
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(
     onBack: () -> Unit,
@@ -50,156 +63,294 @@ fun SettingsScreen(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
 
-    Scaffold(
-        topBar = {
-            CompactTopBar(
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, null,
-                            tint = MaterialTheme.colorScheme.onPrimary)
-                    }
-                },
-                title = {
-                    Text(
-                        "Настройки",
-                        color = MaterialTheme.colorScheme.onPrimary,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 21.sp,
-                        modifier = Modifier.weight(1f),
-                    )
-                },
-            )
-        },
-    ) { padding ->
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.surfaceContainerLow),
+    ) {
+        // ── OneUI-стиль: большой заголовок ─────────────────────────────────
+        Surface(
+            color = MaterialTheme.colorScheme.surface,
+            shadowElevation = 0.dp,
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .statusBarsPadding()
+                    .padding(start = 24.dp, end = 24.dp, top = 32.dp, bottom = 20.dp),
+            ) {
+                Text(
+                    text = "Настройки",
+                    style = MaterialTheme.typography.headlineLarge,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 34.sp,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+            }
+        }
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(padding)
-                .verticalScroll(rememberScrollState()),
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            // ── Уведомления ────────────────────────────────────────────────
+            OneUiSectionLabel("Уведомления")
 
-            // ── Раздел: Уведомления ───────────────────────────────────────────
-            SectionHeader("Уведомления")
+            OneUiCard {
+                OneUiToggleItem(
+                    icon = if (state.notificationsEnabled) Icons.Default.Notifications
+                    else Icons.Default.NotificationsOff,
+                    iconTint = MaterialTheme.colorScheme.primary,
+                    title = "Уведомления",
+                    subtitle = if (state.notificationsEnabled) "Включены" else "Выключены",
+                    checked = state.notificationsEnabled,
+                    onCheckedChange = { viewModel.toggleNotifications() },
+                )
 
-            ListItem(
-                headlineContent = { Text("Уведомления") },
-                supportingContent = { Text(if (state.notificationsEnabled) "Включены" else "Выключены") },
-                leadingContent = {
-                    Icon(
-                        if (state.notificationsEnabled) Icons.Default.Notifications
-                        else Icons.Default.NotificationsOff,
-                        null,
-                        tint = MaterialTheme.colorScheme.primary,
-                    )
-                },
-                trailingContent = {
-                    Switch(
-                        checked = state.notificationsEnabled,
-                        onCheckedChange = { viewModel.toggleNotifications() },
-                    )
-                },
-            )
+                OneUiDivider()
 
-            ListItem(
-                headlineContent = { Text("Звук") },
-                supportingContent = { Text(if (state.soundEnabled) "Включён" else "Выключен") },
-                leadingContent = {
-                    Icon(
-                        Icons.Default.Notifications, null,
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(24.dp),
-                    )
-                },
-                trailingContent = {
-                    Switch(
-                        checked = state.soundEnabled,
-                        onCheckedChange = { viewModel.toggleSound() },
-                        // Блокируем если уведомления выключены
-                        enabled = state.notificationsEnabled,
-                    )
-                },
-            )
+                OneUiToggleItem(
+                    icon = Icons.Default.VolumeUp,
+                    iconTint = MaterialTheme.colorScheme.primary,
+                    title = "Звук",
+                    subtitle = if (state.soundEnabled) "Включён" else "Выключен",
+                    checked = state.soundEnabled,
+                    onCheckedChange = { viewModel.toggleSound() },
+                    enabled = state.notificationsEnabled,
+                )
 
-            ListItem(
-                headlineContent = { Text("Вибрация") },
-                supportingContent = { Text(if (state.vibrationEnabled) "Включена" else "Выключена") },
-                leadingContent = {
-                    Icon(
-                        if (state.vibrationEnabled) Icons.Default.PhoneAndroid
-                        else Icons.Default.PhoneAndroid,
-                        null,
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(24.dp),
-                    )
-                },
-                trailingContent = {
-                    Switch(
-                        checked = state.vibrationEnabled,
-                        onCheckedChange = { viewModel.toggleVibration() },
-                        enabled = state.notificationsEnabled,
-                    )
-                },
-            )
+                OneUiDivider()
 
-            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                OneUiToggleItem(
+                    icon = Icons.Default.Vibration,
+                    iconTint = MaterialTheme.colorScheme.primary,
+                    title = "Вибрация",
+                    subtitle = if (state.vibrationEnabled) "Включена" else "Выключена",
+                    checked = state.vibrationEnabled,
+                    onCheckedChange = { viewModel.toggleVibration() },
+                    enabled = state.notificationsEnabled,
+                )
+            }
 
-            // ── Раздел: Приложение ────────────────────────────────────────────
-            SectionHeader("Приложение")
+            // ── Обновление ─────────────────────────────────────────────────
+            OneUiSectionLabel("Обновление")
 
-            ListItem(
-                headlineContent = { Text("Версия приложения") },
-                supportingContent = { Text(BuildConfig.VERSION_NAME) },
-                leadingContent = {
-                    Icon(
-                        Icons.Default.SystemUpdate, null,
-                        tint = MaterialTheme.colorScheme.primary,
-                    )
-                },
-            )
+            OneUiCard {
+                OneUiClickItem(
+                    icon = Icons.Default.SystemUpdate,
+                    iconTint = MaterialTheme.colorScheme.tertiary,
+                    title = "Проверить обновления",
+                    subtitle = "Текущая версия: ${BuildConfig.VERSION_NAME}",
+                    onClick = {
+                        scope.launch { viewModel.checkForUpdate(context) }
+                    },
+                )
+            }
 
-            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+            // ── О приложении ───────────────────────────────────────────────
+            OneUiSectionLabel("О приложении")
 
-            // ── Раздел: Прочее ────────────────────────────────────────────────
-            SectionHeader("Прочее")
+            OneUiCard {
+                OneUiClickItem(
+                    icon = Icons.AutoMirrored.Filled.OpenInNew,
+                    iconTint = MaterialTheme.colorScheme.secondary,
+                    title = "Политика конфиденциальности",
+                    onClick = {
+                        context.startActivity(
+                            Intent(Intent.ACTION_VIEW, Uri.parse(PRIVACY_POLICY_URL))
+                        )
+                    },
+                )
 
-            // Политика конфиденциальности — тап открывает браузер
-            ListItem(
-                headlineContent = { Text("Политика конфиденциальности") },
-                leadingContent = {
-                    Icon(
-                        Icons.AutoMirrored.Filled.OpenInNew, null,
-                        tint = MaterialTheme.colorScheme.primary,
-                    )
-                },
-                trailingContent = {
-                    Icon(
-                        Icons.AutoMirrored.Filled.OpenInNew, null,
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                },
-                modifier = Modifier.clickable {
-                    context.startActivity(
-                        Intent(Intent.ACTION_VIEW, Uri.parse(PRIVACY_POLICY_URL))
-                    )
-                },
-            )
+                OneUiDivider()
 
-            Spacer(modifier = Modifier.height(32.dp))
+                OneUiInfoItem(
+                    icon = Icons.Default.Info,
+                    iconTint = MaterialTheme.colorScheme.outline,
+                    title = "Версия",
+                    value = "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
+                )
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
         }
     }
 }
 
-// ── Заголовок раздела настроек ────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// OneUI-компоненты
+// ═══════════════════════════════════════════════════════════════════════════════
 
 @Composable
-private fun SectionHeader(title: String) {
+private fun OneUiSectionLabel(title: String) {
     Text(
         text = title,
-        style = MaterialTheme.typography.labelSmall,
+        style = MaterialTheme.typography.labelLarge,
         color = MaterialTheme.colorScheme.primary,
         fontWeight = FontWeight.SemiBold,
-        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+        fontSize = 14.sp,
+        modifier = Modifier.padding(start = 8.dp, top = 4.dp, bottom = 2.dp),
     )
+}
+
+@Composable
+private fun OneUiCard(content: @Composable () -> Unit) {
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.surface,
+        tonalElevation = 1.dp,
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            content()
+        }
+    }
+}
+
+@Composable
+private fun OneUiDivider() {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 56.dp, end = 16.dp)
+            .height(0.5.dp)
+            .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)),
+    )
+}
+
+@Composable
+private fun OneUiToggleItem(
+    icon: ImageVector,
+    iconTint: Color,
+    title: String,
+    subtitle: String? = null,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    enabled: Boolean = true,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = enabled) { onCheckedChange(!checked) }
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = if (enabled) iconTint else iconTint.copy(alpha = 0.38f),
+            modifier = Modifier.size(24.dp),
+        )
+        Spacer(modifier = Modifier.width(16.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyLarge,
+                color = if (enabled) MaterialTheme.colorScheme.onSurface
+                else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
+            )
+            if (subtitle != null) {
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (enabled) MaterialTheme.colorScheme.onSurfaceVariant
+                    else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f),
+                    fontSize = 13.sp,
+                )
+            }
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            enabled = enabled,
+            colors = SwitchDefaults.colors(
+                checkedTrackColor = MaterialTheme.colorScheme.primary,
+                checkedThumbColor = MaterialTheme.colorScheme.onPrimary,
+            ),
+        )
+    }
+}
+
+@Composable
+private fun OneUiClickItem(
+    icon: ImageVector,
+    iconTint: Color,
+    title: String,
+    subtitle: String? = null,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = iconTint,
+            modifier = Modifier.size(24.dp),
+        )
+        Spacer(modifier = Modifier.width(16.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            if (subtitle != null) {
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 13.sp,
+                )
+            }
+        }
+        Icon(
+            imageVector = Icons.AutoMirrored.Filled.ArrowForwardIos,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+            modifier = Modifier.size(16.dp),
+        )
+    }
+}
+
+@Composable
+private fun OneUiInfoItem(
+    icon: ImageVector,
+    iconTint: Color,
+    title: String,
+    value: String,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = iconTint,
+            modifier = Modifier.size(24.dp),
+        )
+        Spacer(modifier = Modifier.width(16.dp))
+        Text(
+            text = title,
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
 }
