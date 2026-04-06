@@ -1,49 +1,35 @@
 package com.secure.messenger.presentation.ui.components
 
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.dp
 
 /**
- * Компактная шапка.
+ * Единая шапка приложения на базе Material3 TopAppBar.
  *
- * Ключевое: statusBarsPadding() вешаем на Column, а не на Row с height().
- * Если повесить statusBarsPadding() на Row с height(N.dp), то N dp будут
- * съедены отступом статусбара — контенту остаётся (N - statusBar) dp.
- *
- * Правильно: Column(statusBarsPadding) { Row(height = 28dp) }
- * Surface закрашивает область за статусбаром в primary-цвет.
+ * Использует системные WindowInsets — корректно обрабатывает статусбар
+ * на любых устройствах без ручного statusBarsPadding().
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CompactTopBar(
     title: @Composable RowScope.() -> Unit,
     navigationIcon: @Composable () -> Unit = {},
     actions: @Composable RowScope.() -> Unit = {},
 ) {
-    Surface(
-        color = MaterialTheme.colorScheme.primary,
-        shadowElevation = 4.dp,
-    ) {
-        Column(modifier = Modifier.statusBarsPadding()) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 4.dp, vertical = 20.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                navigationIcon()
-                title()
-                actions()
-            }
-        }
-    }
+    TopAppBar(
+        title = { androidx.compose.foundation.layout.Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) { title() } },
+        navigationIcon = navigationIcon,
+        actions = actions,
+        colors = TopAppBarDefaults.topAppBarColors(
+            containerColor = MaterialTheme.colorScheme.primary,
+            titleContentColor = MaterialTheme.colorScheme.onPrimary,
+            navigationIconContentColor = MaterialTheme.colorScheme.onPrimary,
+            actionIconContentColor = MaterialTheme.colorScheme.onPrimary,
+        ),
+    )
 }

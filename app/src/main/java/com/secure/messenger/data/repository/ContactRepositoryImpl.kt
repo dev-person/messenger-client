@@ -1,6 +1,5 @@
 package com.secure.messenger.data.repository
 
-import android.content.ContentResolver
 import android.content.Context
 import android.provider.ContactsContract
 import com.secure.messenger.data.local.dao.UserDao
@@ -10,10 +9,15 @@ import com.secure.messenger.domain.model.Contact
 import com.secure.messenger.domain.model.User
 import com.secure.messenger.domain.repository.ContactRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
-import java.time.Instant
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import timber.log.Timber
 import javax.inject.Inject
+
+/**
+ * Данные телефонного контакта (имя + номер) до проверки регистрации в мессенджере.
+ */
+private data class DeviceContact(val name: String, val phone: String)
 
 class ContactRepositoryImpl @Inject constructor(
     @ApplicationContext private val context: Context,
@@ -32,57 +36,103 @@ class ContactRepositoryImpl @Inject constructor(
         }
 
     override suspend fun syncPhoneContacts(): Result<List<Contact>> = runCatching {
-        val devicePhones = readDevicePhoneNumbers()
+        val deviceContacts = readDeviceContacts()
+        val phones = deviceContacts.map { it.phone }
 
-        // Ask server which of these phones are registered
-        val registeredUsers = api.lookupPhones(mapOf("phones" to devicePhones))
-            .data.orEmpty()
+        if (phones.isEmpty()) return@runCatching emptyList()
 
-        // Persist registered users in local DB
-        // isContact = true: контакты из телефонной книги считаются контактами
-        userDao.upsertAll(registeredUsers.map { dto ->
-            UserEntity(
+        // Спрашиваем сервер, какие номера зарегистрированы
+        val registeredUsers = runCatching {
+            api.lookupPhones(mapOf("phones" to phones)).data.orEmpty()
+        }.getOrElse { e ->
+            Timber.e(e, "lookupPhones failed")
+            emptyList()
+        }
+
+        // Сохраняем зарегистрированных пользователей в локальную БД как контакты
+        for (dto in registeredUsers) {
+            val lastSeen = runCatching {
+                java.time.Instant.parse(dto.lastSeen).toEpochMilli()
+            }.getOrDefault(System.currentTimeMillis())
+
+            userDao.upsert(UserEntity(
                 id = dto.id, phone = dto.phone, username = dto.username,
                 displayName = dto.displayName, avatarUrl = dto.avatarUrl,
                 bio = dto.bio, isOnline = dto.isOnline,
-                lastSeen = Instant.parse(dto.lastSeen).toEpochMilli(),
-                publicKey = dto.publicKey, isContact = true,
-            )
-        })
+                lastSeen = lastSeen, publicKey = dto.publicKey, isContact = true,
+            ))
+        }
 
-        val registeredPhoneSet = registeredUsers.associate { it.phone to it }
+        val registeredPhoneSet = registeredUsers.associateBy { it.phone }
+        // Дополнительная карта: номер с + → без +, и наоборот, для нечёткого совпадения
+        val registeredPhoneNormalized = registeredUsers.associateBy { normalizePhone(it.phone) }
 
-        // Build combined list: registered + unregistered contacts
-        devicePhones.map { phone ->
-            val registered = registeredPhoneSet[phone]
+        // Собираем общий список: зарегистрированные + незарегистрированные
+        val deviceNameByPhone = deviceContacts.associateBy({ it.phone }, { it.name })
+
+        deviceContacts.map { dc ->
+            val registered = registeredPhoneSet[dc.phone]
+                ?: registeredPhoneNormalized[normalizePhone(dc.phone)]
+
             Contact(
-                id = registered?.id ?: phone,
+                id = registered?.id ?: dc.phone,
                 userId = registered?.id,
-                displayName = registered?.displayName ?: phone,
-                phone = phone,
+                displayName = registered?.displayName?.takeIf { it.isNotBlank() }
+                    ?: dc.name.takeIf { it.isNotBlank() }
+                    ?: dc.phone,
+                phone = dc.phone,
                 avatarUrl = registered?.avatarUrl,
                 isRegistered = registered != null,
             )
         }
     }
 
-    /** Reads all phone numbers from the device address book. */
-    private fun readDevicePhoneNumbers(): List<String> {
-        val phones = mutableListOf<String>()
+    /**
+     * Читает контакты с устройства — имя + номер телефона.
+     * Использует NORMALIZED_NUMBER с фолбеком на NUMBER.
+     */
+    private fun readDeviceContacts(): List<DeviceContact> {
+        val contacts = mutableMapOf<String, DeviceContact>() // phone → contact (дедупликация)
         val cursor = context.contentResolver.query(
             ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-            arrayOf(ContactsContract.CommonDataKinds.Phone.NORMALIZED_NUMBER),
+            arrayOf(
+                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                ContactsContract.CommonDataKinds.Phone.NORMALIZED_NUMBER,
+                ContactsContract.CommonDataKinds.Phone.NUMBER,
+            ),
             null, null, null,
-        ) ?: return phones
+        ) ?: return emptyList()
 
         cursor.use {
-            val numberCol = it.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NORMALIZED_NUMBER)
+            val nameCol = it.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
+            val normalizedCol = it.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NORMALIZED_NUMBER)
+            val numberCol = it.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+
             while (it.moveToNext()) {
-                val number = it.getString(numberCol)?.trim()
-                if (!number.isNullOrEmpty()) phones.add(number)
+                // NORMALIZED_NUMBER — стандартизированный E.164, но может быть null
+                val phone = it.getString(normalizedCol)?.trim()
+                    ?: it.getString(numberCol)?.replace("[^+\\d]".toRegex(), "")?.trim()
+                    ?: continue
+
+                if (phone.isEmpty()) continue
+
+                val name = it.getString(nameCol)?.trim() ?: ""
+                // Сохраняем первое найденное имя для этого номера
+                contacts.putIfAbsent(phone, DeviceContact(name, phone))
             }
         }
-        return phones.distinct()
+        return contacts.values.toList()
+    }
+
+    /** Нормализует номер: убирает всё кроме цифр, заменяет 8... на +7... (Россия) */
+    private fun normalizePhone(phone: String): String {
+        val digits = phone.replace("[^\\d]".toRegex(), "")
+        return when {
+            digits.startsWith("8") && digits.length == 11 -> "+7${digits.substring(1)}"
+            digits.startsWith("7") && digits.length == 11 -> "+7${digits.substring(1)}"
+            !phone.startsWith("+") -> "+$digits"
+            else -> "+$digits"
+        }
     }
 
     override suspend fun addContact(userId: String): Result<Contact> = runCatching {
@@ -100,20 +150,20 @@ class ContactRepositoryImpl @Inject constructor(
     }
 
     override suspend fun searchUsers(query: String): Result<List<User>> = runCatching {
-        // Пользователи могут вводить @username — убираем @ перед отправкой на сервер,
-        // так как в БД usernames хранятся без префикса.
         val users = api.searchUsers(query.trimStart('@')).data.orEmpty()
 
-        // Кешируем в локальный DB — нужно для последующего шифрования сообщений.
-        // Сохраняем isContact из существующей записи, чтобы не потерять флаг контакта.
         for (dto in users) {
             val existing = userDao.getById(dto.id)
+            val lastSeen = runCatching {
+                java.time.Instant.parse(dto.lastSeen).toEpochMilli()
+            }.getOrDefault(System.currentTimeMillis())
+
             userDao.upsert(UserEntity(
                 id = dto.id, phone = dto.phone, username = dto.username,
                 displayName = dto.displayName, avatarUrl = dto.avatarUrl,
                 bio = dto.bio, isOnline = dto.isOnline,
-                lastSeen = Instant.parse(dto.lastSeen).toEpochMilli(),
-                publicKey = dto.publicKey, isContact = existing?.isContact ?: false,
+                lastSeen = lastSeen, publicKey = dto.publicKey,
+                isContact = existing?.isContact ?: false,
             ))
         }
 
