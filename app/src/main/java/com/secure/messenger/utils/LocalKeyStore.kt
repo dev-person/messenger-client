@@ -2,15 +2,22 @@ package com.secure.messenger.utils
 
 import android.content.Context
 import android.content.SharedPreferences
+import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
+import timber.log.Timber
 import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
  * Persists the user's own X25519 key pair in EncryptedSharedPreferences,
  * backed by the Android Keystore via AES-256-GCM MasterKey.
+ *
+ * При первом запуске после обновления мигрирует ключи из старого DataStore.
  */
 @Singleton
 class LocalKeyStore @Inject constructor(
@@ -27,13 +34,51 @@ class LocalKeyStore @Inject constructor(
             .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
             .build()
 
-        EncryptedSharedPreferences.create(
+        val encPrefs = EncryptedSharedPreferences.create(
             context,
             PREFS_NAME,
             masterKey,
             EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
             EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
         )
+
+        // Миграция из старого DataStore → EncryptedSharedPreferences (одноразово)
+        if (encPrefs.getString(KEY_PRIVATE, null) == null) {
+            migrateFromDataStore(encPrefs)
+        }
+
+        encPrefs
+    }
+
+    private fun migrateFromDataStore(target: SharedPreferences) {
+        try {
+            val legacyFile = context.filesDir.resolve("datastore/key_store.preferences_pb")
+            if (!legacyFile.exists()) return
+
+            val ds = PreferenceDataStoreFactory.create {
+                legacyFile
+            }
+
+            val privKeyPref = stringPreferencesKey(KEY_PRIVATE)
+            val pubKeyPref = stringPreferencesKey(KEY_PUBLIC)
+
+            val (privKey, pubKey) = runBlocking {
+                val data = ds.data.first()
+                data[privKeyPref] to data[pubKeyPref]
+            }
+
+            if (privKey != null && pubKey != null) {
+                target.edit()
+                    .putString(KEY_PRIVATE, privKey)
+                    .putString(KEY_PUBLIC, pubKey)
+                    .commit()
+                Timber.d("LocalKeyStore: migrated keys from DataStore to EncryptedSharedPreferences")
+            }
+
+            legacyFile.delete()
+        } catch (e: Exception) {
+            Timber.w(e, "LocalKeyStore: DataStore migration failed")
+        }
     }
 
     fun saveKeyPair(publicKeyBase64: String, privateKeyBase64: String) {
