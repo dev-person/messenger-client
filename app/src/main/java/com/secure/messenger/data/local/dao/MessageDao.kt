@@ -18,7 +18,7 @@ interface MessageDao {
     suspend fun upsert(message: MessageEntity)
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertAll(messages: List<MessageEntity>)
+    suspend fun insertAll(messages: List<MessageEntity>)
 
     @Update
     suspend fun update(message: MessageEntity)
@@ -31,4 +31,12 @@ interface MessageDao {
 
     @Query("SELECT * FROM messages WHERE chatId = :chatId ORDER BY timestamp DESC LIMIT 1")
     suspend fun getLastMessage(chatId: String): MessageEntity?
+
+    /** Помечает исходящие сообщения как прочитанные собеседником */
+    @Query("UPDATE messages SET status = 'READ' WHERE chatId = :chatId AND senderId != :readerId AND status IN ('SENT', 'DELIVERED')")
+    suspend fun markChatMessagesRead(chatId: String, readerId: String)
+
+    /** Обновляет расшифрованный контент и помечает сообщение как отредактированное */
+    @Query("UPDATE messages SET encryptedContent = :encrypted, decryptedContent = :decrypted, isEdited = 1 WHERE id = :messageId")
+    suspend fun updateContent(messageId: String, encrypted: String, decrypted: String)
 }

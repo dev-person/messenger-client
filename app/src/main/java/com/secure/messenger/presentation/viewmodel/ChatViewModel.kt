@@ -22,6 +22,7 @@ import javax.inject.Inject
 data class ChatUiState(
     val isLoading: Boolean = false,
     val error: String? = null,
+    val editingMessage: Message? = null,
 )
 
 @HiltViewModel
@@ -67,17 +68,49 @@ class ChatViewModel @Inject constructor(
     }
 
     fun sendMessage() {
+        val editing = _uiState.value.editingMessage
         val content = _inputText.value.trim()
         if (content.isEmpty()) return
-        _inputText.value = ""
 
+        if (editing != null) {
+            _inputText.value = ""
+            _uiState.value = _uiState.value.copy(editingMessage = null)
+            viewModelScope.launch {
+                chatRepository.editMessage(editing.id, content)
+                    .onFailure { e ->
+                        _uiState.value = _uiState.value.copy(error = "Ошибка редактирования: ${e.message}")
+                    }
+            }
+            return
+        }
+
+        _inputText.value = ""
         viewModelScope.launch {
             sendMessageUseCase(chatId, content)
                 .onFailure { e ->
                     Timber.e(e, "Не удалось отправить сообщение в чат $chatId")
-                    _uiState.value = ChatUiState(error = "Ошибка отправки: ${e.message}")
+                    _uiState.value = _uiState.value.copy(error = "Ошибка отправки: ${e.message}")
                 }
         }
+    }
+
+    fun deleteMessage(message: Message) {
+        viewModelScope.launch {
+            chatRepository.deleteMessage(message.id)
+                .onFailure { e ->
+                    _uiState.value = _uiState.value.copy(error = "Ошибка удаления: ${e.message}")
+                }
+        }
+    }
+
+    fun startEditing(message: Message) {
+        _uiState.value = _uiState.value.copy(editingMessage = message)
+        _inputText.value = message.content
+    }
+
+    fun cancelEditing() {
+        _uiState.value = _uiState.value.copy(editingMessage = null)
+        _inputText.value = ""
     }
 
     fun clearError() {

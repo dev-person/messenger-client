@@ -49,4 +49,10 @@ interface ChatDao {
 
     @Query("UPDATE chats SET isMuted = :muted WHERE id = :chatId")
     suspend fun setMuted(chatId: String, muted: Boolean)
+
+    @Query("DELETE FROM chats WHERE id = :chatId")
+    suspend fun deleteById(chatId: String)
+
+    @Query("SELECT * FROM chats WHERE otherUserId = :userId AND type = 'DIRECT' LIMIT 1")
+    suspend fun getByOtherUserId(userId: String): ChatEntity?
 }

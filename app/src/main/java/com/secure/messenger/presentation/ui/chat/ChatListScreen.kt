@@ -1,7 +1,9 @@
 package com.secure.messenger.presentation.ui.chat
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -21,19 +23,30 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
+import androidx.compose.material.icons.filled.Block
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import com.secure.messenger.presentation.ui.components.CompactTopBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -50,7 +63,10 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import com.secure.messenger.BuildConfig
+import com.secure.messenger.data.remote.api.MessengerApi
+import com.secure.messenger.data.remote.api.SupportInfoDto
 import com.secure.messenger.domain.model.Chat
+import com.secure.messenger.domain.model.ChatType
 import com.secure.messenger.domain.model.MessageType
 import com.secure.messenger.domain.model.User
 import com.secure.messenger.presentation.viewmodel.ChatListViewModel
@@ -78,18 +94,17 @@ fun ChatListScreen(
     val currentUser by viewModel.currentUser.collectAsStateWithLifecycle()
     val isConnected by viewModel.isConnected.collectAsStateWithLifecycle()
 
-    // Переподключаемся при каждом возврате приложения в foreground
-    val lifecycle = LocalLifecycleOwner.current.lifecycle
-    DisposableEffect(lifecycle) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) viewModel.reconnect()
-        }
-        lifecycle.addObserver(observer)
-        onDispose { lifecycle.removeObserver(observer) }
-    }
+    // Состояние диалога «Поддержать автора»
+    var showSupportDialog by remember { mutableStateOf(false) }
 
     Scaffold(
-        topBar = { ChatListTopBar(currentUser = currentUser, isConnected = isConnected) },
+        topBar = {
+            ChatListTopBar(
+                currentUser = currentUser,
+                isConnected = isConnected,
+                onSupportClick = { showSupportDialog = true },
+            )
+        },
         floatingActionButton = {
             FloatingActionButton(
                 onClick = { /* TODO: открыть диалог нового чата */ },
@@ -110,7 +125,14 @@ fun ChatListScreen(
                     .padding(padding),
             ) {
                 items(chats, key = { it.id }) { chat ->
-                    ChatRow(chat = chat, onClick = { onChatClick(chat.id) })
+                    ChatRow(
+                        chat = chat,
+                        onClick = { onChatClick(chat.id) },
+                        onDeleteChat = { viewModel.deleteChat(chat.id) },
+                        onBlockUser = {
+                            chat.otherUserId?.let { userId -> viewModel.blockUser(userId) }
+                        },
+                    )
                     HorizontalDivider(
                         modifier = Modifier.padding(start = 80.dp, end = 16.dp),
                         color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f),
@@ -119,13 +141,22 @@ fun ChatListScreen(
             }
         }
     }
+
+    // Диалог «Поддержать автора»
+    if (showSupportDialog) {
+        SupportAuthorDialog(onDismiss = { showSupportDialog = false })
+    }
 }
 
 // ── Компактная шапка (заменяет TopAppBar) ─────────────────────────────────────
 // Высота фиксирована: 52dp + padding статус-бара (автоматически через statusBarsPadding)
 
 @Composable
-private fun ChatListTopBar(currentUser: User?, isConnected: Boolean) {
+private fun ChatListTopBar(
+    currentUser: User?,
+    isConnected: Boolean,
+    onSupportClick: () -> Unit,
+) {
     CompactTopBar(
         navigationIcon = {
             // Аватар с точкой статуса подключения
@@ -168,83 +199,182 @@ private fun ChatListTopBar(currentUser: User?, isConnected: Boolean) {
                 )
             }
         },
+        actions = {
+            // Иконка «Поддержать автора»
+            IconButton(onClick = onSupportClick) {
+                Icon(
+                    imageVector = Icons.Default.Favorite,
+                    contentDescription = "Поддержать автора",
+                    tint = MaterialTheme.colorScheme.onPrimary,
+                )
+            }
+        },
+    )
+}
+
+// ── Диалог «Поддержать автора» ───────────────────────────────────────────────
+
+@Composable
+private fun SupportAuthorDialog(onDismiss: () -> Unit) {
+    var supportInfo by remember { mutableStateOf<SupportInfoDto?>(null) }
+    var isLoading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    // Загружаем данные с сервера при открытии диалога
+    val viewModel: ChatListViewModel = hiltViewModel()
+    LaunchedEffect(Unit) {
+        val result = runCatching { viewModel.loadSupportInfo() }
+        result.onSuccess { info ->
+            supportInfo = info
+            isLoading = false
+        }.onFailure { e ->
+            error = e.message
+            isLoading = false
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(supportInfo?.title ?: "Поддержать автора") },
+        text = {
+            when {
+                isLoading -> Text("Загрузка...")
+                error != null -> Text("Не удалось загрузить: $error")
+                else -> {
+                    Column {
+                        supportInfo?.message?.let { msg ->
+                            Text(text = msg, style = MaterialTheme.typography.bodyMedium)
+                        }
+                        supportInfo?.links?.let { linksJson ->
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Text(
+                                text = linksJson,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Закрыть")
+            }
+        },
     )
 }
 
 // ── Строка одного чата ────────────────────────────────────────────────────────
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ChatRow(chat: Chat, onClick: () -> Unit) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Box {
-            AvatarImage(url = chat.avatarUrl, name = chat.title, size = 54)
-            if (chat.isPinned) {
-                Box(
-                    contentAlignment = Alignment.Center,
-                    modifier = Modifier
-                        .size(18.dp)
-                        .clip(CircleShape)
-                        .background(MaterialTheme.colorScheme.surface)
-                        .align(Alignment.BottomEnd),
-                ) { Text(text = "📌", fontSize = 10.sp) }
-            }
-        }
+private fun ChatRow(
+    chat: Chat,
+    onClick: () -> Unit,
+    onDeleteChat: () -> Unit,
+    onBlockUser: () -> Unit,
+) {
+    var showMenu by remember { mutableStateOf(false) }
 
-        Spacer(modifier = Modifier.width(12.dp))
-
-        Column(modifier = Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = chat.title,
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.weight(1f),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+    Box {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .combinedClickable(
+                    onClick = onClick,
+                    onLongClick = { showMenu = true },
                 )
-                if (chat.isMuted) Text(text = "🔇", fontSize = 12.sp, modifier = Modifier.padding(start = 4.dp))
-                Text(
-                    text = formatTimestamp(chat.updatedAt),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = if (chat.unreadCount > 0) MaterialTheme.colorScheme.primary
-                            else MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(start = 8.dp),
-                )
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box {
+                AvatarImage(url = chat.avatarUrl, name = chat.title, size = 54)
+                if (chat.isPinned) {
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .size(18.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.surface)
+                            .align(Alignment.BottomEnd),
+                    ) { Text(text = "📌", fontSize = 10.sp) }
+                }
             }
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.padding(top = 2.dp),
-            ) {
-                Text(
-                    text = chat.lastMessage?.let { msg ->
-                        when (msg.type) {
-                            MessageType.TEXT   -> msg.content
-                            MessageType.IMAGE  -> "📷 Фото"
-                            MessageType.VIDEO  -> "🎬 Видео"
-                            MessageType.AUDIO  -> "🎵 Аудио"
-                            MessageType.FILE   -> "📎 Файл"
-                            MessageType.SYSTEM -> msg.content
-                        }
-                    } ?: "Нет сообщений",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-                if (chat.unreadCount > 0) {
-                    UnreadBadge(
-                        count = chat.unreadCount,
-                        muted = chat.isMuted,
+
+            Spacer(modifier = Modifier.width(12.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = chat.title,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    if (chat.isMuted) Text(text = "🔇", fontSize = 12.sp, modifier = Modifier.padding(start = 4.dp))
+                    Text(
+                        text = formatTimestamp(chat.updatedAt),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (chat.unreadCount > 0) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(start = 8.dp),
                     )
                 }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(top = 2.dp),
+                ) {
+                    Text(
+                        text = chat.lastMessage?.let { msg ->
+                            when (msg.type) {
+                                MessageType.TEXT   -> msg.content
+                                MessageType.IMAGE  -> "📷 Фото"
+                                MessageType.VIDEO  -> "🎬 Видео"
+                                MessageType.AUDIO  -> "🎵 Аудио"
+                                MessageType.FILE   -> "📎 Файл"
+                                MessageType.SYSTEM -> msg.content
+                            }
+                        } ?: "Нет сообщений",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (chat.unreadCount > 0) {
+                        UnreadBadge(
+                            count = chat.unreadCount,
+                            muted = chat.isMuted,
+                            modifier = Modifier.padding(start = 8.dp),
+                        )
+                    }
+                }
+            }
+        }
+
+        // Контекстное меню при долгом нажатии
+        DropdownMenu(
+            expanded = showMenu,
+            onDismissRequest = { showMenu = false },
+        ) {
+            DropdownMenuItem(
+                text = { Text("Удалить чат") },
+                onClick = { showMenu = false; onDeleteChat() },
+                leadingIcon = {
+                    Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error)
+                },
+            )
+            if (chat.type == ChatType.DIRECT && chat.otherUserId != null) {
+                DropdownMenuItem(
+                    text = { Text("Заблокировать") },
+                    onClick = { showMenu = false; onBlockUser() },
+                    leadingIcon = {
+                        Icon(Icons.Default.Block, null, tint = MaterialTheme.colorScheme.error)
+                    },
+                )
             }
         }
     }

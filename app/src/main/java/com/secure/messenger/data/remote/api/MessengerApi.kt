@@ -95,6 +95,17 @@ interface MessengerApi {
 
     @GET("calls")
     suspend fun getCallHistory(@Query("chatId") chatId: String): ApiResponse<List<CallDto>>
+
+    // ── App — конфигурация клиента ───────────────────────────────────────────
+
+    @GET("app/ice-servers")
+    suspend fun getIceServers(): ApiResponse<List<IceServerDto>>
+
+    @GET("app/update")
+    suspend fun getUpdateInfo(): ApiResponse<UpdateInfoDto>
+
+    @GET("app/support")
+    suspend fun getSupportInfo(): ApiResponse<SupportInfoDto>
 }
 
 data class SendMessageRequest(
@@ -106,6 +117,28 @@ data class SendMessageRequest(
 
 data class AuthResponseDto(val token: String, val user: UserDto)
 data class CallDto(val id: String, val chatId: String, val type: String, val state: String, val startedAt: Long?, val durationSeconds: Int)
+
+// Конфигурация ICE-сервера (STUN/TURN) для WebRTC
+data class IceServerDto(
+    val urls: List<String>,
+    val username: String? = null,
+    val credential: String? = null,
+)
+
+// Информация об обновлении приложения
+data class UpdateInfoDto(
+    val versionCode: Int,
+    val versionName: String?,
+    val downloadUrl: String?,
+    val changelog: String?,
+)
+
+// Информация о поддержке автора
+data class SupportInfoDto(
+    val title: String?,
+    val message: String?,
+    val links: String?,  // JSON-строка с массивом ссылок
+)
 
 data class ApiResponse<T>(
     val success: Boolean,

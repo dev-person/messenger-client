@@ -8,6 +8,7 @@ data class Chat(
     val lastMessage: Message?,
     val unreadCount: Int,
     val members: List<User>,
+    val otherUserId: String? = null,
     val isPinned: Boolean = false,
     val isMuted: Boolean = false,
     val updatedAt: Long,

@@ -20,14 +20,14 @@ import javax.inject.Singleton
 import timber.log.Timber
 
 /**
- * Handles incoming real-time chat messages delivered over WebSocket.
+ * Обрабатывает входящие чат-сообщения, приходящие в реальном времени через WebSocket.
  *
- * Responsibilities:
- *  1. Parse the raw WS JSON envelope.
- *  2. Ensure the sender's user record is in the local DB (fetches from server if missing).
- *  3. Ensure the chat entity is in the local DB (creates minimal entry if missing).
- *  4. Decrypt the message using X25519 ECDH + AES-256-GCM.
- *  5. Persist the decrypted message to Room.
+ * Ответственность:
+ *  1. Разобрать JSON-конверт WebSocket.
+ *  2. Убедиться что отправитель есть в локальной БД (загрузить с сервера если нет).
+ *  3. Убедиться что чат есть в локальной БД (создать минимальную запись если нет).
+ *  4. Расшифровать сообщение через X25519 ECDH + AES-256-GCM.
+ *  5. Сохранить расшифрованное сообщение в Room.
  */
 @Singleton
 class IncomingMessageHandler @Inject constructor(
@@ -41,26 +41,30 @@ class IncomingMessageHandler @Inject constructor(
 ) {
     private val adapter = moshi.adapter(SignalingMessage::class.java)
 
-    suspend fun handle(json: String) {
+    /**
+     * Разбирает, расшифровывает и сохраняет входящее WebSocket-сообщение.
+     * Возвращает Pair(имя_отправителя, расшифрованный_текст) для уведомления, или null при ошибке.
+     */
+    suspend fun handle(json: String): Pair<String, String>? {
         try {
-            val msg = adapter.fromJson(json) ?: return
-            val payload = msg.payload ?: return
+            val msg = adapter.fromJson(json) ?: return null
+            val payload = msg.payload ?: return null
 
-            val chatId = payload["chatId"] as? String ?: return
-            // REST delivery uses "id"; client WS delivery uses "messageId"
-            val messageId = (payload["id"] ?: payload["messageId"]) as? String ?: return
-            val encryptedContent = payload["encryptedContent"] as? String ?: return
-            val senderId = payload["senderId"] as? String ?: return
+            val chatId = payload["chatId"] as? String ?: return null
+            // REST использует "id"; клиентский WS использует "messageId"
+            val messageId = (payload["id"] ?: payload["messageId"]) as? String ?: return null
+            val encryptedContent = payload["encryptedContent"] as? String ?: return null
+            val senderId = payload["senderId"] as? String ?: return null
             val timestampStr = payload["timestamp"] as? String
 
-            // Skip duplicates (e.g. WS + REST both deliver the same message)
-            if (messageDao.getById(messageId) != null) return
+            // Пропускаем дубликаты (WS + REST могут доставить одно и то же сообщение)
+            if (messageDao.getById(messageId) != null) return null
 
-            // Ensure sender exists locally with their public key for decryption
+            // Убеждаемся, что отправитель есть в локальной БД (нужен публичный ключ для расшифровки)
             val sender = userDao.getById(senderId) ?: run {
                 val dto = api.getUserById(senderId).data ?: run {
                     Timber.w("IncomingMessageHandler: sender $senderId not found on server")
-                    return
+                    return null
                 }
                 UserEntity(
                     id = dto.id, phone = dto.phone, username = dto.username,
@@ -71,7 +75,7 @@ class IncomingMessageHandler @Inject constructor(
                 ).also { userDao.upsert(it) }
             }
 
-            // Ensure chat exists locally so the UI can display it
+            // Убеждаемся, что чат существует в локальной БД для отображения в UI
             if (chatDao.getById(chatId) == null) {
                 chatDao.upsert(ChatEntity(
                     id = chatId, type = "DIRECT",
@@ -84,22 +88,38 @@ class IncomingMessageHandler @Inject constructor(
                 ))
             }
 
-            // Decrypt
+            // Расшифровываем
             val myPrivateKeyBase64 = localKeyStore.getPrivateKey() ?: run {
                 Timber.w("IncomingMessageHandler: no local private key")
-                return
+                return null
             }
             val myPrivateKeyBytes = Base64.decode(myPrivateKeyBase64, Base64.NO_WRAP)
-            val theirPublicKeyBytes = Base64.decode(sender.publicKey, Base64.NO_WRAP)
-            val sharedSecret = cryptoManager.computeSharedSecret(myPrivateKeyBytes, theirPublicKeyBytes)
-            val decryptedContent = cryptoManager.decryptMessage(encryptedContent, sharedSecret, messageId)
-                ?: "[Не удалось расшифровать]"
+            var senderPublicKeyBytes = Base64.decode(sender.publicKey, Base64.NO_WRAP)
+            var sharedSecret = cryptoManager.computeSharedSecret(myPrivateKeyBytes, senderPublicKeyBytes)
+            var decryptedContent = cryptoManager.decryptMessage(encryptedContent, sharedSecret, messageId)
+
+            if (decryptedContent == null) {
+                // Расшифровка не удалась — отправитель мог обновить ключевую пару (перелогин).
+                // Запрашиваем актуальный публичный ключ с сервера и пробуем ещё раз.
+                val freshDto = runCatching { api.getUserById(senderId).data }.getOrNull()
+                if (freshDto != null && freshDto.publicKey != sender.publicKey) {
+                    Timber.d("IncomingMessageHandler: retrying decrypt with fresh public key for $senderId")
+                    val freshPubBytes = Base64.decode(freshDto.publicKey, Base64.NO_WRAP)
+                    val freshSecret = cryptoManager.computeSharedSecret(myPrivateKeyBytes, freshPubBytes)
+                    decryptedContent = cryptoManager.decryptMessage(encryptedContent, freshSecret, messageId)
+                    if (decryptedContent != null) {
+                        // Сохраняем обновлённый ключ чтобы следующие сообщения расшифровывались сразу
+                        userDao.upsert(sender.copy(publicKey = freshDto.publicKey))
+                    }
+                }
+                if (decryptedContent == null) decryptedContent = "[Не удалось расшифровать]"
+            }
 
             val timestamp = if (timestampStr != null) {
                 try { Instant.parse(timestampStr).toEpochMilli() } catch (_: Exception) { System.currentTimeMillis() }
             } else System.currentTimeMillis()
 
-            // Persist
+            // Сохраняем в БД
             messageDao.upsert(MessageEntity(
                 id = messageId, chatId = chatId, senderId = senderId,
                 encryptedContent = encryptedContent, decryptedContent = decryptedContent,
@@ -108,8 +128,61 @@ class IncomingMessageHandler @Inject constructor(
                 replyToId = null, mediaUrl = null, isEdited = false,
             ))
 
+            return Pair(sender.displayName, decryptedContent.take(120))
+
         } catch (e: Exception) {
             Timber.e(e, "IncomingMessageHandler: failed to process message")
+            return null
         }
+    }
+
+    /** Удаляет сообщение, удалённое другим пользователем. */
+    suspend fun handleDelete(messageId: String) {
+        messageDao.deleteById(messageId)
+    }
+
+    /** Расшифровывает и применяет редактирование от другого пользователя. */
+    suspend fun handleEdit(messageId: String, chatId: String, encryptedContent: String) {
+        val chat = chatDao.getById(chatId) ?: return
+        val otherUserId = chat.otherUserId ?: return
+        val otherUser = userDao.getById(otherUserId) ?: return
+
+        val myPrivateKeyBase64 = localKeyStore.getPrivateKey() ?: return
+        val myPrivateKeyBytes = Base64.decode(myPrivateKeyBase64, Base64.NO_WRAP)
+        val theirPubKeyBytes = Base64.decode(otherUser.publicKey, Base64.NO_WRAP)
+        val sharedSecret = cryptoManager.computeSharedSecret(myPrivateKeyBytes, theirPubKeyBytes)
+        val decrypted = cryptoManager.decryptMessage(encryptedContent, sharedSecret, messageId)
+            ?: "[Не удалось расшифровать]"
+
+        messageDao.updateContent(messageId, encryptedContent, decrypted)
+    }
+
+    /** Помечает все сообщения от других пользователей в чате как READ, когда собеседник открывает чат. */
+    suspend fun handleMessagesRead(chatId: String, readerId: String) {
+        messageDao.markChatMessagesRead(chatId, readerId)
+    }
+
+    /**
+     * Преобразует ID пользователя в отображаемое имя.
+     * Сначала проверяет локальную БД; если нет — загружает с сервера.
+     * При неудаче возвращает сырой userId.
+     */
+    suspend fun getDisplayName(userId: String): String {
+        userDao.getById(userId)?.let { user ->
+            return user.displayName.ifEmpty { user.username }.ifEmpty { userId }
+        }
+        return runCatching { api.getUserById(userId).data }
+            .getOrNull()
+            ?.also { dto ->
+                userDao.upsert(UserEntity(
+                    id = dto.id, phone = dto.phone, username = dto.username,
+                    displayName = dto.displayName, avatarUrl = dto.avatarUrl,
+                    bio = dto.bio, isOnline = dto.isOnline,
+                    lastSeen = java.time.Instant.parse(dto.lastSeen).toEpochMilli(),
+                    publicKey = dto.publicKey, isContact = false,
+                ))
+            }
+            ?.let { dto -> dto.displayName.ifEmpty { dto.username }.ifEmpty { userId } }
+            ?: userId
     }
 }

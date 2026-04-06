@@ -132,11 +132,11 @@ fun ProfileSetupScreen(
 
                     Spacer(modifier = Modifier.height(14.dp))
 
-                    // Username (необязательно)
+                    // Username (обязательно)
                     OutlinedTextField(
                         value = state.username,
                         onValueChange = viewModel::onUsernameChange,
-                        label = { Text("Username") },
+                        label = { Text("Username *") },
                         placeholder = { Text("ivan_ivanov") },
                         prefix = { Text("@", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold) },
                         singleLine = true,
@@ -145,7 +145,8 @@ fun ProfileSetupScreen(
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = MaterialTheme.colorScheme.primary,
                         ),
-                        supportingText = { Text("Необязательно. Только буквы, цифры и _", style = MaterialTheme.typography.labelSmall) },
+                        supportingText = { Text("Только буквы, цифры и _", style = MaterialTheme.typography.labelSmall) },
+                        isError = state.error != null && state.username.isBlank(),
                     )
 
                     Spacer(modifier = Modifier.height(14.dp))
@@ -202,15 +203,7 @@ fun ProfileSetupScreen(
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    TextButton(onClick = { viewModel.skip(onSuccess) }) {
-                        Text(
-                            text = "Пропустить",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
+                    // Кнопка «Пропустить» убрана — username обязателен
                 }
             }
 

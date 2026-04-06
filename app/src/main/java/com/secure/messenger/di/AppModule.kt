@@ -58,6 +58,9 @@ object AppModule {
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .writeTimeout(30, TimeUnit.SECONDS)
+            // Ping каждые 25 сек держит соединение живым через NAT/файрвол.
+            // Если pong не пришёл — OkHttp закрывает сокет и мы получаем onFailure → переподключение.
+            .pingInterval(25, TimeUnit.SECONDS)
             .build()
 
     // ── Retrofit ──────────────────────────────────────────────────────────────

@@ -1,12 +1,16 @@
 package com.secure.messenger.data.repository
 
+import android.content.Context
+import android.content.Intent
 import com.secure.messenger.data.local.dao.UserDao
 import com.secure.messenger.data.local.entities.UserEntity
 import com.secure.messenger.data.remote.api.MessengerApi
 import com.secure.messenger.di.AuthTokenProvider
 import com.secure.messenger.domain.model.User
 import com.secure.messenger.domain.repository.AuthRepository
+import com.secure.messenger.service.MessagingService
 import com.secure.messenger.utils.LocalKeyStore
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -20,6 +24,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import javax.inject.Inject
 
 class AuthRepositoryImpl @Inject constructor(
+    @ApplicationContext private val context: Context,
     private val api: MessengerApi,
     private val userDao: UserDao,
     private val tokenProvider: AuthTokenProvider,
@@ -94,8 +99,11 @@ class AuthRepositoryImpl @Inject constructor(
     }
 
     override suspend fun logout() {
+        context.stopService(Intent(context, MessagingService::class.java))
         tokenProvider.clearToken()
-        localKeyStore.clear()
+        // Ключи НЕ удаляем: они привязаны к устройству, а не к сессии.
+        // Удаление ключей при выходе приводит к генерации новой пары при следующем входе,
+        // что делает все ранее зашифрованные сообщения нечитаемыми для собеседников.
         _currentUser.value = null
     }
 

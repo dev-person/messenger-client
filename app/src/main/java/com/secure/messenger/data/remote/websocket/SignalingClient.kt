@@ -12,7 +12,7 @@ import timber.log.Timber
 import javax.inject.Inject
 import javax.inject.Singleton
 
-/** Events emitted from the signaling WebSocket to the rest of the app. */
+/** События, приходящие из сигнального WebSocket в остальные части приложения. */
 sealed class SignalingEvent {
     data class Offer(val callId: String, val from: String, val sdp: String) : SignalingEvent()
     data class Answer(val sdp: String) : SignalingEvent()
@@ -24,19 +24,22 @@ sealed class SignalingEvent {
     data class IncomingCall(val callId: String, val callerId: String, val isVideo: Boolean) : SignalingEvent()
     data class CallEnded(val callId: String) : SignalingEvent()
     data class NewMessage(val json: String) : SignalingEvent()
+    data class MessageDeleted(val messageId: String, val chatId: String) : SignalingEvent()
+    data class MessageEdited(val messageId: String, val chatId: String, val encryptedContent: String) : SignalingEvent()
+    data class MessagesRead(val chatId: String, val readerId: String) : SignalingEvent()
     object Connected : SignalingEvent()
     object Disconnected : SignalingEvent()
 }
 
 /**
- * Persistent WebSocket connection to the signaling / messaging server.
+ * Постоянное WebSocket-подключение к сигнальному / сообщательному серверу.
  *
- * All messages are JSON envelopes: { "type": "...", "payload": { ... } }
- * The connection is authenticated via Bearer token in the HTTP header.
+ * Все сообщения — JSON-конверты: { "type": "...", "payload": { ... } }
+ * Подключение аутентифицируется через Bearer-токен в HTTP-заголовке.
  *
- * Routing: every signaling message (offer/answer/ice_candidate/end_call) must include
- * a "to" field with the target user ID. The server forwards the message and injects "from".
- * [peerUserId] is set automatically when sending an offer or receiving one.
+ * Маршрутизация: каждое сигнальное сообщение (offer/answer/ice_candidate/end_call)
+ * содержит поле "to" с ID целевого пользователя. Сервер пересылает сообщение и добавляет "from".
+ * [peerUserId] устанавливается автоматически при отправке или получении offer.
  */
 @Singleton
 class SignalingClient @Inject constructor(
@@ -45,8 +48,8 @@ class SignalingClient @Inject constructor(
 ) {
     private var webSocket: WebSocket? = null
 
-    // The user we are currently in a call with. Set when sending an offer (caller side)
-    // or when receiving an offer / incoming_call (callee side).
+    // Пользователь, с которым идёт текущий звонок. Устанавливается при отправке offer
+    // (вызывающая сторона) или при получении offer / incoming_call (принимающая сторона).
     private var peerUserId: String? = null
     private var currentCallId: String? = null
 
@@ -55,7 +58,7 @@ class SignalingClient @Inject constructor(
 
     private val adapter = moshi.adapter(SignalingMessage::class.java)
 
-    // ── Connection lifecycle ──────────────────────────────────────────────────
+    // ── Жизненный цикл подключения ────────────────────────────────────────────
 
     fun connect(serverUrl: String, authToken: String) {
         if (webSocket != null) return
@@ -96,7 +99,7 @@ class SignalingClient @Inject constructor(
         }
     }
 
-    // ── Message parsing ───────────────────────────────────────────────────────
+    // ── Разбор входящих сообщений ──────────────────────────────────────────────
 
     private fun parseAndEmit(json: String) {
         val msg = runCatching { adapter.fromJson(json) }.getOrNull() ?: return
@@ -104,7 +107,7 @@ class SignalingClient @Inject constructor(
 
         val event = when (msg.type) {
             "offer" -> {
-                // Server injects "from" = callerId when forwarding the offer
+                // Сервер добавляет "from" = callerId при пересылке offer
                 val from = payload["from"] as? String ?: ""
                 if (from.isNotEmpty()) peerUserId = from
                 SignalingEvent.Offer(
@@ -122,7 +125,7 @@ class SignalingClient @Inject constructor(
                 sdpMLineIndex = (payload["sdpMLineIndex"] as? Double)?.toInt() ?: 0,
             )
             "incoming_call" -> {
-                // Set peer so answer/ICE can be routed back even before the offer arrives
+                // Устанавливаем пира, чтобы answer/ICE маршрутизировались даже до прихода offer
                 val callerId = payload["callerId"] as? String ?: ""
                 if (callerId.isNotEmpty()) peerUserId = callerId
                 SignalingEvent.IncomingCall(
@@ -135,6 +138,19 @@ class SignalingClient @Inject constructor(
                 callId = payload["callId"] as? String ?: "",
             )
             "message" -> SignalingEvent.NewMessage(json)
+            "message_deleted" -> SignalingEvent.MessageDeleted(
+                messageId = payload["messageId"] as? String ?: return,
+                chatId = payload["chatId"] as? String ?: return,
+            )
+            "message_edited" -> SignalingEvent.MessageEdited(
+                messageId = payload["id"] as? String ?: return,
+                chatId = payload["chatId"] as? String ?: return,
+                encryptedContent = payload["encryptedContent"] as? String ?: return,
+            )
+            "messages_read" -> SignalingEvent.MessagesRead(
+                chatId = payload["chatId"] as? String ?: return,
+                readerId = payload["readerId"] as? String ?: return,
+            )
             else -> {
                 Timber.w("Unknown signaling type: ${msg.type}")
                 return
@@ -143,7 +159,7 @@ class SignalingClient @Inject constructor(
         _events.tryEmit(event)
     }
 
-    // ── Sending ───────────────────────────────────────────────────────────────
+    // ── Отправка ──────────────────────────────────────────────────────────────
 
     private fun send(type: String, payload: Map<String, Any?>) {
         val msg = SignalingMessage(type = type, payload = payload)
@@ -153,8 +169,8 @@ class SignalingClient @Inject constructor(
     }
 
     /**
-     * Send a WebRTC offer to [toUserId]. Stores [toUserId] as the current peer so that
-     * subsequent answer/ICE/end_call messages are routed to the correct recipient.
+     * Отправляет WebRTC offer пользователю [toUserId]. Сохраняет [toUserId] как текущего пира,
+     * чтобы последующие answer/ICE/end_call маршрутизировались правильно.
      */
     fun sendOffer(callId: String, toUserId: String, isVideo: Boolean, sdp: String) {
         currentCallId = callId

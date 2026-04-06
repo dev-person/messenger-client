@@ -21,4 +21,5 @@ interface ChatRepository {
     suspend fun markAsRead(chatId: String): Result<Unit>
     suspend fun pinChat(chatId: String): Result<Unit>
     suspend fun muteChat(chatId: String, mutedUntil: Long?): Result<Unit>
+    suspend fun deleteChat(chatId: String): Result<Unit>
 }

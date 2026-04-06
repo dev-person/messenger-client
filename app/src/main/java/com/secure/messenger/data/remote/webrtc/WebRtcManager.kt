@@ -1,6 +1,7 @@
 package com.secure.messenger.data.remote.webrtc
 
 import android.content.Context
+import com.secure.messenger.data.remote.api.MessengerApi
 import com.secure.messenger.data.remote.websocket.SignalingClient
 import com.secure.messenger.data.remote.websocket.SignalingEvent
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -10,6 +11,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.webrtc.AudioTrack
 import org.webrtc.Camera2Enumerator
@@ -33,26 +36,27 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Manages WebRTC peer connections for audio/video calls.
+ * Управляет WebRTC-соединениями для аудио/видео звонков.
  *
- * Security:
- *   - DTLS-SRTP is enforced by default in the WebRTC library (all media is encrypted).
- *   - ICE credentials are exchanged over the encrypted WebSocket signaling channel.
- *   - Only TURN/STUN with TLS endpoints should be used in production.
+ * Безопасность:
+ *   - DTLS-SRTP включён по умолчанию в WebRTC (весь медиа-трафик зашифрован).
+ *   - ICE-учётные данные передаются по зашифрованному WebSocket-каналу.
+ *   - В продакшене следует использовать TURN/STUN с TLS.
  *
- * Call flow — outgoing:
+ * Исходящий звонок:
  *   startOutgoingCall(callId, peerId, isVideo)
- *     → builds PeerConnection → adds tracks → creates offer → sends via SignalingClient
+ *     → создаёт PeerConnection → добавляет треки → создаёт offer → отправляет через SignalingClient
  *
- * Call flow — incoming:
- *   1. [SignalingEvent.Offer] arrives → offer SDP is buffered; peerUserId set in SignalingClient
+ * Входящий звонок:
+ *   1. Приходит [SignalingEvent.Offer] → SDP буферизуется; peerUserId сохраняется в SignalingClient
  *   2. acceptIncomingCall(callId, isVideo)
- *        → builds PeerConnection → adds tracks → processes buffered offer → creates answer
+ *        → создаёт PeerConnection → добавляет треки → обрабатывает буферизованный offer → создаёт answer
  */
 @Singleton
 class WebRtcManager @Inject constructor(
     @ApplicationContext private val context: Context,
     private val signalingClient: SignalingClient,
+    private val api: MessengerApi,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -65,8 +69,12 @@ class WebRtcManager @Inject constructor(
     private var localAudioTrack: AudioTrack? = null
     private var videoCapturer: VideoCapturer? = null
 
-    // Offer SDP buffered while waiting for the user to accept the incoming call
+    // SDP-предложение, буферизованное до принятия входящего звонка пользователем
     private var pendingOfferSdp: String? = null
+
+    // Завершает звонок, если ICE-согласование не завершилось за 30 секунд.
+    // Без TURN-сервера симметричный NAT может привести к бесконечному зависанию.
+    private var connectionTimeoutJob: Job? = null
 
     private val _callState = MutableStateFlow(WebRtcCallState.IDLE)
     val callState: StateFlow<WebRtcCallState> = _callState.asStateFlow()
@@ -79,18 +87,22 @@ class WebRtcManager @Inject constructor(
 
     private var factoryInitialized = false
 
-    // Signaling listener starts immediately on construction so that incoming
-    // offers are buffered even before the user initiates or accepts a call.
+    // Кешированный список ICE-серверов с временем загрузки
+    private var cachedIceServers: List<PeerConnection.IceServer>? = null
+    private var iceServersFetchedAt: Long = 0L
+    private val ICE_CACHE_TTL_MS = 5 * 60 * 1000L  // 5 минут
+
     init {
         listenToSignalingEvents()
+        // Загружаем ICE-конфигурацию с сервера заранее
+        scope.launch { fetchIceServers() }
     }
 
-    // ── Initialisation ────────────────────────────────────────────────────────
+    // ── Инициализация ─────────────────────────────────────────────────────────
 
     /**
-     * Lazily initialises [PeerConnectionFactory] on first call.
-     * Must be called on the thread that owns the EGL context (any thread is fine
-     * for the factory itself; EGL context is created once in [eglBase]).
+     * Лениво инициализирует [PeerConnectionFactory] при первом вызове.
+     * EGL-контекст создаётся однократно в [eglBase].
      */
     private fun ensureFactoryInitialized() {
         if (factoryInitialized) return
@@ -106,7 +118,7 @@ class WebRtcManager @Inject constructor(
         factoryInitialized = true
     }
 
-    // ── Signaling listener ────────────────────────────────────────────────────
+    // ── Обработка сигнальных событий ──────────────────────────────────────────
 
     private fun listenToSignalingEvents() {
         scope.launch {
@@ -115,18 +127,20 @@ class WebRtcManager @Inject constructor(
                     is SignalingEvent.Offer -> handleRemoteOffer(event)
                     is SignalingEvent.Answer -> handleRemoteAnswer(event.sdp)
                     is SignalingEvent.IceCandidate -> addRemoteIceCandidate(event.candidate, event.sdpMid, event.sdpMLineIndex)
-                    is SignalingEvent.CallEnded -> endCall()
+                    is SignalingEvent.CallEnded -> handleRemoteCallEnded()
                     else -> Unit
                 }
             }
         }
     }
 
-    // ── Outgoing call ─────────────────────────────────────────────────────────
+    // ── Исходящий звонок ──────────────────────────────────────────────────────
 
     fun startOutgoingCall(callId: String, peerId: String, isVideo: Boolean) {
         ensureFactoryInitialized()
+        setAudioMode(active = true)
         _callState.value = WebRtcCallState.CALLING
+        startConnectionTimeout()
         buildPeerConnection(callId)
         if (isVideo) addVideoTrack()
         addAudioTrack()
@@ -147,18 +161,20 @@ class WebRtcManager @Inject constructor(
         }, constraints)
     }
 
-    // ── Incoming call ─────────────────────────────────────────────────────────
+    // ── Входящий звонок ───────────────────────────────────────────────────────
 
     /**
-     * Called when the user taps "Accept" on an incoming call.
+     * Вызывается когда пользователь нажимает «Принять» на входящем звонке.
      *
-     * Builds the PeerConnection and adds local media tracks. If the remote offer has
-     * already arrived (buffered in [pendingOfferSdp]), it is processed immediately.
-     * Otherwise, it will be processed as soon as it arrives via [handleRemoteOffer].
+     * Создаёт PeerConnection и добавляет локальные медиа-треки. Если удалённый offer
+     * уже пришёл (буферизован в [pendingOfferSdp]), обрабатывается сразу.
+     * Иначе — обработается при поступлении через [handleRemoteOffer].
      */
     fun acceptIncomingCall(callId: String, isVideo: Boolean) {
         ensureFactoryInitialized()
+        setAudioMode(active = true)
         _callState.value = WebRtcCallState.CONNECTING
+        startConnectionTimeout()
         buildPeerConnection(callId)
         if (isVideo) addVideoTrack()
         addAudioTrack()
@@ -171,11 +187,10 @@ class WebRtcManager @Inject constructor(
     }
 
     /**
-     * Handles an incoming offer from the remote peer.
+     * Обрабатывает входящий offer от удалённого пира.
      *
-     * If the user has already accepted (PeerConnection exists), the offer is processed
-     * immediately. Otherwise, the SDP is buffered until [acceptIncomingCall] is called.
-     * The peer ID (callerId) has already been stored in [SignalingClient] by [parseAndEmit].
+     * Если пользователь уже принял (PeerConnection существует) — обрабатывается сразу.
+     * Иначе SDP буферизуется до вызова [acceptIncomingCall].
      */
     private fun handleRemoteOffer(event: SignalingEvent.Offer) {
         if (peerConnection != null) {
@@ -218,24 +233,75 @@ class WebRtcManager @Inject constructor(
         peerConnection?.addIceCandidate(IceCandidate(sdpMid, sdpMLineIndex, candidate))
     }
 
-    // ── PeerConnection builder ────────────────────────────────────────────────
+    // ── Построение PeerConnection ─────────────────────────────────────────────
+
+    /**
+     * Загружает ICE-серверы (STUN/TURN) с сервера.
+     * При ошибке — используем fallback (публичные серверы).
+     */
+    private suspend fun fetchIceServers() {
+        val servers = runCatching {
+            api.getIceServers().data?.flatMap { dto ->
+                dto.urls.map { url ->
+                    PeerConnection.IceServer.builder(url).apply {
+                        if (!dto.username.isNullOrEmpty()) setUsername(dto.username)
+                        if (!dto.credential.isNullOrEmpty()) setPassword(dto.credential)
+                    }.createIceServer()
+                }
+            }
+        }.getOrNull()
+        if (!servers.isNullOrEmpty()) {
+            cachedIceServers = servers
+            iceServersFetchedAt = System.currentTimeMillis()
+        }
+        Timber.d("ICE серверы загружены: ${cachedIceServers?.size ?: 0}")
+    }
+
+    /** Перезагружает ICE-серверы если кеш устарел */
+    private suspend fun refreshIceServersIfNeeded() {
+        val age = System.currentTimeMillis() - iceServersFetchedAt
+        if (cachedIceServers == null || age > ICE_CACHE_TTL_MS) {
+            fetchIceServers()
+        }
+    }
+
+    /** Возвращает fallback ICE-серверы если серверный конфиг недоступен */
+    private fun fallbackIceServers() = listOf(
+        PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
+        PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer(),
+        PeerConnection.IceServer.builder("turn:openrelay.metered.ca:443?transport=tcp")
+            .setUsername("openrelayproject").setPassword("openrelayproject").createIceServer(),
+    )
 
     private fun buildPeerConnection(callId: String) {
-        val iceServers = listOf(
-            // Production: use your own TURN server with TLS
-            PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
-        )
+        // Обновляем ICE-серверы перед каждым звонком если кеш устарел
+        kotlinx.coroutines.runBlocking { refreshIceServersIfNeeded() }
+        val iceServers = cachedIceServers?.takeIf { it.isNotEmpty() } ?: fallbackIceServers()
 
         val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
-            // DTLS-SRTP is the default and cannot be disabled in modern WebRTC
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+            // Принудительно используем relay (TURN) если STUN не проходит
+            iceTransportsType = PeerConnection.IceTransportsType.ALL
         }
 
         peerConnection = peerConnectionFactory.createPeerConnection(
             rtcConfig,
             buildPeerConnectionObserver(callId),
         )
+    }
+
+    private fun startConnectionTimeout() {
+        connectionTimeoutJob?.cancel()
+        connectionTimeoutJob = scope.launch {
+            delay(30_000L)
+            if (_callState.value != WebRtcCallState.CONNECTED &&
+                _callState.value != WebRtcCallState.IDLE &&
+                _callState.value != WebRtcCallState.ENDED) {
+                Timber.w("WebRTC: connection timeout after 30s, ending call")
+                handleRemoteCallEnded()
+            }
+        }
     }
 
     private fun buildPeerConnectionObserver(callId: String) = object : PeerConnection.Observer {
@@ -259,10 +325,17 @@ class WebRtcManager @Inject constructor(
 
         override fun onConnectionChange(state: PeerConnection.PeerConnectionState) {
             _callState.value = when (state) {
-                PeerConnection.PeerConnectionState.CONNECTED -> WebRtcCallState.CONNECTED
+                PeerConnection.PeerConnectionState.CONNECTED -> {
+                    connectionTimeoutJob?.cancel()
+                    WebRtcCallState.CONNECTED
+                }
                 PeerConnection.PeerConnectionState.DISCONNECTED,
                 PeerConnection.PeerConnectionState.FAILED,
-                PeerConnection.PeerConnectionState.CLOSED -> WebRtcCallState.ENDED
+                PeerConnection.PeerConnectionState.CLOSED -> {
+                    // peerConnection is nulled by endCall() before close() is called, so if it's
+                    // still non-null here, the remote side dropped the connection unexpectedly.
+                    if (peerConnection != null) WebRtcCallState.ENDED else _callState.value
+                }
                 else -> _callState.value
             }
             Timber.d("WebRTC connection state: $state")
@@ -280,7 +353,7 @@ class WebRtcManager @Inject constructor(
         override fun onAddTrack(receiver: RtpReceiver, streams: Array<MediaStream>) = Unit
     }
 
-    // ── Media tracks ──────────────────────────────────────────────────────────
+    // ── Медиа-треки ──────────────────────────────────────────────────────────
 
     private fun addAudioTrack() {
         val audioSource = peerConnectionFactory.createAudioSource(MediaConstraints().apply {
@@ -307,14 +380,14 @@ class WebRtcManager @Inject constructor(
 
     private fun buildCameraCapturer(): VideoCapturer {
         val enumerator = Camera2Enumerator(context)
-        // Prefer front camera for video calls
+        // Предпочитаем фронтальную камеру для видеозвонков
         return enumerator.deviceNames
             .firstOrNull { enumerator.isFrontFacing(it) }
             ?.let { enumerator.createCapturer(it, null) }
             ?: enumerator.createCapturer(enumerator.deviceNames.first(), null)
     }
 
-    // ── Controls ──────────────────────────────────────────────────────────────
+    // ── Управление звонком ────────────────────────────────────────────────────
 
     fun toggleMute(muted: Boolean) {
         localAudioTrack?.setEnabled(!muted)
@@ -333,9 +406,27 @@ class WebRtcManager @Inject constructor(
         manager.isSpeakerphoneOn = on
     }
 
-    // ── Teardown ──────────────────────────────────────────────────────────────
+    private fun setAudioMode(active: Boolean) {
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+        if (active) {
+            am.mode = android.media.AudioManager.MODE_IN_COMMUNICATION
+        } else {
+            am.mode = android.media.AudioManager.MODE_NORMAL
+            am.isSpeakerphoneOn = false
+        }
+    }
 
+    // ── Завершение звонка ─────────────────────────────────────────────────────
+
+    /**
+     * Завершает звонок локально. Обнуляет [peerConnection] ДО вызова close(),
+     * чтобы колбэк [onConnectionChange](CLOSED) не выставил [WebRtcCallState.ENDED]
+     * (иначе CallScreen закроется при следующем открытии).
+     */
     fun endCall() {
+        connectionTimeoutJob?.cancel()
+        val pc = peerConnection
+        peerConnection = null   // null first — suppresses spurious ENDED from onConnectionChange
         pendingOfferSdp = null
 
         videoCapturer?.stopCapture()
@@ -351,11 +442,42 @@ class WebRtcManager @Inject constructor(
 
         _remoteVideoTrack.value = null
 
-        peerConnection?.close()
-        peerConnection?.dispose()
-        peerConnection = null
+        pc?.close()
+        pc?.dispose()
 
+        setAudioMode(active = false)
         _callState.value = WebRtcCallState.IDLE
+    }
+
+    /**
+     * Вызывается когда УДАЛЁННАЯ сторона завершила звонок (через [SignalingEvent.CallEnded]).
+     * Выставляет [WebRtcCallState.ENDED], чтобы CallScreen закрылся.
+     */
+    private fun handleRemoteCallEnded() {
+        connectionTimeoutJob?.cancel()
+        if (peerConnection == null && pendingOfferSdp == null) return  // no active session, ignore
+        val pc = peerConnection
+        peerConnection = null
+        pendingOfferSdp = null
+
+        videoCapturer?.stopCapture()
+        videoCapturer?.dispose()
+        videoCapturer = null
+
+        localVideoTrack?.dispose()
+        localVideoTrack = null
+        _localVideoTrack.value = null
+
+        localAudioTrack?.dispose()
+        localAudioTrack = null
+
+        _remoteVideoTrack.value = null
+
+        pc?.close()
+        pc?.dispose()
+
+        setAudioMode(active = false)
+        _callState.value = WebRtcCallState.ENDED
     }
 
     fun dispose() {
@@ -367,7 +489,7 @@ class WebRtcManager @Inject constructor(
 
 enum class WebRtcCallState { IDLE, CALLING, RINGING, CONNECTING, CONNECTED, ENDED }
 
-/** No-op SdpObserver base class to reduce boilerplate. */
+/** Базовый SdpObserver без действий — уменьшает шаблонный код. */
 open class SimpleSdpObserver : SdpObserver {
     override fun onCreateSuccess(sdp: SessionDescription) = Unit
     override fun onSetSuccess() = Unit

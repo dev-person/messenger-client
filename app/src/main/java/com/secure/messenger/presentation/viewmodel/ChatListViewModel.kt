@@ -2,17 +2,17 @@ package com.secure.messenger.presentation.viewmodel
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.secure.messenger.BuildConfig
+import com.secure.messenger.data.remote.api.MessengerApi
 import com.secure.messenger.data.remote.websocket.SignalingClient
 import com.secure.messenger.data.remote.websocket.SignalingEvent
 import com.secure.messenger.di.AuthTokenProvider
-import com.secure.messenger.service.IncomingMessageHandler
+import com.secure.messenger.data.remote.api.SupportInfoDto
 import com.secure.messenger.domain.model.Chat
 import com.secure.messenger.domain.model.User
 import com.secure.messenger.domain.repository.AuthRepository
 import com.secure.messenger.domain.repository.ChatRepository
+import com.secure.messenger.domain.repository.ContactRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -27,9 +27,10 @@ import javax.inject.Inject
 class ChatListViewModel @Inject constructor(
     private val chatRepository: ChatRepository,
     authRepository: AuthRepository,
+    private val contactRepository: ContactRepository,
+    private val api: MessengerApi,
     private val signalingClient: SignalingClient,
     private val tokenProvider: AuthTokenProvider,
-    private val incomingMessageHandler: IncomingMessageHandler,
 ) : ViewModel() {
 
     // Список всех чатов — обновляется в реальном времени
@@ -46,8 +47,7 @@ class ChatListViewModel @Inject constructor(
     val isConnected: StateFlow<Boolean> = _isConnected.asStateFlow()
 
     init {
-        observeConnectionState()
-        connectWebSocket()
+        observeSignalingEvents()
         syncChats()
     }
 
@@ -58,51 +58,35 @@ class ChatListViewModel @Inject constructor(
         }
     }
 
-    // Подключаемся к WebSocket при создании ViewModel (открытие главного экрана)
-    private fun connectWebSocket() {
-        val token = tokenProvider.token ?: return
-        signalingClient.connect(BuildConfig.WS_BASE_URL, token)
-    }
-
-    // Подписываемся на события и отслеживаем статус подключения
-    private fun observeConnectionState() {
+    // Только наблюдаем за событиями — WebSocket-соединением управляет MessagingService.
+    private fun observeSignalingEvents() {
         viewModelScope.launch {
             signalingClient.events.collect { event ->
                 when (event) {
                     is SignalingEvent.Connected    -> _isConnected.value = true
-                    is SignalingEvent.Disconnected -> {
-                        _isConnected.value = false
-                        scheduleReconnect()
-                    }
-                    is SignalingEvent.NewMessage -> viewModelScope.launch {
-                        incomingMessageHandler.handle(event.json)
-                    }
+                    is SignalingEvent.Disconnected -> _isConnected.value = false
                     else -> Unit
                 }
             }
         }
     }
 
-    // Переподключение с задержкой — вызывается автоматически при разрыве
-    private fun scheduleReconnect() {
+    // ── Действия с чатами ─────────────────────────────────────────────────────
+
+    /** Удаляет чат из локальной БД */
+    fun deleteChat(chatId: String) {
+        viewModelScope.launch { chatRepository.deleteChat(chatId) }
+    }
+
+    /** Блокирует пользователя (удаляет из контактов) */
+    fun blockUser(userId: String) {
         viewModelScope.launch {
-            delay(3_000)
-            if (!_isConnected.value) {
-                connectWebSocket()
-            }
+            runCatching { api.removeContact(userId) }
         }
     }
 
-    // Немедленное переподключение — вызывается при возврате в foreground
-    fun reconnect() {
-        if (!_isConnected.value) {
-            connectWebSocket()
-        }
-    }
-
-    override fun onCleared() {
-        // Отключаемся при уходе с главного экрана
-        signalingClient.disconnect()
-        super.onCleared()
+    /** Загружает информацию «Поддержать автора» с сервера */
+    suspend fun loadSupportInfo(): SupportInfoDto? {
+        return api.getSupportInfo().data
     }
 }

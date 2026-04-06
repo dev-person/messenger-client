@@ -59,16 +59,18 @@ class ChatRepositoryImpl @Inject constructor(
         }
 
         // Для прямых чатов сервер возвращает пустой title — подставляем имя собеседника
+        val otherMember = dto.members?.firstOrNull { it.id == userId }
         val title = if (dto.title.isEmpty() && dto.type == "DIRECT") {
-            dto.members?.firstOrNull { it.id == userId }?.displayName
+            otherMember?.displayName
                 ?: userDao.getById(userId)?.displayName
                 ?: ""
         } else {
             dto.title
         }
+        val avatarUrl = dto.avatarUrl ?: otherMember?.avatarUrl
 
         val entity = ChatEntity(
-            id = dto.id, type = dto.type, title = title, avatarUrl = dto.avatarUrl,
+            id = dto.id, type = dto.type, title = title, avatarUrl = avatarUrl,
             unreadCount = dto.unreadCount, isPinned = dto.isPinned, isMuted = dto.isMuted,
             updatedAt = Instant.parse(dto.updatedAt).toEpochMilli(), otherUserId = userId,
         )
@@ -92,10 +94,10 @@ class ChatRepositoryImpl @Inject constructor(
         val chatEntity = chatDao.getById(chatId) ?: error("Chat not found: $chatId")
         val messageId = UUID.randomUUID().toString()
 
-        // Encrypt the message with the recipient's public key
+        // Шифруем сообщение публичным ключом получателя
         val encryptedContent = encryptForChat(chatEntity, content, messageId)
 
-        // Optimistically insert into local DB as SENDING
+        // Оптимистичная вставка в локальную БД со статусом SENDING
         val optimisticEntity = MessageEntity(
             id = messageId, chatId = chatId, senderId = "me", // replaced on server response
             encryptedContent = encryptedContent, decryptedContent = content,
@@ -104,11 +106,11 @@ class ChatRepositoryImpl @Inject constructor(
         )
         messageDao.upsert(optimisticEntity)
 
-        // Send to server
+        // Отправляем на сервер
         val request = SendMessageRequest(messageId = messageId, encryptedContent = encryptedContent)
         val dto = api.sendMessage(chatId, request).data ?: error("Send failed")
 
-        // Update with confirmed server entity
+        // Обновляем подтверждённым ответом сервера
         val confirmedEntity = optimisticEntity.copy(
             id = dto.id,
             senderId = dto.senderId,
@@ -117,7 +119,7 @@ class ChatRepositoryImpl @Inject constructor(
         )
         messageDao.upsert(confirmedEntity)
 
-        // Also push via WebSocket for real-time delivery to recipient
+        // Дополнительно отправляем через WebSocket для доставки в реальном времени
         signalingClient.sendChatMessage(chatId, encryptedContent, dto.id)
 
         confirmedEntity.toDomain()
@@ -147,9 +149,30 @@ class ChatRepositoryImpl @Inject constructor(
         val myPrivateKeyBase64 = localKeyStore.getPrivateKey() ?: error("No local private key")
         val myPrivateKeyBytes = Base64.decode(myPrivateKeyBase64, Base64.NO_WRAP)
 
+        // Получаем актуальный публичный ключ собеседника прямо с сервера —
+        // это защищает от устаревшего ключа в локальной БД после смены ключевой пары.
         val sharedSecret: ByteArray? = if (chat.type == "DIRECT") {
             val otherUserId = chat.otherUserId ?: error("otherUserId missing for chat $chatId")
-            val otherUser = userDao.getById(otherUserId) ?: error("Other user not found: $otherUserId")
+            val otherUser = run {
+                val fresh = runCatching { api.getUserById(otherUserId).data }.getOrNull()
+                if (fresh != null) {
+                    val entity = userDao.getById(otherUserId)
+                    if (entity == null || entity.publicKey != fresh.publicKey) {
+                        // Обновляем ключ в БД если он изменился
+                        userDao.upsert(UserEntity(
+                            id = fresh.id, phone = fresh.phone, username = fresh.username,
+                            displayName = fresh.displayName, avatarUrl = fresh.avatarUrl,
+                            bio = fresh.bio, isOnline = fresh.isOnline,
+                            lastSeen = java.time.Instant.parse(fresh.lastSeen).toEpochMilli(),
+                            publicKey = fresh.publicKey,
+                            isContact = entity?.isContact ?: false,
+                        ))
+                    }
+                    userDao.getById(otherUserId) ?: error("Other user not found: $otherUserId")
+                } else {
+                    userDao.getById(otherUserId) ?: error("Other user not found: $otherUserId")
+                }
+            }
             val theirPublicKeyBytes = Base64.decode(otherUser.publicKey, Base64.NO_WRAP)
             cryptoManager.computeSharedSecret(myPrivateKeyBytes, theirPublicKeyBytes)
         } else null
@@ -169,13 +192,14 @@ class ChatRepositoryImpl @Inject constructor(
                 replyToId = dto.replyToId, mediaUrl = dto.mediaUrl, isEdited = dto.isEdited,
             )
         }
-        messageDao.upsertAll(entities)
+        // Вставляем сообщения, не понижая статус (READ → SENT — баг после перезапуска).
+        upsertWithoutStatusDowngrade(entities)
     }
 
     override suspend fun syncChats(myUserId: String): Result<Unit> = runCatching {
         val dtos = api.getChats().data.orEmpty()
         for (dto in dtos) {
-            // Save members to userDao — needed for encryption and display
+            // Сохраняем участников в локальную БД — нужно для шифрования и отображения
             dto.members?.forEach { memberDto ->
                 val existing = userDao.getById(memberDto.id)
                 userDao.upsert(UserEntity(
@@ -193,16 +217,23 @@ class ChatRepositoryImpl @Inject constructor(
                     ?: chatDao.getById(dto.id)?.otherUserId
             } else null
 
+            val otherMember = if (dto.type == "DIRECT") {
+                dto.members?.firstOrNull { it.id != myUserId }
+            } else null
+
             val title = if (dto.type == "DIRECT" && dto.title.isEmpty()) {
-                dto.members?.firstOrNull { it.id != myUserId }?.displayName
+                otherMember?.displayName
                     ?: chatDao.getById(dto.id)?.title
                     ?: ""
             } else {
                 dto.title
             }
 
+            // Для прямых чатов: если у чата нет аватарки — берём аватар собеседника
+            val avatarUrl = dto.avatarUrl ?: otherMember?.avatarUrl
+
             chatDao.upsert(ChatEntity(
-                id = dto.id, type = dto.type, title = title, avatarUrl = dto.avatarUrl,
+                id = dto.id, type = dto.type, title = title, avatarUrl = avatarUrl,
                 unreadCount = dto.unreadCount, isPinned = dto.isPinned, isMuted = dto.isMuted,
                 updatedAt = Instant.parse(dto.updatedAt).toEpochMilli(),
                 otherUserId = otherUserId,
@@ -224,7 +255,39 @@ class ChatRepositoryImpl @Inject constructor(
         chatDao.setMuted(chatId, mutedUntil != null)
     }
 
-    // ── Encryption helper ─────────────────────────────────────────────────────
+    override suspend fun deleteChat(chatId: String): Result<Unit> = runCatching {
+        chatDao.deleteById(chatId)
+    }
+
+    // ── Защита от понижения статуса при синхронизации ────────────────────────
+
+    /**
+     * Вставляет сообщения, не понижая статус.
+     * Порядок: SENDING(0) < SENT(1) < DELIVERED(2) < READ(3).
+     */
+    private suspend fun upsertWithoutStatusDowngrade(messages: List<MessageEntity>) {
+        for (msg in messages) {
+            val existing = messageDao.getById(msg.id)
+            if (existing != null) {
+                val localPriority = statusPriority(existing.status)
+                val remotePriority = statusPriority(msg.status)
+                val finalStatus = if (localPriority > remotePriority) existing.status else msg.status
+                messageDao.upsert(msg.copy(status = finalStatus))
+            } else {
+                messageDao.upsert(msg)
+            }
+        }
+    }
+
+    private fun statusPriority(status: String): Int = when (status) {
+        "SENDING"   -> 0
+        "SENT"      -> 1
+        "DELIVERED" -> 2
+        "READ"      -> 3
+        else        -> 0
+    }
+
+    // ── Шифрование ─────────────────────────────────────────────────────────
 
     private suspend fun encryptForChat(chat: ChatEntity, content: String, messageId: String): String {
         val myPrivateKeyBase64 = localKeyStore.getPrivateKey() ?: error("No local private key")
@@ -238,7 +301,7 @@ class ChatRepositoryImpl @Inject constructor(
         return cryptoManager.encryptMessage(content, sharedSecret, messageId)
     }
 
-    // ── Mapping helpers ───────────────────────────────────────────────────────
+    // ── Маппинг сущностей ──────────────────────────────────────────────────
 
     private fun ChatWithLastMessage.toChat() = chat.toChat(
         lastMessage = lastMsgId?.let {
@@ -264,6 +327,7 @@ class ChatRepositoryImpl @Inject constructor(
         lastMessage = lastMessage,
         unreadCount = unreadCount,
         members = emptyList(),
+        otherUserId = otherUserId,
         isPinned = isPinned,
         isMuted = isMuted,
         updatedAt = updatedAt,

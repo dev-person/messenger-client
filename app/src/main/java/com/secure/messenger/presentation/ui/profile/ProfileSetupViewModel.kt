@@ -57,8 +57,17 @@ class ProfileSetupViewModel @Inject constructor(
 
     fun save(onSuccess: () -> Unit) {
         val name = _uiState.value.displayName.trim()
+        val username = _uiState.value.username.trim()
         if (name.isEmpty()) {
             _uiState.value = _uiState.value.copy(error = "Укажите ваше имя")
+            return
+        }
+        if (username.isEmpty()) {
+            _uiState.value = _uiState.value.copy(error = "Укажите username")
+            return
+        }
+        if (username.length < 3) {
+            _uiState.value = _uiState.value.copy(error = "Username должен быть не менее 3 символов")
             return
         }
 
@@ -74,7 +83,4 @@ class ProfileSetupViewModel @Inject constructor(
         }
     }
 
-    fun skip(onSuccess: () -> Unit) {
-        onSuccess()
-    }
 }

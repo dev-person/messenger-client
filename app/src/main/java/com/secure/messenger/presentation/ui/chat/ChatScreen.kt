@@ -1,7 +1,9 @@
 package com.secure.messenger.presentation.ui.chat
 
 import androidx.compose.animation.animateContentSize
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -26,7 +28,14 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Call
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Done
+import androidx.compose.material.icons.filled.DoneAll
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -40,12 +49,15 @@ import com.secure.messenger.presentation.ui.components.CompactTopBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -54,6 +66,7 @@ import com.secure.messenger.domain.model.Chat
 import com.secure.messenger.domain.model.ChatType
 import com.secure.messenger.domain.model.Message
 import com.secure.messenger.domain.model.MessageStatus
+import com.secure.messenger.domain.model.MessageType
 import com.secure.messenger.presentation.theme.IncomingBubble
 import com.secure.messenger.presentation.theme.IncomingBubbleDark
 import com.secure.messenger.presentation.theme.OutgoingBubble
@@ -106,8 +119,10 @@ fun ChatScreen(
         bottomBar = {
             MessageInputBar(
                 text = inputText,
+                editingMessage = uiState.editingMessage,
                 onTextChange = viewModel::onInputChange,
                 onSend = viewModel::sendMessage,
+                onCancelEdit = viewModel::cancelEditing,
             )
         },
     ) { padding ->
@@ -128,10 +143,18 @@ fun ChatScreen(
                     DateSeparator(timestamp = message.timestamp)
                 }
 
-                MessageBubble(
-                    message = message,
-                    isOutgoing = message.senderId == currentUserId,
-                )
+                if (message.type == MessageType.SYSTEM) {
+                    // Системное сообщение (звонки и т.д.) — по центру
+                    SystemMessage(text = message.content, timestamp = message.timestamp)
+                } else {
+                    val isOutgoing = message.senderId == currentUserId
+                    MessageBubble(
+                        message = message,
+                        isOutgoing = isOutgoing,
+                        onDelete = if (isOutgoing) { { viewModel.deleteMessage(message) } } else null,
+                        onEdit   = if (isOutgoing) { { viewModel.startEditing(message) } } else null,
+                    )
+                }
             }
         }
     }
@@ -146,10 +169,10 @@ private fun ChatTopBar(
     onBack: () -> Unit,
     onCallClick: (userId: String, isVideo: Boolean, peerName: String) -> Unit,
 ) {
-    // Для прямого чата — собеседник это участник, который не является текущим пользователем
-    val peer = chatInfo?.members?.firstOrNull { it.id != currentUserId }
-    val peerId   = peer?.id ?: ""
-    val peerName = chatInfo?.title ?: peer?.displayName ?: ""
+    // Для прямого чата peerId хранится прямо в ChatEntity.otherUserId
+    val peerId   = chatInfo?.otherUserId ?: ""
+    val peerName = chatInfo?.title ?: ""
+    val isDirectChat = chatInfo == null || chatInfo.type != ChatType.GROUP
 
     CompactTopBar(
         navigationIcon = {
@@ -190,11 +213,17 @@ private fun ChatTopBar(
             }
         },
         actions = {
-            if (peerId.isNotEmpty()) {
-                IconButton(onClick = { onCallClick(peerId, false, peerName) }) {
+            if (isDirectChat) {
+                IconButton(
+                    onClick = { if (peerId.isNotEmpty()) onCallClick(peerId, false, peerName) },
+                    enabled = peerId.isNotEmpty(),
+                ) {
                     Icon(Icons.Default.Call, "Аудиозвонок", tint = MaterialTheme.colorScheme.onPrimary)
                 }
-                IconButton(onClick = { onCallClick(peerId, true, peerName) }) {
+                IconButton(
+                    onClick = { if (peerId.isNotEmpty()) onCallClick(peerId, true, peerName) },
+                    enabled = peerId.isNotEmpty(),
+                ) {
                     Icon(Icons.Default.Videocam, "Видеозвонок", tint = MaterialTheme.colorScheme.onPrimary)
                 }
             }
@@ -224,11 +253,52 @@ private fun DateSeparator(timestamp: Long) {
     }
 }
 
-// ── Пузырь сообщения ──────────────────────────────────────────────────────────
+// ── Системное сообщение (звонки, события) ────────────────────────────────────
 
 @Composable
-private fun MessageBubble(message: Message, isOutgoing: Boolean) {
+private fun SystemMessage(text: String, timestamp: Long) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(12.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f))
+                .padding(horizontal = 14.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = text,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontWeight = FontWeight.Medium,
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = formatMessageTime(timestamp),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                fontSize = 10.sp,
+            )
+        }
+    }
+}
+
+// ── Пузырь сообщения ──────────────────────────────────────────────────────────
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun MessageBubble(
+    message: Message,
+    isOutgoing: Boolean,
+    onDelete: (() -> Unit)?,
+    onEdit: (() -> Unit)?,
+) {
     val darkTheme = isSystemInDarkTheme()
+    var showMenu by remember { mutableStateOf(false) }
 
     // Цвет пузыря зависит от направления и темы приложения
     val bubbleColor = when {
@@ -255,54 +325,87 @@ private fun MessageBubble(message: Message, isOutgoing: Boolean) {
             .padding(horizontal = 8.dp, vertical = 2.dp),
         horizontalArrangement = if (isOutgoing) Arrangement.End else Arrangement.Start,
     ) {
-        Column(
-            modifier = Modifier
-                .widthIn(max = 280.dp)
-                .clip(shape)
-                .background(bubbleColor)
-                .padding(horizontal = 12.dp, vertical = 8.dp)
-                .animateContentSize(),
-        ) {
-            Text(
-                text = message.content,
-                style = MaterialTheme.typography.bodyMedium,
-                color = textColor,
-            )
-            // Время и статус доставки — справа внизу пузыря
-            Row(
+        Box {
+            Column(
                 modifier = Modifier
-                    .align(Alignment.End)
-                    .padding(top = 2.dp),
-                verticalAlignment = Alignment.CenterVertically,
+                    .widthIn(max = 280.dp)
+                    .clip(shape)
+                    .background(bubbleColor)
+                    .combinedClickable(
+                        onClick = {},
+                        onLongClick = { if (onDelete != null || onEdit != null) showMenu = true },
+                    )
+                    .padding(horizontal = 12.dp, vertical = 8.dp)
+                    .animateContentSize(),
             ) {
                 Text(
-                    text = formatMessageTime(message.timestamp),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = metaColor,
-                    fontSize = 11.sp,
+                    text = message.content,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = textColor,
                 )
-                if (isOutgoing) {
-                    Spacer(modifier = Modifier.width(4.dp))
-                    MessageStatusIcon(status = message.status, metaColor = metaColor)
+                // Время, отметка редактирования и статус доставки — справа внизу пузыря
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.End)
+                        .padding(top = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (message.isEdited) {
+                        Text(
+                            text = "ред.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = metaColor,
+                            fontSize = 10.sp,
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                    }
+                    Text(
+                        text = formatMessageTime(message.timestamp),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = metaColor,
+                        fontSize = 11.sp,
+                    )
+                    if (isOutgoing) {
+                        Spacer(modifier = Modifier.width(4.dp))
+                        MessageStatusIcon(status = message.status, metaColor = metaColor)
+                    }
+                }
+            }
+
+            // Контекстное меню — появляется при долгом нажатии на своё сообщение
+            DropdownMenu(
+                expanded = showMenu,
+                onDismissRequest = { showMenu = false },
+            ) {
+                if (onEdit != null) {
+                    DropdownMenuItem(
+                        text = { Text("Редактировать") },
+                        onClick = { showMenu = false; onEdit() },
+                    )
+                }
+                if (onDelete != null) {
+                    DropdownMenuItem(
+                        text = { Text("Удалить", color = MaterialTheme.colorScheme.error) },
+                        onClick = { showMenu = false; onDelete() },
+                    )
                 }
             }
         }
     }
 }
 
-// ── Иконка статуса сообщения ──────────────────────────────────────────────────
+// ── Иконка статуса сообщения (Telegram-стиль) ────────────────────────────────
 
 @Composable
 private fun MessageStatusIcon(status: MessageStatus, metaColor: Color) {
-    val (symbol, color) = when (status) {
-        MessageStatus.SENDING   -> "○" to metaColor
-        MessageStatus.SENT      -> "✓" to metaColor
-        MessageStatus.DELIVERED -> "✓✓" to metaColor
-        // Прочитанные сообщения — голубые галочки
-        MessageStatus.READ      -> "✓✓" to Color(0xFF4FC3F7)
-        MessageStatus.FAILED    -> "✗" to MaterialTheme.colorScheme.error
+    val iconSize = Modifier.size(14.dp)
+    when (status) {
+        MessageStatus.SENDING   -> Icon(Icons.Default.Schedule, null, tint = metaColor, modifier = iconSize)
+        MessageStatus.SENT      -> Icon(Icons.Default.Done,    null, tint = metaColor, modifier = iconSize)
+        MessageStatus.DELIVERED -> Icon(Icons.Default.DoneAll, null, tint = metaColor, modifier = iconSize)
+        MessageStatus.READ      -> Icon(Icons.Default.DoneAll, null, tint = Color(0xFF4FC3F7), modifier = iconSize)
+        MessageStatus.FAILED    -> Icon(Icons.Default.Done,    null, tint = MaterialTheme.colorScheme.error, modifier = iconSize)
     }
-    Text(text = symbol, style = MaterialTheme.typography.labelSmall, color = color)
 }
 
 // ── Поле ввода сообщения ──────────────────────────────────────────────────────
@@ -310,14 +413,52 @@ private fun MessageStatusIcon(status: MessageStatus, metaColor: Color) {
 @Composable
 private fun MessageInputBar(
     text: String,
+    editingMessage: Message?,
     onTextChange: (String) -> Unit,
     onSend: () -> Unit,
+    onCancelEdit: () -> Unit,
 ) {
     // Поверхность с лёгкой тенью отделяет ввод от списка сообщений
     Surface(
         shadowElevation = 8.dp,
         color = MaterialTheme.colorScheme.surface,
     ) {
+        Column {
+            // Баннер режима редактирования
+            if (editingMessage != null) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(MaterialTheme.colorScheme.primaryContainer)
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        Icons.Default.Edit,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = editingMessage.content,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    IconButton(onClick = onCancelEdit, modifier = Modifier.size(24.dp)) {
+                        Icon(
+                            Icons.Default.Close,
+                            contentDescription = "Отмена",
+                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
+                }
+            }
+
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -377,5 +518,6 @@ private fun MessageInputBar(
                 )
             }
         }
+        } // Column
     }
 }

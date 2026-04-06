@@ -1,14 +1,20 @@
 package com.secure.messenger.presentation.viewmodel
 
+import android.app.NotificationManager
+import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.secure.messenger.data.local.dao.UserDao
 import com.secure.messenger.data.remote.webrtc.WebRtcCallState
 import com.secure.messenger.data.remote.webrtc.WebRtcManager
 import com.secure.messenger.domain.model.Call
+import com.secure.messenger.domain.model.CallState
 import com.secure.messenger.domain.model.CallType
 import com.secure.messenger.domain.repository.CallRepository
 import com.secure.messenger.domain.usecase.StartCallUseCase
+import com.secure.messenger.service.MessagingService
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -31,6 +37,8 @@ data class CallUiState(
 class CallViewModel @Inject constructor(
     private val callRepository: CallRepository,
     private val startCallUseCase: StartCallUseCase,
+    private val userDao: UserDao,
+    @ApplicationContext private val context: Context,
     val webRtcManager: WebRtcManager,
 ) : ViewModel() {
 
@@ -45,12 +53,36 @@ class CallViewModel @Inject constructor(
     private val _uiState = MutableStateFlow(CallUiState())
     val uiState: StateFlow<CallUiState> = _uiState.asStateFlow()
 
+    private val _peerDisplayName = MutableStateFlow("")
+    val peerDisplayName: StateFlow<String> = _peerDisplayName.asStateFlow()
+
+    private val _peerAvatarUrl = MutableStateFlow<String?>(null)
+    val peerAvatarUrl: StateFlow<String?> = _peerAvatarUrl.asStateFlow()
+
     init {
         // Keep uiState.call in sync with repository's activeCall
         viewModelScope.launch {
             callRepository.activeCall.collect { call ->
                 _uiState.value = _uiState.value.copy(call = call)
+                // For incoming calls, resolve caller's display name + avatar automatically
+                if (call != null && call.state == CallState.RINGING) {
+                    resolvePeer(call.callerId)
+                }
             }
+        }
+    }
+
+    /**
+     * Resolves a user ID to their display name and avatar URL from the local DB.
+     * Called when CallScreen opens (for both outgoing and incoming calls).
+     */
+    fun resolvePeer(userId: String) {
+        if (userId.isBlank()) return
+        viewModelScope.launch {
+            val user = userDao.getById(userId) ?: return@launch
+            val name = user.displayName.ifEmpty { user.username }.ifEmpty { userId }
+            _peerDisplayName.value = name
+            _peerAvatarUrl.value = user.avatarUrl
         }
     }
 
@@ -62,6 +94,7 @@ class CallViewModel @Inject constructor(
     }
 
     fun acceptCall(callId: String) {
+        cancelCallNotification()
         viewModelScope.launch {
             callRepository.acceptCall(callId)
                 .onFailure { e -> Timber.e(e, "Failed to accept call") }
@@ -69,6 +102,7 @@ class CallViewModel @Inject constructor(
     }
 
     fun hangUp() {
+        cancelCallNotification()
         viewModelScope.launch {
             val callId = _uiState.value.call?.id ?: return@launch
             callRepository.hangUp(callId)
@@ -77,6 +111,7 @@ class CallViewModel @Inject constructor(
     }
 
     fun declineCall() {
+        cancelCallNotification()
         viewModelScope.launch {
             val callId = _uiState.value.call?.id ?: return@launch
             callRepository.declineCall(callId)
@@ -103,4 +138,9 @@ class CallViewModel @Inject constructor(
     }
 
     fun switchCamera() = webRtcManager.switchCamera()
+
+    private fun cancelCallNotification() {
+        context.getSystemService(NotificationManager::class.java)
+            .cancel(MessagingService.NOTIF_ID_CALL)
+    }
 }
