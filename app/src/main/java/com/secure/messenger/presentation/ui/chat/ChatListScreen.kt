@@ -31,25 +31,18 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FloatingActionButton
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import com.secure.messenger.presentation.ui.components.CompactTopBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -63,7 +56,6 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import com.secure.messenger.BuildConfig
-import com.secure.messenger.data.remote.api.MessengerApi
 import com.secure.messenger.data.remote.api.SupportInfoDto
 import com.secure.messenger.domain.model.Chat
 import com.secure.messenger.domain.model.ChatType
@@ -88,57 +80,134 @@ private val AvatarPalette = listOf(
 @Composable
 fun ChatListScreen(
     onChatClick: (chatId: String) -> Unit,
+    onNewChatClick: () -> Unit = {},
+    onProfileClick: () -> Unit = {},
     viewModel: ChatListViewModel = hiltViewModel(),
 ) {
     val chats by viewModel.chats.collectAsStateWithLifecycle()
     val currentUser by viewModel.currentUser.collectAsStateWithLifecycle()
     val isConnected by viewModel.isConnected.collectAsStateWithLifecycle()
 
-    // Состояние диалога «Поддержать автора»
     var showSupportDialog by remember { mutableStateOf(false) }
 
-    Scaffold(
-        topBar = {
-            ChatListTopBar(
-                currentUser = currentUser,
-                isConnected = isConnected,
-                onSupportClick = { showSupportDialog = true },
-            )
-        },
-        floatingActionButton = {
-            FloatingActionButton(
-                onClick = { /* TODO: открыть диалог нового чата */ },
-                containerColor = MaterialTheme.colorScheme.primary,
-                contentColor = MaterialTheme.colorScheme.onPrimary,
-                shape = CircleShape,
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.surfaceContainerLow),
+    ) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            // ── OneUI-стиль: большой заголовок ─────────────────────────────
+            Surface(
+                color = MaterialTheme.colorScheme.surface,
+                shadowElevation = 0.dp,
             ) {
-                Icon(Icons.Default.Edit, contentDescription = "Новый чат")
-            }
-        },
-    ) { padding ->
-        if (chats.isEmpty()) {
-            EmptyChatList(modifier = Modifier.padding(padding))
-        } else {
-            LazyColumn(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(padding),
-            ) {
-                items(chats, key = { it.id }) { chat ->
-                    ChatRow(
-                        chat = chat,
-                        onClick = { onChatClick(chat.id) },
-                        onDeleteChat = { viewModel.deleteChat(chat.id) },
-                        onBlockUser = {
-                            chat.otherUserId?.let { userId -> viewModel.blockUser(userId) }
-                        },
-                    )
-                    HorizontalDivider(
-                        modifier = Modifier.padding(start = 80.dp, end = 16.dp),
-                        color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f),
-                    )
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .statusBarsPadding()
+                        .padding(start = 24.dp, end = 16.dp, top = 32.dp, bottom = 20.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        // Аватар пользователя слева — тап → профиль
+                        Box(modifier = Modifier.clickable { onProfileClick() }) {
+                            AvatarImage(
+                                url = currentUser?.avatarUrl,
+                                name = currentUser?.displayName ?: "?",
+                                size = 52,
+                            )
+                            // Индикатор подключения
+                            Box(
+                                modifier = Modifier
+                                    .size(14.dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.surface)
+                                    .padding(2.dp)
+                                    .clip(CircleShape)
+                                    .background(
+                                        if (isConnected) Color(0xFF4CAF50)
+                                        else Color(0xFFFF9800)
+                                    )
+                                    .align(Alignment.BottomEnd),
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.width(14.dp))
+
+                        // Имя пользователя + статус сети — тап → профиль
+                        Column(modifier = Modifier.weight(1f).clickable { onProfileClick() }) {
+                            val title = when {
+                                currentUser?.displayName?.isNotEmpty() == true -> currentUser!!.displayName
+                                currentUser?.username?.isNotEmpty() == true -> "@${currentUser!!.username}"
+                                else -> "Чаты"
+                            }
+                            Text(
+                                text = title,
+                                style = MaterialTheme.typography.headlineMedium,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 26.sp,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                text = if (isConnected) "В сети" else "Нет соединения",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (isConnected) Color(0xFF4CAF50)
+                                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontSize = 13.sp,
+                            )
+                        }
+
+                        // Иконка «Поддержать автора»
+                        IconButton(onClick = { showSupportDialog = true }) {
+                            Icon(
+                                imageVector = Icons.Default.Favorite,
+                                contentDescription = "Поддержать автора",
+                                tint = MaterialTheme.colorScheme.primary,
+                            )
+                        }
+                    }
                 }
             }
+
+            // ── Список чатов ───────────────────────────────────────────────
+            if (chats.isEmpty()) {
+                EmptyChatList(modifier = Modifier.weight(1f))
+            } else {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    items(chats, key = { it.id }) { chat ->
+                        ChatRow(
+                            chat = chat,
+                            onClick = { onChatClick(chat.id) },
+                            onDeleteChat = { viewModel.deleteChat(chat.id) },
+                            onBlockUser = {
+                                chat.otherUserId?.let { userId -> viewModel.blockUser(userId) }
+                            },
+                        )
+                    }
+                }
+            }
+        }
+
+        // FAB
+        FloatingActionButton(
+            onClick = onNewChatClick,
+            containerColor = MaterialTheme.colorScheme.primary,
+            contentColor = MaterialTheme.colorScheme.onPrimary,
+            shape = CircleShape,
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(24.dp),
+        ) {
+            Icon(Icons.Default.Edit, contentDescription = "Новый чат")
         }
     }
 
@@ -146,70 +215,6 @@ fun ChatListScreen(
     if (showSupportDialog) {
         SupportAuthorDialog(onDismiss = { showSupportDialog = false })
     }
-}
-
-// ── Компактная шапка (заменяет TopAppBar) ─────────────────────────────────────
-// Высота фиксирована: 52dp + padding статус-бара (автоматически через statusBarsPadding)
-
-@Composable
-private fun ChatListTopBar(
-    currentUser: User?,
-    isConnected: Boolean,
-    onSupportClick: () -> Unit,
-) {
-    CompactTopBar(
-        navigationIcon = {
-            // Аватар с точкой статуса подключения
-            Box(modifier = Modifier.padding(horizontal = 12.dp)) {
-                AvatarImage(
-                    url = currentUser?.avatarUrl,
-                    name = currentUser?.displayName ?: "?",
-                    size = 48,
-                )
-                Box(
-                    modifier = Modifier
-                        .size(14.dp)
-                        .clip(CircleShape)
-                        .background(if (isConnected) Color(0xFF4CAF50) else Color(0xFFFF9800))
-                        .align(Alignment.BottomEnd),
-                )
-            }
-        },
-        title = {
-            val title = when {
-                currentUser?.displayName?.isNotEmpty() == true -> currentUser!!.displayName
-                currentUser?.username?.isNotEmpty() == true -> "@${currentUser!!.username}"
-                else -> "Мессенджер"
-            }
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = title,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 21.sp,
-                    color = MaterialTheme.colorScheme.onPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    text = if (isConnected) "в сети" else "нет соединения",
-                    style = MaterialTheme.typography.bodySmall,
-                    fontSize = 16.sp,
-                    color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.75f),
-                )
-            }
-        },
-        actions = {
-            // Иконка «Поддержать автора»
-            IconButton(onClick = onSupportClick) {
-                Icon(
-                    imageVector = Icons.Default.Favorite,
-                    contentDescription = "Поддержать автора",
-                    tint = MaterialTheme.colorScheme.onPrimary,
-                )
-            }
-        },
-    )
 }
 
 // ── Диалог «Поддержать автора» ───────────────────────────────────────────────
@@ -220,7 +225,6 @@ private fun SupportAuthorDialog(onDismiss: () -> Unit) {
     var isLoading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
 
-    // Загружаем данные с сервера при открытии диалога
     val viewModel: ChatListViewModel = hiltViewModel()
     LaunchedEffect(Unit) {
         val result = runCatching { viewModel.loadSupportInfo() }
@@ -246,7 +250,6 @@ private fun SupportAuthorDialog(onDismiss: () -> Unit) {
                         supportInfo?.message?.takeIf { it.isNotBlank() }?.let { msg ->
                             Text(text = msg, style = MaterialTheme.typography.bodyMedium)
                         }
-                        // Парсим JSON-ссылки и показываем как кликабельные элементы
                         val links = remember(supportInfo?.links) {
                             runCatching {
                                 val json = org.json.JSONArray(supportInfo?.links ?: "[]")
@@ -285,7 +288,7 @@ private fun SupportAuthorDialog(onDismiss: () -> Unit) {
     )
 }
 
-// ── Строка одного чата ────────────────────────────────────────────────────────
+// ── Строка одного чата (в карточке) ──────────────────────────────────────────
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -297,104 +300,124 @@ private fun ChatRow(
 ) {
     var showMenu by remember { mutableStateOf(false) }
 
-    Box {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .combinedClickable(
-                    onClick = onClick,
-                    onLongClick = { showMenu = true },
-                )
-                .padding(horizontal = 16.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Box {
-                AvatarImage(url = chat.avatarUrl, name = chat.title, size = 54)
-                if (chat.isPinned) {
-                    Box(
-                        contentAlignment = Alignment.Center,
-                        modifier = Modifier
-                            .size(18.dp)
-                            .clip(CircleShape)
-                            .background(MaterialTheme.colorScheme.surface)
-                            .align(Alignment.BottomEnd),
-                    ) { Text(text = "📌", fontSize = 10.sp) }
-                }
-            }
-
-            Spacer(modifier = Modifier.width(12.dp))
-
-            Column(modifier = Modifier.weight(1f)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = chat.title,
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.weight(1f),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.surface,
+        tonalElevation = 1.dp,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Box {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .combinedClickable(
+                        onClick = onClick,
+                        onLongClick = { showMenu = true },
                     )
-                    if (chat.isMuted) Text(text = "🔇", fontSize = 12.sp, modifier = Modifier.padding(start = 4.dp))
-                    Text(
-                        text = formatTimestamp(chat.updatedAt),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (chat.unreadCount > 0) MaterialTheme.colorScheme.primary
-                                else MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(start = 8.dp),
-                    )
-                }
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.padding(top = 2.dp),
-                ) {
-                    Text(
-                        text = chat.lastMessage?.let { msg ->
-                            when (msg.type) {
-                                MessageType.TEXT   -> msg.content
-                                MessageType.IMAGE  -> "📷 Фото"
-                                MessageType.VIDEO  -> "🎬 Видео"
-                                MessageType.AUDIO  -> "🎵 Аудио"
-                                MessageType.FILE   -> "📎 Файл"
-                                MessageType.SYSTEM -> msg.content
-                            }
-                        } ?: "Нет сообщений",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f),
-                    )
-                    if (chat.unreadCount > 0) {
-                        UnreadBadge(
-                            count = chat.unreadCount,
-                            muted = chat.isMuted,
-                            modifier = Modifier.padding(start = 8.dp),
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                // Аватар с индикатором онлайн-статуса
+                val isOtherUserOnline = chat.members.firstOrNull { it.id == chat.otherUserId }?.isOnline == true
+                Box {
+                    AvatarImage(url = chat.avatarUrl, name = chat.title, size = 52)
+                    if (chat.isPinned) {
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .size(18.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.surface)
+                                .align(Alignment.BottomEnd),
+                        ) { Text(text = "📌", fontSize = 10.sp) }
+                    } else if (isOtherUserOnline && chat.type == ChatType.DIRECT) {
+                        Box(
+                            modifier = Modifier
+                                .size(14.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.surface)
+                                .padding(2.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFF4CAF50))
+                                .align(Alignment.BottomEnd),
                         )
                     }
                 }
-            }
-        }
 
-        // Контекстное меню при долгом нажатии
-        DropdownMenu(
-            expanded = showMenu,
-            onDismissRequest = { showMenu = false },
-        ) {
-            DropdownMenuItem(
-                text = { Text("Удалить чат") },
-                onClick = { showMenu = false; onDeleteChat() },
-                leadingIcon = {
-                    Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error)
-                },
-            )
-            if (chat.type == ChatType.DIRECT && chat.otherUserId != null) {
+                Spacer(modifier = Modifier.width(12.dp))
+
+                Column(modifier = Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = chat.title,
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.weight(1f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        if (chat.isMuted) Text(text = "🔇", fontSize = 12.sp, modifier = Modifier.padding(start = 4.dp))
+                        Text(
+                            text = formatTimestamp(chat.updatedAt),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (chat.unreadCount > 0) MaterialTheme.colorScheme.primary
+                                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(start = 8.dp),
+                        )
+                    }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(top = 2.dp),
+                    ) {
+                        Text(
+                            text = chat.lastMessage?.let { msg ->
+                                when (msg.type) {
+                                    MessageType.TEXT   -> msg.content
+                                    MessageType.IMAGE  -> "📷 Фото"
+                                    MessageType.VIDEO  -> "🎬 Видео"
+                                    MessageType.AUDIO  -> "🎵 Аудио"
+                                    MessageType.FILE   -> "📎 Файл"
+                                    MessageType.SYSTEM -> msg.content
+                                }
+                            } ?: "Нет сообщений",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (chat.unreadCount > 0) {
+                            UnreadBadge(
+                                count = chat.unreadCount,
+                                muted = chat.isMuted,
+                                modifier = Modifier.padding(start = 8.dp),
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Контекстное меню при долгом нажатии
+            DropdownMenu(
+                expanded = showMenu,
+                onDismissRequest = { showMenu = false },
+            ) {
                 DropdownMenuItem(
-                    text = { Text("Заблокировать") },
-                    onClick = { showMenu = false; onBlockUser() },
+                    text = { Text("Удалить чат") },
+                    onClick = { showMenu = false; onDeleteChat() },
                     leadingIcon = {
-                        Icon(Icons.Default.Block, null, tint = MaterialTheme.colorScheme.error)
+                        Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error)
                     },
                 )
+                if (chat.type == ChatType.DIRECT && chat.otherUserId != null) {
+                    DropdownMenuItem(
+                        text = { Text("Заблокировать") },
+                        onClick = { showMenu = false; onBlockUser() },
+                        leadingIcon = {
+                            Icon(Icons.Default.Block, null, tint = MaterialTheme.colorScheme.error)
+                        },
+                    )
+                }
             }
         }
     }
@@ -461,7 +484,6 @@ fun AvatarImage(url: String?, name: String, size: Int) {
         .joinToString("") { it.firstOrNull()?.uppercaseChar()?.toString() ?: "" }
     val bgColor = remember(name) { AvatarPalette[abs(name.hashCode()) % AvatarPalette.size] }
 
-    // Относительные пути (/static/...) дополняем базовым URL сервера
     val resolvedUrl = when {
         url == null -> null
         url.startsWith("http") -> url

@@ -16,6 +16,7 @@ bouncycastle = "1.78.1"
 coil = "2.7.0"
 accompanist = "0.36.0"
 timber = "5.0.1"
+security-crypto = "1.1.0-alpha06"
 moshi = "1.15.1"
 activity = "1.9.2"
 core-ktx = "1.13.1"
@@ -78,6 +79,9 @@ bouncycastle-pkix = { group = "org.bouncycastle", name = "bcpkix-jdk18on", versi
 
 # DataStore
 datastore-preferences = { group = "androidx.datastore", name = "datastore-preferences", version.ref = "datastore" }
+
+# Security (EncryptedSharedPreferences)
+security-crypto = { group = "androidx.security", name = "security-crypto", version.ref = "security-crypto" }
 
 # Coil image loading
 coil-compose = { group = "io.coil-kt", name = "coil-compose", version.ref = "coil" }

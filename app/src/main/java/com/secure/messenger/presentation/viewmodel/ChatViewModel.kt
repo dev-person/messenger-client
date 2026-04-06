@@ -3,16 +3,24 @@ package com.secure.messenger.presentation.viewmodel
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.secure.messenger.data.local.dao.UserDao
+import com.secure.messenger.data.remote.websocket.SignalingClient
+import com.secure.messenger.data.remote.websocket.SignalingEvent
 import com.secure.messenger.domain.model.Chat
+import com.secure.messenger.domain.model.ChatType
 import com.secure.messenger.domain.model.Message
 import com.secure.messenger.domain.repository.AuthRepository
 import com.secure.messenger.domain.repository.ChatRepository
 import com.secure.messenger.domain.usecase.SendMessageUseCase
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -31,6 +39,8 @@ class ChatViewModel @Inject constructor(
     private val chatRepository: ChatRepository,
     private val sendMessageUseCase: SendMessageUseCase,
     authRepository: AuthRepository,
+    private val userDao: UserDao,
+    private val signalingClient: SignalingClient,
 ) : ViewModel() {
 
     private val chatId: String = checkNotNull(savedStateHandle["chatId"])
@@ -50,6 +60,24 @@ class ChatViewModel @Inject constructor(
         .map { list -> list.find { it.id == chatId } }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
+    // Онлайн-статус собеседника — реактивно из Room (обновляется через WebSocket user_status)
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    val isOtherUserOnline: StateFlow<Boolean> = chatInfo
+        .flatMapLatest { chat ->
+            val otherId = chat?.otherUserId
+            if (otherId != null && chat.type == ChatType.DIRECT) {
+                userDao.observeById(otherId).map { it?.isOnline == true }
+            } else {
+                flowOf(false)
+            }
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
+    // Индикатор «печатает…»
+    private val _isTyping = MutableStateFlow(false)
+    val isTyping: StateFlow<Boolean> = _isTyping.asStateFlow()
+    private var typingResetJob: Job? = null
+
     private val _uiState = MutableStateFlow(ChatUiState())
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
 
@@ -61,6 +89,30 @@ class ChatViewModel @Inject constructor(
         viewModelScope.launch { chatRepository.fetchMessages(chatId) }
         // Помечаем все сообщения как прочитанные при открытии чата
         markAsRead()
+        observeTyping()
+        // При каждом новом сообщении — помечаем как прочитанное (пока чат открыт)
+        observeNewMessagesAndMarkRead()
+    }
+
+    private fun observeNewMessagesAndMarkRead() {
+        viewModelScope.launch {
+            messages.collect { markAsRead() }
+        }
+    }
+
+    private fun observeTyping() {
+        viewModelScope.launch {
+            signalingClient.events.collect { event ->
+                if (event is SignalingEvent.Typing && event.chatId == chatId) {
+                    _isTyping.value = true
+                    typingResetJob?.cancel()
+                    typingResetJob = viewModelScope.launch {
+                        delay(3_000)
+                        _isTyping.value = false
+                    }
+                }
+            }
+        }
     }
 
     fun onInputChange(text: String) {

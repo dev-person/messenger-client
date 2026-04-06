@@ -12,6 +12,7 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import timber.log.Timber
+import java.security.MessageDigest
 import javax.inject.Inject
 
 /**
@@ -41,11 +42,13 @@ class ContactRepositoryImpl @Inject constructor(
 
         if (phones.isEmpty()) return@runCatching emptyList()
 
-        // Спрашиваем сервер, какие номера зарегистрированы
+        // Хешируем номера SHA-256 перед отправкой — сервер никогда не видит реальных номеров
+        val hashes = phones.map { sha256(normalizePhone(it)) }
+
         val registeredUsers = runCatching {
-            api.lookupPhones(mapOf("phones" to phones)).data.orEmpty()
+            api.lookupByHash(mapOf("hashes" to hashes)).data.orEmpty()
         }.getOrElse { e ->
-            Timber.e(e, "lookupPhones failed")
+            Timber.e(e, "lookupByHash failed")
             emptyList()
         }
 
@@ -168,6 +171,12 @@ class ContactRepositoryImpl @Inject constructor(
         }
 
         users.map { it.toDomain() }
+    }
+
+    /** SHA-256 хеш строки → lowercase hex */
+    private fun sha256(input: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        return digest.digest(input.toByteArray()).joinToString("") { "%02x".format(it) }
     }
 
     override fun buildInviteLink(phone: String): String =

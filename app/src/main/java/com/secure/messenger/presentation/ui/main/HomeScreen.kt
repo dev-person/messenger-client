@@ -76,7 +76,11 @@ fun HomeScreen(
                 .padding(padding),
         ) {
             when (selectedTab) {
-                0 -> ChatListScreen(onChatClick = onChatClick)
+                0 -> ChatListScreen(
+                    onChatClick = onChatClick,
+                    onNewChatClick = { selectedTab = 1 },
+                    onProfileClick = { selectedTab = 2 },
+                )
                 1 -> ContactsScreen(
                     onBack = { selectedTab = 0 },
                     onStartChat = onChatClick,

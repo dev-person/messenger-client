@@ -86,6 +86,9 @@ class IncomingMessageHandler @Inject constructor(
                     updatedAt = System.currentTimeMillis(),
                     otherUserId = senderId,
                 ))
+            } else {
+                // Инкрементируем счётчик непрочитанных и обновляем timestamp
+                chatDao.incrementUnread(chatId, System.currentTimeMillis())
             }
 
             // Расшифровываем
@@ -155,6 +158,11 @@ class IncomingMessageHandler @Inject constructor(
             ?: "[Не удалось расшифровать]"
 
         messageDao.updateContent(messageId, encryptedContent, decrypted)
+    }
+
+    /** Обновляет онлайн-статус пользователя в локальной БД. */
+    suspend fun handleUserStatus(userId: String, isOnline: Boolean) {
+        userDao.updateOnlineStatus(userId, isOnline, System.currentTimeMillis())
     }
 
     /** Помечает все сообщения от других пользователей в чате как READ, когда собеседник открывает чат. */

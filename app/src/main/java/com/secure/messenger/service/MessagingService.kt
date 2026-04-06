@@ -115,6 +115,9 @@ class MessagingService : Service() {
                     is SignalingEvent.MessagesRead    -> scope.launch {
                         incomingMessageHandler.handleMessagesRead(event.chatId, event.readerId)
                     }
+                    is SignalingEvent.UserStatus -> scope.launch {
+                        incomingMessageHandler.handleUserStatus(event.userId, event.isOnline)
+                    }
                     is SignalingEvent.Disconnected -> {
                         Timber.w("WS disconnected — reconnect in ${reconnectDelayMs}ms")
                         scheduleReconnect()
@@ -156,11 +159,13 @@ class MessagingService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_BG)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentTitle("Secure Messenger")
-            .setContentText("Ожидание сообщений и звонков")
+            .setContentText("Подключено")
             .setContentIntent(openIntent)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setSilent(true)
+            .setVisibility(NotificationCompat.VISIBILITY_SECRET)
             .build()
     }
 
@@ -218,6 +223,16 @@ class MessagingService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
 
+        // Public version shown on lock screen — hides actual message content
+        val publicNotification = NotificationCompat.Builder(this, CHANNEL_MESSAGE)
+            .setSmallIcon(android.R.drawable.ic_dialog_email)
+            .setContentTitle("Новое сообщение")
+            .setContentIntent(openIntent)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .build()
+
         val notification = NotificationCompat.Builder(this, CHANNEL_MESSAGE)
             .setSmallIcon(android.R.drawable.ic_dialog_email)
             .setContentTitle(senderName)
@@ -227,6 +242,8 @@ class MessagingService : Service() {
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setVibrate(longArrayOf(0, 250))
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPublicVersion(publicNotification)
             .build()
 
         nm.notify(senderName.hashCode(), notification)
@@ -239,11 +256,13 @@ class MessagingService : Service() {
         NotificationChannel(
             CHANNEL_BG,
             "Фоновое соединение",
-            NotificationManager.IMPORTANCE_MIN,
+            NotificationManager.IMPORTANCE_NONE,
         ).apply {
             description = "Поддерживает соединение для сообщений и звонков"
             setSound(null, null)
             enableVibration(false)
+            lockscreenVisibility = Notification.VISIBILITY_SECRET
+            setShowBadge(false)
         }.also { nm.createNotificationChannel(it) }
 
         // 2. Канал максимального приоритета для входящих звонков (рингтон + вибрация)

@@ -45,6 +45,9 @@ interface MessengerApi {
     @POST("users/lookup-phones")
     suspend fun lookupPhones(@Body body: Map<String, List<String>>): ApiResponse<List<UserDto>>
 
+    @POST("users/lookup-hashes")
+    suspend fun lookupByHash(@Body body: Map<String, List<String>>): ApiResponse<List<UserDto>>
+
     // ── Contacts ──────────────────────────────────────────────────────────────
 
     @POST("contacts/{userId}")

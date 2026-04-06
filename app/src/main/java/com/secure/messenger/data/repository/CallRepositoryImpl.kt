@@ -55,12 +55,34 @@ class CallRepositoryImpl @Inject constructor(
                         endedAt = null,
                     )
                     is SignalingEvent.CallEnded -> {
-                        val call = _activeCall.value
-                        if (call != null && call.state == CallState.RINGING) {
-                            // Звонящий повесил трубку до ответа — пропущенный звонок
-                            insertCallMessage(call.callerId, call.type, "📵 Пропущенный звонок")
-                            _activeCall.value = null
+                        val call = _activeCall.value ?: return@collect
+                        val label = if (call.type == CallType.VIDEO) "Видеозвонок" else "Звонок"
+                        val peerId = if (call.callerId == "me") call.calleeId else call.callerId
+
+                        when (call.state) {
+                            CallState.RINGING -> {
+                                insertCallMessage(call.callerId, call.type, "Пропущенный $label")
+                            }
+                            CallState.CONNECTING, CallState.CONNECTED -> {
+                                val duration = connectedAt?.let {
+                                    ((System.currentTimeMillis() - it) / 1000).toInt()
+                                } ?: 0
+                                val text = if (duration > 0) {
+                                    val min = duration / 60
+                                    val sec = duration % 60
+                                    "$label · ${String.format("%d:%02d", min, sec)}"
+                                } else {
+                                    "Входящий $label"
+                                }
+                                insertCallMessage(peerId, call.type, text)
+                            }
+                            CallState.CALLING -> {
+                                insertCallMessage(peerId, call.type, "Исходящий $label")
+                            }
+                            else -> Unit
                         }
+                        connectedAt = null
+                        _activeCall.value = null
                     }
                     else -> Unit
                 }
@@ -101,8 +123,8 @@ class CallRepositoryImpl @Inject constructor(
         webRtcManager.endCall()
         // Системное сообщение: отклонённый звонок
         if (call != null) {
-            val icon = if (call.type == CallType.VIDEO) "📹" else "📞"
-            insertCallMessage(call.callerId, call.type, "$icon Отклонённый звонок")
+            val label = if (call.type == CallType.VIDEO) "Видеозвонок" else "Звонок"
+            insertCallMessage(call.callerId, call.type, "Отклонённый $label")
         }
         connectedAt = null
         _activeCall.value = null
@@ -117,13 +139,13 @@ class CallRepositoryImpl @Inject constructor(
 
             // Системное сообщение в чат
             val peerId = if (call.callerId == "me") call.calleeId else call.callerId
-            val icon = if (call.type == CallType.VIDEO) "📹" else "📞"
+            val label = if (call.type == CallType.VIDEO) "Видеозвонок" else "Звонок"
             val text = if (duration > 0) {
                 val min = duration / 60
                 val sec = duration % 60
-                "$icon Звонок · ${String.format("%d:%02d", min, sec)}"
+                "$label · ${String.format("%d:%02d", min, sec)}"
             } else {
-                "$icon Исходящий звонок"
+                "Исходящий $label"
             }
             insertCallMessage(peerId, call.type, text)
         }

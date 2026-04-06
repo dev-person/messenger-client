@@ -1,39 +1,46 @@
 package com.secure.messenger.di
 
 import android.content.Context
-import androidx.datastore.core.DataStore
-import androidx.datastore.preferences.core.Preferences
-import androidx.datastore.preferences.core.edit
-import androidx.datastore.preferences.core.stringPreferencesKey
-import androidx.datastore.preferences.preferencesDataStore
+import android.content.SharedPreferences
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
 import dagger.hilt.android.qualifiers.ApplicationContext
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.runBlocking
 import javax.inject.Inject
 import javax.inject.Singleton
-
-private val Context.authDataStore: DataStore<Preferences>
-    by preferencesDataStore(name = "auth")
 
 /** Provides the current auth token synchronously (for OkHttp interceptor). */
 @Singleton
 class AuthTokenProvider @Inject constructor(
     @ApplicationContext private val context: Context,
 ) {
-    private val tokenKey = stringPreferencesKey("auth_token")
-
-    val token: String?
-        get() = runBlocking {
-            context.authDataStore.data.map { it[tokenKey] }.first()
-        }
-
-    suspend fun saveToken(token: String) {
-        context.authDataStore.edit { it[tokenKey] = token }
+    companion object {
+        private const val PREFS_NAME = "encrypted_auth"
+        private const val KEY_TOKEN = "auth_token"
     }
 
-    suspend fun clearToken() {
-        context.authDataStore.edit { it.remove(tokenKey) }
+    private val prefs: SharedPreferences by lazy {
+        val masterKey = MasterKey.Builder(context, MasterKey.DEFAULT_MASTER_KEY_ALIAS)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .build()
+
+        EncryptedSharedPreferences.create(
+            context,
+            PREFS_NAME,
+            masterKey,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
+        )
+    }
+
+    val token: String?
+        get() = prefs.getString(KEY_TOKEN, null)
+
+    fun saveToken(token: String) {
+        prefs.edit().putString(KEY_TOKEN, token).apply()
+    }
+
+    fun clearToken() {
+        prefs.edit().remove(KEY_TOKEN).apply()
     }
 
     fun hasToken(): Boolean = token != null

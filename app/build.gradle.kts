@@ -14,8 +14,8 @@ android {
         applicationId = "com.secure.messenger"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "1.4.0"
+        versionCode = 11
+        versionName = "1.0.11 Alfa"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         // Room schema export for migrations
@@ -121,6 +121,9 @@ dependencies {
 
     // DataStore
     implementation(libs.datastore.preferences)
+
+    // Security (EncryptedSharedPreferences)
+    implementation(libs.security.crypto)
 
     // Image loading
     implementation(libs.coil.compose)

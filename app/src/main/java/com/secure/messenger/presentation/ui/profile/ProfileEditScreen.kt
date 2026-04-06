@@ -12,6 +12,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -22,37 +23,37 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.automirrored.filled.Logout
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.Photo
+import androidx.compose.material.icons.filled.Save
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
-import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberModalBottomSheetState
-import com.secure.messenger.presentation.ui.components.CompactTopBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -69,6 +70,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import coil.compose.AsyncImage
+import com.secure.messenger.BuildConfig
 import com.secure.messenger.presentation.ui.chat.AvatarImage
 import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
@@ -78,7 +81,6 @@ import java.io.ByteArrayOutputStream
 fun ProfileEditScreen(
     onBack: () -> Unit,
     onLogout: () -> Unit,
-    // В режиме вкладки (HomeScreen) кнопка «назад» не нужна
     showBackButton: Boolean = true,
     viewModel: ProfileEditViewModel = hiltViewModel(),
 ) {
@@ -104,7 +106,7 @@ fun ProfileEditScreen(
         viewModel.uploadAvatar(raw.prepareForUpload().toJpegBytes(), "jpg")
     }
 
-    // ── Лаунчер камеры (возвращает Bitmap превью) ─────────────────────────────
+    // ── Лаунчер камеры ─────────────────────────────────────────────────────
     val cameraLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.TakePicturePreview()
     ) { bitmap: Bitmap? ->
@@ -112,7 +114,7 @@ fun ProfileEditScreen(
         viewModel.uploadAvatar(bitmap.prepareForUpload().toJpegBytes(), "jpg")
     }
 
-    // ── Лаунчер запроса разрешения на камеру ─────────────────────────────────
+    // ── Лаунчер разрешения камеры ─────────────────────────────────────────
     val cameraPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
@@ -159,7 +161,6 @@ fun ProfileEditScreen(
                 modifier = Modifier.clickable {
                     scope.launch { sheetState.hide() }.invokeOnCompletion {
                         showAvatarSheet = false
-                        // Проверяем разрешение — запрашиваем если нет
                         if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA)
                             == PackageManager.PERMISSION_GRANTED
                         ) {
@@ -186,266 +187,333 @@ fun ProfileEditScreen(
         }
     }
 
-    Scaffold(
-        // Когда экран вложен в HomeScreen (tab-режим), внешний Scaffold уже
-        // обработал window insets — передаём пустые чтобы не было двойного отступа
-        contentWindowInsets = WindowInsets(0),
-        topBar = {
-            CompactTopBar(
-                navigationIcon = {
-                    if (showBackButton) {
-                        IconButton(onClick = onBack) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, null,
-                                tint = MaterialTheme.colorScheme.onPrimary)
-                        }
-                    }
-                },
-                title = {
-                    Text(
-                        "Мой профиль",
-                        color = MaterialTheme.colorScheme.onPrimary,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 21.sp,
-                        modifier = Modifier.weight(1f),
-                    )
-                },
-                actions = {
-                    IconButton(onClick = { showLogoutDialog = true }) {
-                        Icon(Icons.AutoMirrored.Filled.Logout, "Выйти",
-                            tint = MaterialTheme.colorScheme.onPrimary)
-                    }
-                },
-            )
-        },
-    ) { padding ->
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.surfaceContainerLow),
+    ) {
+        // ── OneUI-стиль: большой заголовок ─────────────────────────────────
+        Surface(
+            color = MaterialTheme.colorScheme.surface,
+            shadowElevation = 0.dp,
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .statusBarsPadding()
+                    .padding(start = 24.dp, end = 24.dp, top = 32.dp, bottom = 20.dp),
+            ) {
+                Text(
+                    text = "Мой профиль",
+                    style = MaterialTheme.typography.headlineLarge,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 34.sp,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+            }
+        }
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(padding)
                 .imePadding()
-                .verticalScroll(rememberScrollState()),
-            horizontalAlignment = Alignment.CenterHorizontally,
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Spacer(modifier = Modifier.height(24.dp))
-
-            // ── Аватар с кнопкой редактирования ──────────────────────────────
-            Box(contentAlignment = Alignment.BottomEnd) {
-                if (state.isLoading && state.avatarUrl == null) {
-                    // Пока загружается аватар — показываем спиннер
-                    Box(
-                        modifier = Modifier.size(90.dp).clip(CircleShape)
-                            .background(MaterialTheme.colorScheme.surfaceVariant),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        CircularProgressIndicator(modifier = Modifier.size(32.dp))
-                    }
-                } else {
-                    AvatarImage(
-                        url = state.avatarUrl,
-                        name = state.displayName.ifEmpty { state.phone },
-                        size = 90,
-                    )
-                }
-                // Иконка «карандаш» поверх аватара
-                Box(
-                    modifier = Modifier
-                        .size(28.dp)
-                        .clip(CircleShape)
-                        .background(MaterialTheme.colorScheme.primary)
-                        .clickable { showAvatarSheet = true },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Icon(
-                        Icons.Default.Edit, null,
-                        tint = MaterialTheme.colorScheme.onPrimary,
-                        modifier = Modifier.size(16.dp),
-                    )
+            // ── Аватар на всю карточку как фон ──────────────────────────
+            val serverRoot = BuildConfig.API_BASE_URL.removeSuffix("v1/").trimEnd('/')
+            val resolvedAvatarUrl = state.avatarUrl?.let { url ->
+                when {
+                    url.startsWith("http") -> url
+                    url.startsWith("/") -> "$serverRoot$url"
+                    else -> url
                 }
             }
 
-            Spacer(modifier = Modifier.height(8.dp))
-
-            // Имя под аватаром
-            Text(
-                text = state.displayName.ifEmpty { "—" },
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-            )
-            if (state.username.isNotEmpty()) {
-                Text(
-                    text = "@${state.username}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-
-            Spacer(modifier = Modifier.height(24.dp))
-
-            // ── Форма редактирования ──────────────────────────────────────────
-            Column(modifier = Modifier.padding(horizontal = 20.dp)) {
-
-                // Номер телефона (только для чтения)
-                if (state.phone.isNotEmpty()) {
-                    Text(
-                        text = "Аккаунт",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.padding(bottom = 6.dp),
-                    )
-                    Text(
-                        text = state.phone,
-                        style = MaterialTheme.typography.bodyLarge,
-                        fontWeight = FontWeight.Medium,
-                    )
-                    Text(
-                        text = "Телефон",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
-                }
-
-                Text(
-                    text = "Основная информация",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.padding(bottom = 12.dp),
-                )
-
-                OutlinedTextField(
-                    value = state.displayName,
-                    onValueChange = viewModel::onDisplayNameChange,
-                    label = { Text("Имя") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = MaterialTheme.colorScheme.primary,
-                    ),
-                    isError = state.error != null && state.displayName.isBlank(),
-                )
-
-                Spacer(modifier = Modifier.height(12.dp))
-
-                OutlinedTextField(
-                    value = state.username,
-                    onValueChange = viewModel::onUsernameChange,
-                    label = { Text("Username") },
-                    prefix = {
-                        Text("@", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
-                    },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = MaterialTheme.colorScheme.primary,
-                    ),
-                    supportingText = { Text("Необязательно", style = MaterialTheme.typography.labelSmall) },
-                )
-
-                Spacer(modifier = Modifier.height(12.dp))
-
-                OutlinedTextField(
-                    value = state.bio,
-                    onValueChange = viewModel::onBioChange,
-                    label = { Text("О себе") },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(110.dp),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = MaterialTheme.colorScheme.primary,
-                    ),
-                )
-
-                if (state.error != null) {
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = state.error!!,
-                        color = MaterialTheme.colorScheme.error,
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-
-                if (state.saved) {
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "✓ Сохранено",
-                        color = Color(0xFF4CAF50),
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(24.dp))
-
-                Button(
-                    onClick = { viewModel.save() },
-                    enabled = !state.isLoading,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(50.dp),
-                    shape = RoundedCornerShape(14.dp),
-                ) {
-                    if (state.isLoading) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
-                            color = Color.White,
-                            strokeWidth = 2.dp,
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = MaterialTheme.colorScheme.surface,
+                tonalElevation = 1.dp,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(200.dp)
+                    .clickable { showAvatarSheet = true },
+            ) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    // Фоновое фото
+                    if (state.isLoading && state.avatarUrl == null) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(MaterialTheme.colorScheme.surfaceVariant),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.size(32.dp))
+                        }
+                    } else if (resolvedAvatarUrl != null) {
+                        AsyncImage(
+                            model = resolvedAvatarUrl,
+                            contentDescription = "Аватар",
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Crop,
                         )
                     } else {
-                        Text("Сохранить", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                        // Фон-заглушка с инициалами
+                        val initials = state.displayName.ifEmpty { state.phone }
+                            .split(" ").take(2)
+                            .joinToString("") { it.firstOrNull()?.uppercaseChar()?.toString() ?: "" }
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(MaterialTheme.colorScheme.primaryContainer),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(
+                                Icons.Default.Person, null,
+                                tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                modifier = Modifier.size(64.dp),
+                            )
+                        }
+                    }
+
+                    // Затемнение снизу для текста
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(80.dp)
+                            .align(Alignment.BottomCenter)
+                            .background(
+                                Brush.verticalGradient(
+                                    0f to Color.Transparent,
+                                    1f to Color.Black.copy(alpha = 0.6f),
+                                )
+                            ),
+                    )
+
+                    // Имя и username внизу
+                    Column(
+                        modifier = Modifier
+                            .align(Alignment.BottomStart)
+                            .padding(16.dp),
+                    ) {
+                        Text(
+                            text = state.displayName.ifEmpty { "—" },
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White,
+                        )
+                        if (state.username.isNotEmpty()) {
+                            Text(
+                                text = "@${state.username}",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = Color.White.copy(alpha = 0.8f),
+                            )
+                        }
+                    }
+
+                    // Подсказка справа
+                    Text(
+                        text = "Изменить",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color.White.copy(alpha = 0.7f),
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(12.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color.Black.copy(alpha = 0.3f))
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                    )
+                }
+            }
+
+            // ── Аккаунт (телефон) ─────────────────────────────────────────
+            if (state.phone.isNotEmpty()) {
+                OneUiSectionLabel("Аккаунт")
+
+                Surface(
+                    shape = RoundedCornerShape(18.dp),
+                    color = MaterialTheme.colorScheme.surface,
+                    tonalElevation = 1.dp,
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            Icons.Default.Phone, null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(24.dp),
+                        )
+                        Spacer(modifier = Modifier.width(16.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = state.phone,
+                                style = MaterialTheme.typography.bodyLarge,
+                            )
+                            Text(
+                                text = "Телефон",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontSize = 13.sp,
+                            )
+                        }
                     }
                 }
+            }
 
-                Spacer(modifier = Modifier.height(12.dp))
+            // ── Основная информация ───────────────────────────────────────
+            OneUiSectionLabel("Основная информация")
 
-                // Кнопка выхода из аккаунта
-                Button(
-                    onClick = { showLogoutDialog = true },
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = MaterialTheme.colorScheme.surface,
+                tonalElevation = 1.dp,
+            ) {
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(50.dp),
-                    shape = RoundedCornerShape(14.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.errorContainer,
-                        contentColor = MaterialTheme.colorScheme.error,
-                    ),
+                        .padding(horizontal = 16.dp, vertical = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.AutoMirrored.Filled.Logout, null, modifier = Modifier.size(18.dp))
+                    OutlinedTextField(
+                        value = state.displayName,
+                        onValueChange = viewModel::onDisplayNameChange,
+                        label = { Text("Имя") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = MaterialTheme.colorScheme.primary,
+                        ),
+                        isError = state.error != null && state.displayName.isBlank(),
+                    )
+
+                    OutlinedTextField(
+                        value = state.username,
+                        onValueChange = viewModel::onUsernameChange,
+                        label = { Text("Username") },
+                        prefix = {
+                            Text("@", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                        },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = MaterialTheme.colorScheme.primary,
+                        ),
+                        supportingText = { Text("Необязательно", style = MaterialTheme.typography.labelSmall) },
+                    )
+
+                    OutlinedTextField(
+                        value = state.bio,
+                        onValueChange = viewModel::onBioChange,
+                        label = { Text("О себе") },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(110.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = MaterialTheme.colorScheme.primary,
+                        ),
+                    )
+
+                    if (state.error != null) {
                         Text(
-                            "Выйти из аккаунта",
-                            modifier = Modifier.padding(start = 8.dp),
-                            fontSize = 15.sp,
-                            fontWeight = FontWeight.SemiBold,
+                            text = state.error!!,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.labelSmall,
                         )
                     }
-                }
 
-                Spacer(modifier = Modifier.height(32.dp))
+                    if (state.saved) {
+                        Text(
+                            text = "✓ Сохранено",
+                            color = Color(0xFF4CAF50),
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    }
+
+                    Button(
+                        onClick = { viewModel.save() },
+                        enabled = !state.isLoading,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp),
+                        shape = RoundedCornerShape(14.dp),
+                    ) {
+                        if (state.isLoading) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(20.dp),
+                                color = Color.White,
+                                strokeWidth = 2.dp,
+                            )
+                        } else {
+                            Icon(Icons.Default.Save, null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Сохранить", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
             }
+
+            // ── Выход из аккаунта ─────────────────────────────────────────
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = MaterialTheme.colorScheme.surface,
+                tonalElevation = 1.dp,
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { showLogoutDialog = true }
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center,
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.Logout, null,
+                        tint = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.size(20.dp),
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "Выйти из аккаунта",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.error,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
         }
     }
 }
 
-// ── Подготовка аватара: кроп до квадрата → resize до 512px → JPEG ─────────────
+// ── OneUI-компоненты ─────────────────────────────────────────────────────────
 
-/**
- * Центрирует, обрезает до квадрата и масштабирует до [maxSize]×[maxSize].
- * JPEG не поддерживает прозрачность, поэтому круговую маску делает UI (AsyncImage + CircleShape).
- * Здесь мы просто гарантируем нужное соотношение сторон и небольшой размер файла.
- */
+@Composable
+private fun OneUiSectionLabel(title: String) {
+    Text(
+        text = title,
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.primary,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 14.sp,
+        modifier = Modifier.padding(start = 8.dp, top = 4.dp, bottom = 2.dp),
+    )
+}
+
+// ── Подготовка аватара ────────────────────────────────────────────────────────
+
 private fun Bitmap.prepareForUpload(maxSize: Int = 512): Bitmap {
-    // 1. Центрированный кроп до квадрата
     val side = minOf(width, height)
     val x = (width - side) / 2
     val y = (height - side) / 2
     val squared = Bitmap.createBitmap(this, x, y, side, side)
-
-    // 2. Масштабируем если больше maxSize
     return if (side <= maxSize) squared
     else Bitmap.createScaledBitmap(squared, maxSize, maxSize, true)
 }

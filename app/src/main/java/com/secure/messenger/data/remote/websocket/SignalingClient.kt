@@ -2,8 +2,11 @@ package com.secure.messenger.data.remote.websocket
 
 import com.squareup.moshi.Moshi
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.WebSocket
@@ -27,6 +30,8 @@ sealed class SignalingEvent {
     data class MessageDeleted(val messageId: String, val chatId: String) : SignalingEvent()
     data class MessageEdited(val messageId: String, val chatId: String, val encryptedContent: String) : SignalingEvent()
     data class MessagesRead(val chatId: String, val readerId: String) : SignalingEvent()
+    data class UserStatus(val userId: String, val isOnline: Boolean) : SignalingEvent()
+    data class Typing(val chatId: String, val userId: String) : SignalingEvent()
     object Connected : SignalingEvent()
     object Disconnected : SignalingEvent()
 }
@@ -56,6 +61,10 @@ class SignalingClient @Inject constructor(
     private val _events = MutableSharedFlow<SignalingEvent>(extraBufferCapacity = 64)
     val events: SharedFlow<SignalingEvent> = _events.asSharedFlow()
 
+    // Состояние подключения — StateFlow с replay, доступен сразу при подписке
+    private val _isConnected = MutableStateFlow(false)
+    val isConnected: StateFlow<Boolean> = _isConnected.asStateFlow()
+
     private val adapter = moshi.adapter(SignalingMessage::class.java)
 
     // ── Жизненный цикл подключения ────────────────────────────────────────────
@@ -78,23 +87,25 @@ class SignalingClient @Inject constructor(
 
     private fun createListener() = object : WebSocketListener() {
         override fun onOpen(ws: WebSocket, response: okhttp3.Response) {
+            _isConnected.value = true
             _events.tryEmit(SignalingEvent.Connected)
             Timber.d("Signaling WebSocket connected")
         }
 
         override fun onMessage(ws: WebSocket, text: String) {
-            Timber.d("Signaling ← $text")
             parseAndEmit(text)
         }
 
         override fun onFailure(ws: WebSocket, t: Throwable, response: okhttp3.Response?) {
             Timber.e(t, "Signaling WebSocket failure")
             webSocket = null
+            _isConnected.value = false
             _events.tryEmit(SignalingEvent.Disconnected)
         }
 
         override fun onClosed(ws: WebSocket, code: Int, reason: String) {
             webSocket = null
+            _isConnected.value = false
             _events.tryEmit(SignalingEvent.Disconnected)
         }
     }
@@ -151,6 +162,14 @@ class SignalingClient @Inject constructor(
                 chatId = payload["chatId"] as? String ?: return,
                 readerId = payload["readerId"] as? String ?: return,
             )
+            "user_status" -> SignalingEvent.UserStatus(
+                userId = payload["userId"] as? String ?: return,
+                isOnline = payload["isOnline"] as? Boolean ?: false,
+            )
+            "typing" -> SignalingEvent.Typing(
+                chatId = payload["chatId"] as? String ?: return,
+                userId = payload["userId"] as? String ?: return,
+            )
             else -> {
                 Timber.w("Unknown signaling type: ${msg.type}")
                 return
@@ -164,7 +183,6 @@ class SignalingClient @Inject constructor(
     private fun send(type: String, payload: Map<String, Any?>) {
         val msg = SignalingMessage(type = type, payload = payload)
         val json = adapter.toJson(msg)
-        Timber.d("Signaling → $json")
         webSocket?.send(json)
     }
 

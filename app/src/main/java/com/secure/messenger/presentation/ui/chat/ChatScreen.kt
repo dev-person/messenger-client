@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
@@ -36,16 +37,13 @@ import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import com.secure.messenger.presentation.ui.components.CompactTopBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -78,7 +76,6 @@ import com.secure.messenger.utils.isSameDay
 
 // ── Экран чата ────────────────────────────────────────────────────────────────
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
     onBack: () -> Unit,
@@ -90,15 +87,15 @@ fun ChatScreen(
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val chatInfo by viewModel.chatInfo.collectAsStateWithLifecycle()
     val currentUserId by viewModel.currentUserId.collectAsStateWithLifecycle()
+    val isOtherOnline by viewModel.isOtherUserOnline.collectAsStateWithLifecycle()
+    val isTyping by viewModel.isTyping.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     val listState = rememberLazyListState()
 
-    // Прокрутить список вниз при получении нового сообщения
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1)
     }
 
-    // Показать ошибку в снекбаре
     LaunchedEffect(uiState.error) {
         uiState.error?.let {
             snackbarHostState.showSnackbar(it)
@@ -106,17 +103,52 @@ fun ChatScreen(
         }
     }
 
-    Scaffold(
-        snackbarHost = { SnackbarHost(snackbarHostState) },
-        topBar = {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.surfaceContainerLow),
+    ) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            // ── OneUI-стиль: шапка чата ────────────────────────────────────
             ChatTopBar(
                 chatInfo = chatInfo,
                 currentUserId = currentUserId,
+                isOtherOnline = isOtherOnline,
+                isTyping = isTyping,
                 onBack = onBack,
                 onCallClick = onCallClick,
             )
-        },
-        bottomBar = {
+
+            // ── Список сообщений ───────────────────────────────────────────
+            LazyColumn(
+                state = listState,
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 8.dp),
+            ) {
+                itemsIndexed(messages, key = { _, msg -> msg.id }) { index, message ->
+                    val prevMessage = messages.getOrNull(index - 1)
+
+                    if (prevMessage == null || !isSameDay(prevMessage.timestamp, message.timestamp)) {
+                        DateSeparator(timestamp = message.timestamp)
+                    }
+
+                    if (message.type == MessageType.SYSTEM) {
+                        SystemMessage(text = message.content, timestamp = message.timestamp)
+                    } else {
+                        val isOutgoing = message.senderId == currentUserId
+                        MessageBubble(
+                            message = message,
+                            isOutgoing = isOutgoing,
+                            onDelete = if (isOutgoing) { { viewModel.deleteMessage(message) } } else null,
+                            onEdit   = if (isOutgoing) { { viewModel.startEditing(message) } } else null,
+                        )
+                    }
+                }
+            }
+
+            // ── Поле ввода ─────────────────────────────────────────────────
             MessageInputBar(
                 text = inputText,
                 editingMessage = uiState.editingMessage,
@@ -124,111 +156,122 @@ fun ChatScreen(
                 onSend = viewModel::sendMessage,
                 onCancelEdit = viewModel::cancelEditing,
             )
-        },
-    ) { padding ->
-        // Фон чата — немного отличается от белого, как в большинстве мессенджеров
-        LazyColumn(
-            state = listState,
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .background(MaterialTheme.colorScheme.background),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 8.dp),
-        ) {
-            itemsIndexed(messages, key = { _, msg -> msg.id }) { index, message ->
-                val prevMessage = messages.getOrNull(index - 1)
-
-                // Показываем разделитель, если это первое сообщение дня
-                if (prevMessage == null || !isSameDay(prevMessage.timestamp, message.timestamp)) {
-                    DateSeparator(timestamp = message.timestamp)
-                }
-
-                if (message.type == MessageType.SYSTEM) {
-                    // Системное сообщение (звонки и т.д.) — по центру
-                    SystemMessage(text = message.content, timestamp = message.timestamp)
-                } else {
-                    val isOutgoing = message.senderId == currentUserId
-                    MessageBubble(
-                        message = message,
-                        isOutgoing = isOutgoing,
-                        onDelete = if (isOutgoing) { { viewModel.deleteMessage(message) } } else null,
-                        onEdit   = if (isOutgoing) { { viewModel.startEditing(message) } } else null,
-                    )
-                }
-            }
         }
+
+        // Snackbar
+        SnackbarHost(
+            hostState = snackbarHostState,
+            modifier = Modifier.align(Alignment.BottomCenter),
+        )
     }
 }
 
-// ── Шапка чата: аватар, имя, подзаголовок, звонки ───────────────────────────
+// ── Шапка чата (стиль как у экрана Чаты) ─────────────────────────────────────
 
 @Composable
 private fun ChatTopBar(
     chatInfo: Chat?,
     currentUserId: String?,
+    isOtherOnline: Boolean,
+    isTyping: Boolean,
     onBack: () -> Unit,
     onCallClick: (userId: String, isVideo: Boolean, peerName: String) -> Unit,
 ) {
-    // Для прямого чата peerId хранится прямо в ChatEntity.otherUserId
     val peerId   = chatInfo?.otherUserId ?: ""
     val peerName = chatInfo?.title ?: ""
     val isDirectChat = chatInfo == null || chatInfo.type != ChatType.GROUP
 
-    CompactTopBar(
-        navigationIcon = {
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        shadowElevation = 2.dp,
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .statusBarsPadding()
+                .padding(start = 4.dp, end = 8.dp, top = 10.dp, bottom = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
             IconButton(onClick = onBack) {
                 Icon(
                     Icons.AutoMirrored.Filled.ArrowBack, null,
-                    tint = MaterialTheme.colorScheme.onPrimary,
+                    tint = MaterialTheme.colorScheme.onSurface,
                 )
             }
-        },
-        title = {
-            // Аватар + название + подзаголовок
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.weight(1f),
-            ) {
-                AvatarImage(url = chatInfo?.avatarUrl, name = chatInfo?.title ?: "?", size = 36)
-                Spacer(modifier = Modifier.width(10.dp))
-                Column {
-                    Text(
-                        text = chatInfo?.title ?: "Чат",
-                        color = MaterialTheme.colorScheme.onPrimary,
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 21.sp,
-                        maxLines = 1,
+
+            // Аватар с индикатором онлайн
+            Box {
+                AvatarImage(url = chatInfo?.avatarUrl, name = chatInfo?.title ?: "?", size = 46)
+                if (isDirectChat && isOtherOnline) {
+                    Box(
+                        modifier = Modifier
+                            .size(14.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.surface)
+                            .padding(2.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFF4CAF50))
+                            .align(Alignment.BottomEnd),
                     )
-                    val subtitle = if (chatInfo?.type == ChatType.GROUP)
-                        "${chatInfo.members.size} участников" else ""
-                    if (subtitle.isNotEmpty()) {
-                        Text(
-                            text = subtitle,
-                            color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.75f),
-                            style = MaterialTheme.typography.labelSmall,
-                        )
-                    }
                 }
             }
-        },
-        actions = {
+
+            Spacer(modifier = Modifier.width(12.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = chatInfo?.title ?: "Чат",
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 26.sp,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                // Статус: печатает / в сети / не в сети / кол-во участников
+                val subtitle = when {
+                    isDirectChat && isTyping -> "печатает..."
+                    chatInfo?.type == ChatType.GROUP -> "${chatInfo.members.size} участников"
+                    isDirectChat && isOtherOnline -> "в сети"
+                    isDirectChat -> "не в сети"
+                    else -> ""
+                }
+                if (subtitle.isNotEmpty()) {
+                    Text(
+                        text = subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = when {
+                            isTyping -> MaterialTheme.colorScheme.primary
+                            isOtherOnline -> Color(0xFF4CAF50)
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        fontSize = 13.sp,
+                    )
+                }
+            }
+
             if (isDirectChat) {
                 IconButton(
                     onClick = { if (peerId.isNotEmpty()) onCallClick(peerId, false, peerName) },
                     enabled = peerId.isNotEmpty(),
                 ) {
-                    Icon(Icons.Default.Call, "Аудиозвонок", tint = MaterialTheme.colorScheme.onPrimary)
+                    Icon(
+                        Icons.Default.Call, "Аудиозвонок",
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
                 }
                 IconButton(
                     onClick = { if (peerId.isNotEmpty()) onCallClick(peerId, true, peerName) },
                     enabled = peerId.isNotEmpty(),
                 ) {
-                    Icon(Icons.Default.Videocam, "Видеозвонок", tint = MaterialTheme.colorScheme.onPrimary)
+                    Icon(
+                        Icons.Default.Videocam, "Видеозвонок",
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
                 }
             }
-        },
-    )
+        }
+    }
 }
 
 // ── Разделитель дат между группами сообщений ─────────────────────────────────
@@ -300,7 +343,6 @@ private fun MessageBubble(
     val darkTheme = isSystemInDarkTheme()
     var showMenu by remember { mutableStateOf(false) }
 
-    // Цвет пузыря зависит от направления и темы приложения
     val bubbleColor = when {
         isOutgoing && darkTheme -> OutgoingBubbleDark
         isOutgoing -> OutgoingBubble
@@ -308,11 +350,9 @@ private fun MessageBubble(
         else -> IncomingBubble
     }
 
-    // Цвет текста — контрастный к фону пузыря
     val textColor = if (darkTheme) Color.White else Color.Black
     val metaColor = if (darkTheme) Color.White.copy(alpha = 0.45f) else Color.Gray
 
-    // Исходящие сообщения — скруглённый левый угол, входящие — правый
     val shape = if (isOutgoing) {
         RoundedCornerShape(topStart = 18.dp, topEnd = 4.dp, bottomStart = 18.dp, bottomEnd = 18.dp)
     } else {
@@ -343,7 +383,6 @@ private fun MessageBubble(
                     style = MaterialTheme.typography.bodyMedium,
                     color = textColor,
                 )
-                // Время, отметка редактирования и статус доставки — справа внизу пузыря
                 Row(
                     modifier = Modifier
                         .align(Alignment.End)
@@ -372,7 +411,6 @@ private fun MessageBubble(
                 }
             }
 
-            // Контекстное меню — появляется при долгом нажатии на своё сообщение
             DropdownMenu(
                 expanded = showMenu,
                 onDismissRequest = { showMenu = false },
@@ -394,7 +432,7 @@ private fun MessageBubble(
     }
 }
 
-// ── Иконка статуса сообщения (Telegram-стиль) ────────────────────────────────
+// ── Иконка статуса сообщения ─────────────────────────────────────────────────
 
 @Composable
 private fun MessageStatusIcon(status: MessageStatus, metaColor: Color) {
@@ -418,13 +456,11 @@ private fun MessageInputBar(
     onSend: () -> Unit,
     onCancelEdit: () -> Unit,
 ) {
-    // Поверхность с лёгкой тенью отделяет ввод от списка сообщений
     Surface(
         shadowElevation = 8.dp,
         color = MaterialTheme.colorScheme.surface,
     ) {
         Column {
-            // Баннер режима редактирования
             if (editingMessage != null) {
                 Row(
                     modifier = Modifier
@@ -459,65 +495,62 @@ private fun MessageInputBar(
                 }
             }
 
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 8.dp, vertical = 8.dp)
-                .navigationBarsPadding()
-                .imePadding(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            // Текстовое поле в скруглённом контейнере
-            Box(
+            Row(
                 modifier = Modifier
-                    .weight(1f)
-                    .clip(RoundedCornerShape(24.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant)
-                    .padding(horizontal = 16.dp, vertical = 10.dp),
-                contentAlignment = Alignment.CenterStart,
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 8.dp)
+                    .navigationBarsPadding()
+                    .imePadding(),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                // Плейсхолдер — виден только когда поле пустое
-                if (text.isEmpty()) {
-                    Text(
-                        text = "Сообщение…",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        style = MaterialTheme.typography.bodyMedium,
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(24.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    contentAlignment = Alignment.CenterStart,
+                ) {
+                    if (text.isEmpty()) {
+                        Text(
+                            text = "Сообщение…",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                    BasicTextField(
+                        value = text,
+                        onValueChange = onTextChange,
+                        textStyle = MaterialTheme.typography.bodyMedium.copy(
+                            color = MaterialTheme.colorScheme.onSurface,
+                        ),
+                        modifier = Modifier.fillMaxWidth(),
+                        maxLines = 6,
                     )
                 }
-                BasicTextField(
-                    value = text,
-                    onValueChange = onTextChange,
-                    textStyle = MaterialTheme.typography.bodyMedium.copy(
-                        color = MaterialTheme.colorScheme.onSurface,
-                    ),
-                    modifier = Modifier.fillMaxWidth(),
-                    maxLines = 6,
-                )
-            }
 
-            Spacer(modifier = Modifier.width(8.dp))
+                Spacer(modifier = Modifier.width(8.dp))
 
-            // Кнопка отправки: активна только при наличии текста
-            IconButton(
-                onClick = onSend,
-                enabled = text.isNotEmpty(),
-                modifier = Modifier
-                    .size(46.dp)
-                    .clip(CircleShape)
-                    .background(
-                        if (text.isNotEmpty()) MaterialTheme.colorScheme.primary
-                        else MaterialTheme.colorScheme.surfaceVariant,
-                    ),
-            ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Filled.Send,
-                    contentDescription = "Отправить",
-                    tint = if (text.isNotEmpty()) MaterialTheme.colorScheme.onPrimary
-                           else MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(20.dp),
-                )
+                IconButton(
+                    onClick = onSend,
+                    enabled = text.isNotEmpty(),
+                    modifier = Modifier
+                        .size(46.dp)
+                        .clip(CircleShape)
+                        .background(
+                            if (text.isNotEmpty()) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.surfaceVariant,
+                        ),
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.Send,
+                        contentDescription = "Отправить",
+                        tint = if (text.isNotEmpty()) MaterialTheme.colorScheme.onPrimary
+                               else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
             }
         }
-        } // Column
     }
 }
