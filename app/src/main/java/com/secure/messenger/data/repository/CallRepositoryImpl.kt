@@ -1,8 +1,5 @@
 package com.secure.messenger.data.repository
 
-import com.secure.messenger.data.local.dao.ChatDao
-import com.secure.messenger.data.local.dao.MessageDao
-import com.secure.messenger.data.local.entities.MessageEntity
 import com.secure.messenger.data.remote.api.MessengerApi
 import com.secure.messenger.data.remote.webrtc.WebRtcCallState
 import com.secure.messenger.data.remote.webrtc.WebRtcManager
@@ -11,8 +8,6 @@ import com.secure.messenger.data.remote.websocket.SignalingEvent
 import com.secure.messenger.domain.model.Call
 import com.secure.messenger.domain.model.CallState
 import com.secure.messenger.domain.model.CallType
-import com.secure.messenger.domain.model.MessageStatus
-import com.secure.messenger.domain.model.MessageType
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -27,8 +22,6 @@ class CallRepositoryImpl @Inject constructor(
     private val api: MessengerApi,
     private val webRtcManager: WebRtcManager,
     private val signalingClient: SignalingClient,
-    private val chatDao: ChatDao,
-    private val messageDao: MessageDao,
 ) : com.secure.messenger.domain.repository.CallRepository {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -40,7 +33,12 @@ class CallRepositoryImpl @Inject constructor(
     private var connectedAt: Long? = null
 
     init {
-        // Заполняем _activeCall при входящем звонке
+        // Заполняем _activeCall при входящем звонке.
+        //
+        // Системные сообщения о звонках («Пропущенный», «Звонок завершён · 1:23»)
+        // создаются сервером в БД при обработке end_call и приходят сюда обычным
+        // путём — через IncomingMessageHandler как SYSTEM-сообщения. Локально
+        // ничего не вставляем, иначе будет дублирование.
         scope.launch {
             signalingClient.events.collect { event ->
                 when (event) {
@@ -55,32 +53,6 @@ class CallRepositoryImpl @Inject constructor(
                         endedAt = null,
                     )
                     is SignalingEvent.CallEnded -> {
-                        val call = _activeCall.value ?: return@collect
-                        val label = if (call.type == CallType.VIDEO) "Видеозвонок" else "Звонок"
-                        val peerId = if (call.callerId == "me") call.calleeId else call.callerId
-
-                        when (call.state) {
-                            CallState.RINGING -> {
-                                insertCallMessage(call.callerId, call.type, "Пропущенный $label")
-                            }
-                            CallState.CONNECTING, CallState.CONNECTED -> {
-                                val duration = connectedAt?.let {
-                                    ((System.currentTimeMillis() - it) / 1000).toInt()
-                                } ?: 0
-                                val text = if (duration > 0) {
-                                    val min = duration / 60
-                                    val sec = duration % 60
-                                    "$label · ${String.format("%d:%02d", min, sec)}"
-                                } else {
-                                    "Входящий $label"
-                                }
-                                insertCallMessage(peerId, call.type, text)
-                            }
-                            CallState.CALLING -> {
-                                insertCallMessage(peerId, call.type, "Исходящий $label")
-                            }
-                            else -> Unit
-                        }
                         connectedAt = null
                         _activeCall.value = null
                     }
@@ -121,11 +93,8 @@ class CallRepositoryImpl @Inject constructor(
         signalingClient.sendEndCall(callId)
         _activeCall.value = call?.copy(state = CallState.DECLINED)
         webRtcManager.endCall()
-        // Системное сообщение: отклонённый звонок
-        if (call != null) {
-            val label = if (call.type == CallType.VIDEO) "Видеозвонок" else "Звонок"
-            insertCallMessage(call.callerId, call.type, "Отклонённый $label")
-        }
+        // Системное сообщение об отклонённом звонке создаст сервер
+        // (forwardAsCallEnded → InsertSystemMessage) и пришлёт обоим участникам.
         connectedAt = null
         _activeCall.value = null
     }
@@ -136,45 +105,11 @@ class CallRepositoryImpl @Inject constructor(
         if (call != null) {
             val duration = connectedAt?.let { ((System.currentTimeMillis() - it) / 1000).toInt() } ?: 0
             _activeCall.value = call.copy(state = CallState.ENDED, durationSeconds = duration)
-
-            // Системное сообщение в чат
-            val peerId = if (call.callerId == "me") call.calleeId else call.callerId
-            val label = if (call.type == CallType.VIDEO) "Видеозвонок" else "Звонок"
-            val text = if (duration > 0) {
-                val min = duration / 60
-                val sec = duration % 60
-                "$label · ${String.format("%d:%02d", min, sec)}"
-            } else {
-                "Исходящий $label"
-            }
-            insertCallMessage(peerId, call.type, text)
+            // Системное сообщение о завершённом звонке создаст сервер
         }
         webRtcManager.endCall()
         connectedAt = null
         _activeCall.value = null
-    }
-
-    // ── Вставка системного сообщения о звонке в чат ────────────────────────
-
-    /**
-     * Создаёт системное сообщение о звонке в чате с указанным пользователем.
-     * Если чата ещё нет — сообщение не создаётся (звонок без чата).
-     */
-    private suspend fun insertCallMessage(peerUserId: String, callType: CallType, text: String) {
-        val chat = chatDao.getByOtherUserId(peerUserId) ?: return
-        messageDao.upsert(MessageEntity(
-            id = "call_${UUID.randomUUID()}",
-            chatId = chat.id,
-            senderId = "system",
-            encryptedContent = "",
-            decryptedContent = text,
-            type = MessageType.SYSTEM.name,
-            status = MessageStatus.READ.name,
-            timestamp = System.currentTimeMillis(),
-            replyToId = null,
-            mediaUrl = null,
-            isEdited = false,
-        ))
     }
 
     override suspend fun getCallHistory(chatId: String): Result<List<Call>> = runCatching {

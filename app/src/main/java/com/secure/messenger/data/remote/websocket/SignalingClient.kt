@@ -58,6 +58,10 @@ class SignalingClient @Inject constructor(
     private var peerUserId: String? = null
     private var currentCallId: String? = null
 
+    /** true когда приложение на переднем плане (MainActivity видима) */
+    @Volatile
+    var isAppForeground: Boolean = false
+
     private val _events = MutableSharedFlow<SignalingEvent>(extraBufferCapacity = 64)
     val events: SharedFlow<SignalingEvent> = _events.asSharedFlow()
 
@@ -72,9 +76,10 @@ class SignalingClient @Inject constructor(
     fun connect(serverUrl: String, authToken: String) {
         if (webSocket != null) return
 
+        // Authorization header is added by the OkHttpClient interceptor (AppModule).
+        // Do NOT add it here — a duplicate Authorization header causes nginx to return 400.
         val request = Request.Builder()
             .url(serverUrl)
-            .addHeader("Authorization", "Bearer $authToken")
             .build()
 
         webSocket = okHttpClient.newWebSocket(request, createListener())
@@ -224,6 +229,16 @@ class SignalingClient @Inject constructor(
         if (peer != null) {
             send("end_call", mapOf("to" to peer, "callId" to callId))
         }
+    }
+
+    /** Сообщает серверу, что пользователь в сети / свернул приложение */
+    fun sendPresence(online: Boolean) {
+        send("presence", mapOf("online" to online))
+    }
+
+    /** Уведомляет собеседника, что текущий пользователь печатает */
+    fun sendTyping(chatId: String) {
+        send("typing", mapOf("chatId" to chatId))
     }
 
     fun sendChatMessage(chatId: String, encryptedContent: String, messageId: String) {

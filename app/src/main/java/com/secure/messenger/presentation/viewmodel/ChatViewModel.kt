@@ -9,9 +9,11 @@ import com.secure.messenger.data.remote.websocket.SignalingEvent
 import com.secure.messenger.domain.model.Chat
 import com.secure.messenger.domain.model.ChatType
 import com.secure.messenger.domain.model.Message
+import com.secure.messenger.domain.model.User
 import com.secure.messenger.domain.repository.AuthRepository
 import com.secure.messenger.domain.repository.ChatRepository
 import com.secure.messenger.domain.usecase.SendMessageUseCase
+import com.secure.messenger.utils.TextEnhancer
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -31,6 +33,8 @@ data class ChatUiState(
     val isLoading: Boolean = false,
     val error: String? = null,
     val editingMessage: Message? = null,
+    val isLoadingOlder: Boolean = false,
+    val hasOlderMessages: Boolean = true,
 )
 
 @HiltViewModel
@@ -44,14 +48,16 @@ class ChatViewModel @Inject constructor(
 ) : ViewModel() {
 
     private val chatId: String = checkNotNull(savedStateHandle["chatId"])
+    private val displayLimit = MutableStateFlow(PAGE_SIZE)
 
     val currentUserId: StateFlow<String?> = authRepository.currentUser
         .map { it?.id }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
     // Список сообщений текущего чата — обновляется в реальном времени через WebSocket
-    val messages: StateFlow<List<Message>> = chatRepository
-        .observeMessages(chatId)
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    val messages: StateFlow<List<Message>> = displayLimit
+        .flatMapLatest { limit -> chatRepository.observeMessages(chatId, limit) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     // Метаданные текущего чата (название, аватар, участники) — для отображения в шапке экрана
@@ -73,10 +79,26 @@ class ChatViewModel @Inject constructor(
         }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
+    // Данные о собеседнике — для диалога профиля
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    val otherUser: StateFlow<User?> = chatInfo
+        .flatMapLatest { chat ->
+            val otherId = chat?.otherUserId
+            if (otherId != null && chat.type == ChatType.DIRECT) {
+                userDao.observeById(otherId).map { it?.toDomain() }
+            } else {
+                flowOf(null)
+            }
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
     // Индикатор «печатает…»
     private val _isTyping = MutableStateFlow(false)
     val isTyping: StateFlow<Boolean> = _isTyping.asStateFlow()
     private var typingResetJob: Job? = null
+
+    // Дебаунс отправки typing: не чаще раза в 2 секунды
+    private var typingSentAt = 0L
 
     private val _uiState = MutableStateFlow(ChatUiState())
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
@@ -85,8 +107,12 @@ class ChatViewModel @Inject constructor(
     val inputText: StateFlow<String> = _inputText.asStateFlow()
 
     init {
-        // Загружаем историю сообщений с сервера при открытии чата
-        viewModelScope.launch { chatRepository.fetchMessages(chatId) }
+        // Загружаем историю сообщений с сервера при открытии чата (+ синхронизация удалений)
+        viewModelScope.launch {
+            chatRepository.fetchMessages(chatId).onFailure { e ->
+                Timber.e(e, "fetchMessages failed for chatId=$chatId")
+            }
+        }
         // Помечаем все сообщения как прочитанные при открытии чата
         markAsRead()
         observeTyping()
@@ -117,6 +143,13 @@ class ChatViewModel @Inject constructor(
 
     fun onInputChange(text: String) {
         _inputText.value = text
+        if (text.isNotEmpty()) {
+            val now = System.currentTimeMillis()
+            if (now - typingSentAt > 2_000) {
+                typingSentAt = now
+                signalingClient.sendTyping(chatId)
+            }
+        }
     }
 
     fun sendMessage() {
@@ -169,7 +202,44 @@ class ChatViewModel @Inject constructor(
         _uiState.value = _uiState.value.copy(error = null)
     }
 
+    /** Улучшает текст в инпуте: Gemini Nano (если есть) → правила */
+    fun enhanceText() {
+        val current = _inputText.value
+        if (current.isBlank()) return
+        viewModelScope.launch {
+            val (enhanced, changed) = TextEnhancer.enhance(current)
+            if (changed) {
+                _inputText.value = enhanced
+            }
+        }
+    }
+
+    /** Подгружает старые сообщения (вызывается при скролле вверх) */
+    fun loadOlderMessages() {
+        val state = _uiState.value
+        if (state.isLoadingOlder || !state.hasOlderMessages) return
+
+        val oldest = messages.value.firstOrNull() ?: return
+        _uiState.value = state.copy(isLoadingOlder = true)
+
+        viewModelScope.launch {
+            chatRepository.fetchOlderMessages(chatId, oldest.timestamp)
+                .onSuccess { hasMore ->
+                    displayLimit.value += PAGE_SIZE
+                    _uiState.value = _uiState.value.copy(isLoadingOlder = false, hasOlderMessages = hasMore)
+                }
+                .onFailure { e ->
+                    Timber.e(e, "Failed to load older messages")
+                    _uiState.value = _uiState.value.copy(isLoadingOlder = false)
+                }
+        }
+    }
+
     private fun markAsRead() {
         viewModelScope.launch { chatRepository.markAsRead(chatId) }
+    }
+
+    companion object {
+        private const val PAGE_SIZE = 50
     }
 }

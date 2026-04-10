@@ -17,11 +17,10 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.VIBRATE" />
 
-    <!-- Foreground Service for calls (keeps calls alive when app is in background) -->
+    <!-- Foreground Service для звонков (камера + микрофон) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
     <uses-permission android:name="android.permission.USE_SIP" />
 
@@ -42,6 +41,9 @@
 
     <!-- Установка обновлений APK -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- Авто-чтение OTP кода из входящего SMS -->
+    <uses-permission android:name="android.permission.RECEIVE_SMS" />
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.camera.front" android:required="false" />
@@ -75,11 +77,30 @@
             android:foregroundServiceType="camera|microphone"
             android:exported="false" />
 
-        <!-- WebSocket / notification service (foreground, dataSync type for Android 14+) -->
+        <!-- WebSocket сервис — фоновый, без постоянного уведомления.
+             FCM обеспечивает доставку когда сервис убит. -->
         <service
             android:name=".service.MessagingService"
-            android:foregroundServiceType="dataSync"
             android:exported="false" />
+
+        <!-- Firebase Cloud Messaging — получает push когда приложение в фоне/убито -->
+        <service
+            android:name=".service.FcmService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+
+        <!-- Авто-читает OTP из входящих SMS -->
+        <receiver
+            android:name=".service.SmsReceiver"
+            android:exported="false"
+            android:permission="android.permission.BROADCAST_SMS">
+            <intent-filter android:priority="999">
+                <action android:name="android.provider.Telephony.SMS_RECEIVED" />
+            </intent-filter>
+        </receiver>
 
         <!-- Restarts MessagingService after device reboot -->
         <receiver

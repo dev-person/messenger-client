@@ -30,3 +30,4 @@ server/
 
 # Local scratch / task reference files
 forTask/
+grizzly.keystore

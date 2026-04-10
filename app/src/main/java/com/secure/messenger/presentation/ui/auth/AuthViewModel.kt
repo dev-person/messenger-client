@@ -1,13 +1,16 @@
 package com.secure.messenger.presentation.ui.auth
 
+import android.content.Context
 import android.util.Base64
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.secure.messenger.data.repository.OtpCooldownException
 import com.secure.messenger.di.AuthTokenProvider
 import com.secure.messenger.domain.repository.AuthRepository
 import com.secure.messenger.utils.CryptoManager
 import com.secure.messenger.utils.LocalKeyStore
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -71,16 +74,33 @@ data class AuthUiState(
 
 @HiltViewModel
 class AuthViewModel @Inject constructor(
+    @ApplicationContext private val appContext: Context,
     private val authRepository: AuthRepository,
     private val cryptoManager: CryptoManager,
     private val localKeyStore: LocalKeyStore,
     private val tokenProvider: AuthTokenProvider,
 ) : ViewModel() {
 
+    /**
+     * SharedPreferences для хранения времени окончания кулдауна OTP.
+     * Сохраняет timestamp (мс) до которого нельзя повторно запрашивать код.
+     * Переживает перезапуск приложения — пользователь не может обойти кулдаун
+     * закрытием и повторным открытием приложения.
+     */
+    private val cooldownPrefs = appContext.getSharedPreferences("otp_cooldown", Context.MODE_PRIVATE)
+    private companion object {
+        const val KEY_COOLDOWN_EXPIRY = "cooldown_expiry_ms"
+    }
+
     private val _uiState = MutableStateFlow(AuthUiState())
     val uiState: StateFlow<AuthUiState> = _uiState.asStateFlow()
 
     private var countdownJob: Job? = null
+
+    init {
+        // Восстанавливаем кулдаун после перезапуска приложения
+        restoreCooldownIfActive()
+    }
 
     // ── Ввод телефона ──────────────────────────────────────────────────────────
 
@@ -116,27 +136,33 @@ class AuthViewModel @Inject constructor(
     }
 
     fun backToPhone() {
-        countdownJob?.cancel()
+        // Не сбрасываем countdown — сервер не позволит отправить раньше времени
         _uiState.value = _uiState.value.copy(
             step = AuthStep.PHONE,
             otp = "",
             error = null,
-            resendCountdown = 0,
         )
     }
 
     // ── Запрос OTP ────────────────────────────────────────────────────────────
 
     fun requestOtp() {
+        if (_uiState.value.resendCountdown > 0) return
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isLoading = true, error = null)
             authRepository.requestOtp(_uiState.value.fullPhone)
                 .onSuccess {
                     _uiState.value = _uiState.value.copy(step = AuthStep.OTP, otp = "")
-                    startResendCountdown()
+                    startResendCountdown(300)
                 }
                 .onFailure { e ->
-                    _uiState.value = _uiState.value.copy(error = e.message)
+                    if (e is OtpCooldownException) {
+                        // Сервер говорит сколько ждать — показываем отсчёт и переходим к вводу кода
+                        _uiState.value = _uiState.value.copy(step = AuthStep.OTP, otp = "", error = null)
+                        startResendCountdown(e.retryAfterSeconds)
+                    } else {
+                        _uiState.value = _uiState.value.copy(error = e.message)
+                    }
                 }
             _uiState.value = _uiState.value.copy(isLoading = false)
         }
@@ -147,20 +173,51 @@ class AuthViewModel @Inject constructor(
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isLoading = true, error = null, otp = "")
             authRepository.requestOtp(_uiState.value.fullPhone)
-                .onSuccess { startResendCountdown() }
-                .onFailure { e -> _uiState.value = _uiState.value.copy(error = e.message) }
+                .onSuccess { startResendCountdown(300) }
+                .onFailure { e ->
+                    if (e is OtpCooldownException) {
+                        startResendCountdown(e.retryAfterSeconds)
+                    } else {
+                        _uiState.value = _uiState.value.copy(error = e.message)
+                    }
+                }
             _uiState.value = _uiState.value.copy(isLoading = false)
         }
     }
 
-    private fun startResendCountdown() {
+    /**
+     * Восстанавливает кулдаун из SharedPreferences если он ещё активен.
+     * Вызывается при создании ViewModel (в т.ч. после перезапуска приложения).
+     * Не переключает на экран OTP — номер телефона при перезапуске не сохранён.
+     * Кнопка «Получить код» будет заблокирована пока таймер тикает.
+     */
+    private fun restoreCooldownIfActive() {
+        val expiryMs = cooldownPrefs.getLong(KEY_COOLDOWN_EXPIRY, 0)
+        val remainingMs = expiryMs - System.currentTimeMillis()
+        if (remainingMs > 1_000) {
+            val remainingSec = (remainingMs / 1_000).toInt()
+            startResendCountdownInternal(remainingSec)
+        }
+    }
+
+    private fun startResendCountdown(seconds: Int) {
+        // Сохраняем время окончания кулдауна — переживёт перезапуск приложения
+        cooldownPrefs.edit()
+            .putLong(KEY_COOLDOWN_EXPIRY, System.currentTimeMillis() + seconds * 1_000L)
+            .apply()
+        startResendCountdownInternal(seconds)
+    }
+
+    private fun startResendCountdownInternal(seconds: Int) {
         countdownJob?.cancel()
         countdownJob = viewModelScope.launch {
-            for (s in 60 downTo 1) {
+            for (s in seconds downTo 1) {
                 _uiState.value = _uiState.value.copy(resendCountdown = s)
                 delay(1000)
             }
             _uiState.value = _uiState.value.copy(resendCountdown = 0)
+            // Кулдаун истёк — очищаем сохранённое значение
+            cooldownPrefs.edit().remove(KEY_COOLDOWN_EXPIRY).apply()
         }
     }
 
@@ -174,6 +231,9 @@ class AuthViewModel @Inject constructor(
 
             authRepository.verifyOtp(_uiState.value.fullPhone, _uiState.value.otp)
                 .onSuccess {
+                    // Верификация успешна — очищаем сохранённый кулдаун
+                    cooldownPrefs.edit().remove(KEY_COOLDOWN_EXPIRY).apply()
+                    countdownJob?.cancel()
                     ensureKeyPairExists()
                     onSuccess(isNewUser)
                 }

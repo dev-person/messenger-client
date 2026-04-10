@@ -5,7 +5,6 @@ import android.content.Intent
 import android.widget.Toast
 import androidx.core.content.FileProvider
 import com.secure.messenger.BuildConfig
-import com.secure.messenger.data.remote.api.MessengerApi
 import com.secure.messenger.data.remote.api.UpdateInfoDto
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
@@ -14,8 +13,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONObject
 import timber.log.Timber
 import java.io.File
+import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -28,22 +29,43 @@ import javax.inject.Singleton
 @Singleton
 class UpdateManager @Inject constructor(
     @ApplicationContext private val context: Context,
-    private val api: MessengerApi,
     private val okHttpClient: OkHttpClient,
 ) {
+    // Отдельный клиент без авторизации — работает до входа в аккаунт
+    private val publicClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .build()
+
     private val _updateAvailable = MutableStateFlow<UpdateInfoDto?>(null)
     val updateAvailable = _updateAvailable.asStateFlow()
 
     /**
      * Проверяет наличие обновления на сервере.
+     * Использует публичный HTTP-клиент (без токена) — работает на экране авторизации.
      * Возвращает [UpdateInfoDto] если есть более новая версия, иначе null.
-     * Также обновляет StateFlow для подписчиков.
      */
     suspend fun checkForUpdate(): UpdateInfoDto? = withContext(Dispatchers.IO) {
         runCatching {
-            val info = api.getUpdateInfo().data ?: return@withContext null
-            val currentCode = BuildConfig.VERSION_CODE
-            if (info.versionCode > currentCode && !info.downloadUrl.isNullOrBlank()) {
+            // Передаём текущую версию — сервер вернёт кумулятивный changelog
+            // со всех версий, что вышли после установленной.
+            val url = BuildConfig.API_BASE_URL + "app/update?currentVersion=${BuildConfig.VERSION_CODE}"
+            val request = Request.Builder().url(url).build()
+            val response = publicClient.newCall(request).execute()
+            val body = response.body?.string() ?: return@withContext null
+            val json = JSONObject(body)
+            val data = json.optJSONObject("data") ?: return@withContext null
+            val versionCode = data.optInt("versionCode", -1)
+            if (versionCode < 0) return@withContext null
+            val downloadUrl = data.optString("downloadUrl").takeIf { it.isNotBlank() }
+                ?: return@withContext null
+            val info = UpdateInfoDto(
+                versionCode = versionCode,
+                versionName = data.optString("versionName").takeIf { it.isNotBlank() },
+                downloadUrl = downloadUrl,
+                changelog = data.optString("changelog").takeIf { it.isNotBlank() },
+            )
+            if (info.versionCode > BuildConfig.VERSION_CODE) {
                 _updateAvailable.value = info
                 info
             } else null

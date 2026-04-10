@@ -25,6 +25,6 @@ class BootReceiver : BroadcastReceiver() {
         // Only start if the user is logged in
         if (!tokenProvider.hasToken()) return
 
-        context.startForegroundService(Intent(context, MessagingService::class.java))
+        context.startService(Intent(context, MessagingService::class.java))
     }
 }

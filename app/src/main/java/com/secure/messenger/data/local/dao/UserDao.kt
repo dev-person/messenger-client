@@ -10,7 +10,11 @@ import kotlinx.coroutines.flow.Flow
 @Dao
 interface UserDao {
 
-    @Query("SELECT * FROM users WHERE isContact = 1 ORDER BY displayName ASC")
+    @Query("""
+        SELECT * FROM users WHERE isContact = 1
+        OR id IN (SELECT otherUserId FROM chats WHERE type = 'DIRECT' AND otherUserId IS NOT NULL)
+        ORDER BY displayName ASC
+    """)
     fun observeContacts(): Flow<List<UserEntity>>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)

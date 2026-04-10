@@ -1,5 +1,11 @@
 package com.secure.messenger.presentation.ui.chat
 
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -43,6 +49,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.LaunchedEffect
+import kotlinx.coroutines.delay
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -56,6 +63,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import com.secure.messenger.BuildConfig
+import com.secure.messenger.R
 import com.secure.messenger.data.remote.api.SupportInfoDto
 import com.secure.messenger.domain.model.Chat
 import com.secure.messenger.domain.model.ChatType
@@ -87,8 +95,30 @@ fun ChatListScreen(
     val chats by viewModel.chats.collectAsStateWithLifecycle()
     val currentUser by viewModel.currentUser.collectAsStateWithLifecycle()
     val isConnected by viewModel.isConnected.collectAsStateWithLifecycle()
+    val typingChats by viewModel.typingChats.collectAsStateWithLifecycle()
+    val error by viewModel.error.collectAsStateWithLifecycle()
+
+    // Задержка перед показом "Нет соединения" — убирает мигание при первом запуске.
+    // isConnected стартует как false пока WS устанавливается (~1-2с после запуска).
+    var showDisconnected by remember { mutableStateOf(false) }
+    LaunchedEffect(isConnected) {
+        if (isConnected) {
+            showDisconnected = false
+        } else {
+            delay(3_000)
+            showDisconnected = true
+        }
+    }
 
     var showSupportDialog by remember { mutableStateOf(false) }
+    val snackbarHostState = remember { androidx.compose.material3.SnackbarHostState() }
+
+    LaunchedEffect(error) {
+        error?.let {
+            snackbarHostState.showSnackbar(it)
+            viewModel.clearError()
+        }
+    }
 
     Box(
         modifier = Modifier
@@ -127,8 +157,11 @@ fun ChatListScreen(
                                     .padding(2.dp)
                                     .clip(CircleShape)
                                     .background(
-                                        if (isConnected) Color(0xFF4CAF50)
-                                        else Color(0xFFFF9800)
+                                        when {
+                                            isConnected -> Color(0xFF4CAF50)
+                                            showDisconnected -> Color(0xFFFF9800)
+                                            else -> Color(0xFF9E9E9E)
+                                        }
                                     )
                                     .align(Alignment.BottomEnd),
                             )
@@ -153,7 +186,11 @@ fun ChatListScreen(
                                 overflow = TextOverflow.Ellipsis,
                             )
                             Text(
-                                text = if (isConnected) "В сети" else "Нет соединения",
+                                text = when {
+                                    isConnected -> "В сети"
+                                    showDisconnected -> "Нет соединения"
+                                    else -> "Подключение..."
+                                },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = if (isConnected) Color(0xFF4CAF50)
                                         else MaterialTheme.colorScheme.onSurfaceVariant,
@@ -186,6 +223,7 @@ fun ChatListScreen(
                     items(chats, key = { it.id }) { chat ->
                         ChatRow(
                             chat = chat,
+                            isTyping = chat.id in typingChats,
                             onClick = { onChatClick(chat.id) },
                             onDeleteChat = { viewModel.deleteChat(chat.id) },
                             onBlockUser = {
@@ -209,6 +247,12 @@ fun ChatListScreen(
         ) {
             Icon(Icons.Default.Edit, contentDescription = "Новый чат")
         }
+
+        // Snackbar для ошибок
+        androidx.compose.material3.SnackbarHost(
+            hostState = snackbarHostState,
+            modifier = Modifier.align(Alignment.BottomCenter),
+        )
     }
 
     // Диалог «Поддержать автора»
@@ -294,6 +338,7 @@ private fun SupportAuthorDialog(onDismiss: () -> Unit) {
 @Composable
 private fun ChatRow(
     chat: Chat,
+    isTyping: Boolean,
     onClick: () -> Unit,
     onDeleteChat: () -> Unit,
     onBlockUser: () -> Unit,
@@ -317,11 +362,11 @@ private fun ChatRow(
                     .padding(horizontal = 16.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                // Аватар с индикатором онлайн-статуса
+                // Аватар с индикатором онлайн-статуса / печатает
                 val isOtherUserOnline = chat.members.firstOrNull { it.id == chat.otherUserId }?.isOnline == true
                 Box {
                     AvatarImage(url = chat.avatarUrl, name = chat.title, size = 52)
-                    if (chat.isPinned) {
+                    if (chat.isPinned && !isTyping) {
                         Box(
                             contentAlignment = Alignment.Center,
                             modifier = Modifier
@@ -330,6 +375,28 @@ private fun ChatRow(
                                 .background(MaterialTheme.colorScheme.surface)
                                 .align(Alignment.BottomEnd),
                         ) { Text(text = "📌", fontSize = 10.sp) }
+                    } else if (isTyping && chat.type == ChatType.DIRECT) {
+                        // Пульсирующий синий индикатор «печатает»
+                        val pulse by rememberInfiniteTransition(label = "typing")
+                            .animateFloat(
+                                initialValue = 0.4f,
+                                targetValue = 1f,
+                                animationSpec = infiniteRepeatable(
+                                    animation = tween(500, easing = FastOutSlowInEasing),
+                                    repeatMode = RepeatMode.Reverse,
+                                ),
+                                label = "pulse",
+                            )
+                        Box(
+                            modifier = Modifier
+                                .size(14.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.surface)
+                                .padding(2.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.primary.copy(alpha = pulse))
+                                .align(Alignment.BottomEnd),
+                        )
                     } else if (isOtherUserOnline && chat.type == ChatType.DIRECT) {
                         Box(
                             modifier = Modifier
@@ -370,18 +437,25 @@ private fun ChatRow(
                         modifier = Modifier.padding(top = 2.dp),
                     ) {
                         Text(
-                            text = chat.lastMessage?.let { msg ->
-                                when (msg.type) {
-                                    MessageType.TEXT   -> msg.content
-                                    MessageType.IMAGE  -> "📷 Фото"
-                                    MessageType.VIDEO  -> "🎬 Видео"
-                                    MessageType.AUDIO  -> "🎵 Аудио"
-                                    MessageType.FILE   -> "📎 Файл"
-                                    MessageType.SYSTEM -> msg.content
-                                }
-                            } ?: "Нет сообщений",
+                            text = if (isTyping && chat.type == ChatType.DIRECT) {
+                                "печатает..."
+                            } else {
+                                chat.lastMessage?.let { msg ->
+                                    when (msg.type) {
+                                        MessageType.TEXT   -> msg.content
+                                        MessageType.IMAGE  -> "📷 Фото"
+                                        MessageType.VIDEO  -> "🎬 Видео"
+                                        MessageType.AUDIO  -> "🎵 Аудио"
+                                        MessageType.FILE   -> "📎 Файл"
+                                        MessageType.SYSTEM -> msg.content
+                                    }
+                                } ?: "Нет сообщений"
+                            },
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            color = if (isTyping && chat.type == ChatType.DIRECT)
+                                MaterialTheme.colorScheme.primary
+                            else
+                                MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.weight(1f),
@@ -498,16 +572,17 @@ fun AvatarImage(url: String?, name: String, size: Int) {
             modifier = Modifier.size(size.dp).clip(CircleShape),
         )
     } else {
+        // Заглушка — логотип медведя на цветном фоне
         Box(
             contentAlignment = Alignment.Center,
             modifier = Modifier.size(size.dp).clip(CircleShape).background(bgColor),
         ) {
-            Text(
-                text = initials.ifEmpty { "?" },
-                style = MaterialTheme.typography.titleMedium,
-                color = Color.White,
-                fontWeight = FontWeight.Bold,
-                fontSize = (size * 0.35f).sp,
+            androidx.compose.foundation.Image(
+                painter = androidx.compose.ui.res.painterResource(R.drawable.avatar_placeholder),
+                contentDescription = name,
+                modifier = Modifier
+                    .size((size * 0.82f).dp)
+                    .clip(CircleShape),
             )
         }
     }

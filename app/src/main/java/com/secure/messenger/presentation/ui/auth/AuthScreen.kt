@@ -26,10 +26,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.Image
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.ui.res.painterResource
+import com.secure.messenger.R
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -45,9 +47,22 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
+import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.platform.LocalContext
+import androidx.core.content.ContextCompat
+import com.secure.messenger.service.SmsReceiver
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
@@ -68,6 +83,21 @@ fun AuthScreen(
     viewModel: AuthViewModel = hiltViewModel(),
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+
+    // Запрашиваем RECEIVE_SMS при переходе на шаг ввода OTP
+    val smsPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* разрешение выдано или отклонено — авто-чтение сработает если выдано */ }
+
+    LaunchedEffect(state.step) {
+        if (state.step == AuthStep.OTP &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECEIVE_SMS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            smsPermissionLauncher.launch(Manifest.permission.RECEIVE_SMS)
+        }
+    }
 
     Box(modifier = Modifier.fillMaxSize()) {
         // Градиентный фон (синий сверху → белый снизу)
@@ -92,23 +122,16 @@ fun AuthScreen(
         ) {
             // ── Шапка с логотипом ──────────────────────────────────────────
             Spacer(modifier = Modifier.height(64.dp))
-            Box(
-                contentAlignment = Alignment.Center,
+            Image(
+                painter = painterResource(R.drawable.avatar_placeholder),
+                contentDescription = null,
                 modifier = Modifier
-                    .size(80.dp)
-                    .clip(CircleShape)
-                    .background(Color.White.copy(alpha = 0.25f)),
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Lock,
-                    contentDescription = null,
-                    tint = Color.White,
-                    modifier = Modifier.size(40.dp),
-                )
-            }
+                    .size(90.dp)
+                    .clip(CircleShape),
+            )
             Spacer(modifier = Modifier.height(16.dp))
             Text(
-                text = "SecureMessenger",
+                text = "Grizzly Messenger",
                 style = MaterialTheme.typography.titleMedium.copy(
                     fontSize = 22.sp,
                     fontWeight = FontWeight.Bold,
@@ -267,9 +290,10 @@ private fun PhoneInputStep(
 
         Spacer(modifier = Modifier.height(20.dp))
 
+        val onCooldown = state.resendCountdown > 0
         Button(
             onClick = onSubmit,
-            enabled = state.phoneNumber.length >= 7 && !state.isLoading,
+            enabled = state.phoneNumber.length >= 7 && !state.isLoading && !onCooldown,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(52.dp),
@@ -281,6 +305,11 @@ private fun PhoneInputStep(
                     color = Color.White,
                     strokeWidth = 2.dp,
                 )
+            } else if (onCooldown) {
+                val min = state.resendCountdown / 60
+                val sec = state.resendCountdown % 60
+                val label = if (min > 0) "${min}:${sec.toString().padStart(2, '0')}" else "${sec}с"
+                Text("Подождите $label", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
             } else {
                 Text("Продолжить", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
             }
@@ -299,6 +328,20 @@ private fun OtpInputStep(
     onResend: () -> Unit,
 ) {
     val keyboard = LocalSoftwareKeyboardController.current
+    val context = LocalContext.current
+
+    // Слушаем входящий OTP из SMS пока этот экран открыт
+    DisposableEffect(Unit) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                val code = intent.getStringExtra(SmsReceiver.EXTRA_OTP_CODE) ?: return
+                onOtpChange(code)
+            }
+        }
+        val filter = IntentFilter(SmsReceiver.ACTION_OTP_RECEIVED)
+        ContextCompat.registerReceiver(context, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        onDispose { context.unregisterReceiver(receiver) }
+    }
 
     Column(
         modifier = Modifier.padding(horizontal = 24.dp, vertical = 24.dp),
@@ -326,18 +369,24 @@ private fun OtpInputStep(
         )
         Spacer(modifier = Modifier.height(6.dp))
         Text(
-            text = "Отправлен на ${state.fullPhone}",
+            text = "Код отправлен на ${state.fullPhone}",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
         )
         Spacer(modifier = Modifier.height(24.dp))
 
-        // 6-значный код — большой красивый ввод
         OutlinedTextField(
             value = state.otp,
             onValueChange = { if (it.length <= 6 && it.all { c -> c.isDigit() }) onOtpChange(it) },
-            placeholder = { Text("• • • • • •", letterSpacing = 8.sp) },
+            placeholder = {
+                Text(
+                    "• • • • • •",
+                    letterSpacing = 8.sp,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            },
             keyboardOptions = KeyboardOptions(
                 keyboardType = KeyboardType.NumberPassword,
                 imeAction = ImeAction.Done,
@@ -396,8 +445,11 @@ private fun OtpInputStep(
 
         // Повторная отправка
         if (state.resendCountdown > 0) {
+            val m = state.resendCountdown / 60
+            val s = state.resendCountdown % 60
+            val timer = if (m > 0) "${m}:${s.toString().padStart(2, '0')}" else "${s} с"
             Text(
-                text = "Отправить повторно через ${state.resendCountdown} с",
+                text = "Отправить повторно через $timer",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

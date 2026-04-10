@@ -14,6 +14,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import com.secure.messenger.BuildConfig
+import com.secure.messenger.R
 import com.secure.messenger.data.remote.websocket.SignalingClient
 import com.secure.messenger.data.remote.websocket.SignalingEvent
 import com.secure.messenger.di.AuthTokenProvider
@@ -54,21 +55,14 @@ class MessagingService : Service() {
     private var reconnectDelayMs = 1_000L
 
     companion object {
-        // Notification channels
-        const val CHANNEL_BG      = "bg_service_channel"  // silent persistent (foreground)
-        const val CHANNEL_CALL    = "call_channel"         // incoming call — max priority
-        const val CHANNEL_MESSAGE = "message_channel"      // new message
-
-        // Notification IDs
-        private const val NOTIF_ID_FG   = 1000  // persistent foreground notification
-        const val NOTIF_ID_CALL = 1001  // incoming call (single, replaced each time)
+        const val CHANNEL_CALL    = "call_channel"    // входящий звонок — максимальный приоритет
+        const val CHANNEL_MESSAGE = "message_channel" // новое сообщение
+        const val NOTIF_ID_CALL   = 1001              // уведомление о звонке (одно, заменяется)
     }
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannels()
-        // Обязателен вызов startForeground() в течение 5 сек после onCreate()
-        startForeground(NOTIF_ID_FG, buildForegroundNotification())
+        // Каналы создаются в MessengerApp.onCreate() — здесь не нужно
         acquireWifiLock()
     }
 
@@ -99,6 +93,8 @@ class MessagingService : Service() {
                     is SignalingEvent.Connected -> {
                         Timber.d("WS connected")
                         reconnectDelayMs = 1_000L   // сбрасываем backoff при успешном подключении
+                        // Отправляем presence сразу после подключения — сервер не ставит online автоматически
+                        signalingClient.sendPresence(signalingClient.isAppForeground)
                     }
                     is SignalingEvent.IncomingCall    -> scope.launch { showCallNotification(event) }
                     is SignalingEvent.CallEnded       -> {
@@ -144,30 +140,13 @@ class MessagingService : Service() {
 
     private suspend fun handleMessage(json: String) {
         val info = incomingMessageHandler.handle(json) ?: return
+        // Не показываем уведомление когда приложение на переднем плане —
+        // пользователь уже видит сообщения в UI
+        if (com.secure.messenger.MessengerApp.isInForeground) return
         showMessageNotification(senderName = info.first, content = info.second)
     }
 
     // ── Уведомления ───────────────────────────────────────────────────────────
-
-    /** Тихое постоянное уведомление, требуемое для foreground-сервиса. */
-    private fun buildForegroundNotification(): Notification {
-        val openIntent = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE,
-        )
-        return NotificationCompat.Builder(this, CHANNEL_BG)
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentTitle("Secure Messenger")
-            .setContentText("Подключено")
-            .setContentIntent(openIntent)
-            .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_MIN)
-            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-            .setSilent(true)
-            .setVisibility(NotificationCompat.VISIBILITY_SECRET)
-            .build()
-    }
 
     /**
      * Полноэкранное уведомление о звонке — будит экран при заблокированном устройстве.
@@ -200,7 +179,7 @@ class MessagingService : Service() {
         val ringtoneUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
 
         val builder = NotificationCompat.Builder(this, CHANNEL_CALL)
-            .setSmallIcon(android.R.drawable.ic_menu_call)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(if (event.isVideo) "Входящий видеозвонок" else "Входящий звонок")
             .setContentText(callerName)
             .setContentIntent(openIntent)
@@ -225,7 +204,7 @@ class MessagingService : Service() {
 
         // Public version shown on lock screen — hides actual message content
         val publicNotification = NotificationCompat.Builder(this, CHANNEL_MESSAGE)
-            .setSmallIcon(android.R.drawable.ic_dialog_email)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("Новое сообщение")
             .setContentIntent(openIntent)
             .setAutoCancel(true)
@@ -234,7 +213,7 @@ class MessagingService : Service() {
             .build()
 
         val notification = NotificationCompat.Builder(this, CHANNEL_MESSAGE)
-            .setSmallIcon(android.R.drawable.ic_dialog_email)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(senderName)
             .setContentText(content)
             .setContentIntent(openIntent)
@@ -252,20 +231,7 @@ class MessagingService : Service() {
     // ── Создание каналов уведомлений (идемпотентно) ────────────────────────────
 
     private fun createNotificationChannels() {
-        // 1. Тихий канал для постоянного foreground-уведомления
-        NotificationChannel(
-            CHANNEL_BG,
-            "Фоновое соединение",
-            NotificationManager.IMPORTANCE_NONE,
-        ).apply {
-            description = "Поддерживает соединение для сообщений и звонков"
-            setSound(null, null)
-            enableVibration(false)
-            lockscreenVisibility = Notification.VISIBILITY_SECRET
-            setShowBadge(false)
-        }.also { nm.createNotificationChannel(it) }
-
-        // 2. Канал максимального приоритета для входящих звонков (рингтон + вибрация)
+        // 1. Канал максимального приоритета для входящих звонков (рингтон + вибрация)
         val ringtoneUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
         NotificationChannel(
             CHANNEL_CALL,

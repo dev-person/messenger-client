@@ -31,6 +31,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -77,6 +80,15 @@ fun CallScreen(
     val resolvedName   by viewModel.peerDisplayName.collectAsStateWithLifecycle()
     val peerAvatarUrl  by viewModel.peerAvatarUrl.collectAsStateWithLifecycle()
 
+    // Защита от двойного popBackStack — вызываем onCallEnd только один раз
+    var callEndHandled by remember { mutableStateOf(false) }
+    val safeCallEnd: () -> Unit = {
+        if (!callEndHandled) {
+            callEndHandled = true
+            onCallEnd()
+        }
+    }
+
     // Resolve peer info as soon as the screen opens
     LaunchedEffect(userId) {
         if (userId.isNotEmpty()) viewModel.resolvePeer(userId)
@@ -104,10 +116,16 @@ fun CallScreen(
         }
     }
 
-    // Close screen when call ends — drop(1) skips the initial IDLE/ENDED value on screen open
+    // Закрываем экран когда звонок завершён:
+    // 1) WebRTC перешёл в ENDED (нормальное завершение соединённого звонка)
+    // 2) activeCall стал null (собеседник отменил/завершил до соединения)
     LaunchedEffect(Unit) {
         viewModel.webRtcState.drop(1)
-            .collect { state: WebRtcCallState -> if (state == WebRtcCallState.ENDED) onCallEnd() }
+            .collect { state: WebRtcCallState -> if (state == WebRtcCallState.ENDED) safeCallEnd() }
+    }
+    LaunchedEffect(Unit) {
+        viewModel.activeCallState.drop(1)
+            .collect { call -> if (call == null) safeCallEnd() }
     }
 
     val isVideoCall = uiState.call?.type == CallType.VIDEO || isVideo
@@ -238,7 +256,7 @@ fun CallScreen(
                     size = 72,
                     onClick = {
                         viewModel.declineCall()
-                        onCallEnd()
+                        safeCallEnd()
                     },
                 )
                 CallControlButton(
@@ -299,7 +317,7 @@ fun CallScreen(
                     size = 72,
                     onClick = {
                         viewModel.hangUp()
-                        onCallEnd()
+                        safeCallEnd()
                     },
                 )
             }

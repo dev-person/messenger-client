@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1008261828118",
+    "project_id": "grizzly-messenger-15ed7",
+    "storage_bucket": "grizzly-messenger-15ed7.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1008261828118:android:2121334c77d8496b9caf37",
+        "android_client_info": {
+          "package_name": "com.secure.messenger"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDkQuJoM3Dx0mxN6RJBY7Zic8L90yaHVPI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

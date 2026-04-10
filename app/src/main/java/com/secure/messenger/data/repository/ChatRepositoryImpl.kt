@@ -21,6 +21,7 @@ import com.secure.messenger.utils.CryptoManager
 import com.secure.messenger.utils.LocalKeyStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import timber.log.Timber
 import java.time.Instant
 import java.util.UUID
 import javax.inject.Inject
@@ -38,8 +39,8 @@ class ChatRepositoryImpl @Inject constructor(
     override fun observeChats(): Flow<List<Chat>> =
         chatDao.observeAllWithLastMessage().map { rows -> rows.map { it.toChat() } }
 
-    override fun observeMessages(chatId: String): Flow<List<Message>> =
-        messageDao.observeMessages(chatId).map { it.map { e -> e.toDomain() } }
+    override fun observeMessages(chatId: String, limit: Int): Flow<List<Message>> =
+        messageDao.observeMessages(chatId, limit).map { it.map { e -> e.toDomain() } }
 
     override suspend fun getOrCreateDirectChat(userId: String): Result<Chat> = runCatching {
         val dto = api.getOrCreateDirectChat(mapOf("userId" to userId)).data
@@ -126,8 +127,14 @@ class ChatRepositoryImpl @Inject constructor(
     }
 
     override suspend fun deleteMessage(messageId: String): Result<Unit> = runCatching {
-        api.deleteMessage(messageId)
+        // Удаляем на сервере; 404 = уже удалено — всё равно чистим локально
+        val response = runCatching { api.deleteMessage(messageId) }
         messageDao.deleteById(messageId)
+        // Пробрасываем ошибку только если это не 404
+        response.onFailure { e ->
+            val is404 = e is retrofit2.HttpException && e.code() == 404
+            if (!is404) throw e
+        }
     }
 
     override suspend fun editMessage(messageId: String, newContent: String): Result<Message> = runCatching {
@@ -142,15 +149,42 @@ class ChatRepositoryImpl @Inject constructor(
     }
 
     override suspend fun fetchMessages(chatId: String): Result<Unit> = runCatching {
+        Timber.d("fetchMessages: НАЧАЛО для chatId=$chatId")
         val chat = chatDao.getById(chatId) ?: error("Chat not found: $chatId")
-        val dtos = api.getMessages(chatId).data.orEmpty()
-        if (dtos.isEmpty()) return@runCatching
+        val response = api.getMessages(chatId)
+        Timber.d("fetchMessages: API ответ: success=${response.success}, data.size=${response.data?.size}, error=${response.error}")
+        val dtos = response.data.orEmpty()
 
+        // ── Синхронизация удалений: удаляем локальные сообщения, которых нет на сервере ──
+        // Делаем ЭТО ПЕРВЫМ — до расшифровки, которая может упасть.
+        val serverIds = dtos.map { it.id }.toSet()
+        Timber.d("fetchMessages: chatId=$chatId, сервер вернул ${serverIds.size} сообщений")
+
+        if (dtos.isEmpty()) {
+            // Сервер вернул пустой список — удаляем все локальные сообщения этого чата
+            val allLocal = messageDao.getAllMessageIds(chatId)
+            Timber.d("fetchMessages: сервер пуст, удаляем ${allLocal.size} локальных сообщений")
+            for (id in allLocal) {
+                messageDao.deleteById(id)
+            }
+            return@runCatching
+        }
+
+        // Удаляем только среди сообщений с timestamp >= самого старого из серверного ответа,
+        // чтобы не затронуть более старые сообщения вне текущей страницы.
+        val oldestServerTimestamp = dtos.minOf { Instant.parse(it.timestamp).toEpochMilli() }
+        val localIds = messageDao.getMessageIdsSince(chatId, oldestServerTimestamp)
+        val toDelete = localIds.filter { it !in serverIds }
+        Timber.d("fetchMessages: localIds=${localIds.size}, toDelete=${toDelete.size}, oldestTs=$oldestServerTimestamp")
+        for (id in toDelete) {
+            Timber.d("fetchMessages: удаляем локальное сообщение $id (нет на сервере)")
+            messageDao.deleteById(id)
+        }
+
+        // ── Расшифровка и upsert ────────────────────────────────────────────────
         val myPrivateKeyBase64 = localKeyStore.getPrivateKey() ?: error("No local private key")
         val myPrivateKeyBytes = Base64.decode(myPrivateKeyBase64, Base64.NO_WRAP)
 
-        // Получаем актуальный публичный ключ собеседника прямо с сервера —
-        // это защищает от устаревшего ключа в локальной БД после смены ключевой пары.
         val sharedSecret: ByteArray? = if (chat.type == "DIRECT") {
             val otherUserId = chat.otherUserId ?: error("otherUserId missing for chat $chatId")
             val otherUser = run {
@@ -158,7 +192,6 @@ class ChatRepositoryImpl @Inject constructor(
                 if (fresh != null) {
                     val entity = userDao.getById(otherUserId)
                     if (entity == null || entity.publicKey != fresh.publicKey) {
-                        // Обновляем ключ в БД если он изменился
                         userDao.upsert(UserEntity(
                             id = fresh.id, phone = fresh.phone, username = fresh.username,
                             displayName = fresh.displayName, avatarUrl = fresh.avatarUrl,
@@ -178,7 +211,9 @@ class ChatRepositoryImpl @Inject constructor(
         } else null
 
         val entities = dtos.map { dto ->
-            val decrypted = if (sharedSecret != null) {
+            val decrypted = if (dto.type == "SYSTEM") {
+                dto.encryptedContent // системные сообщения — plain text
+            } else if (sharedSecret != null) {
                 cryptoManager.decryptMessage(dto.encryptedContent, sharedSecret, dto.id)
                     ?: "[Не удалось расшифровать]"
             } else {
@@ -192,8 +227,41 @@ class ChatRepositoryImpl @Inject constructor(
                 replyToId = dto.replyToId, mediaUrl = dto.mediaUrl, isEdited = dto.isEdited,
             )
         }
-        // Вставляем сообщения, не понижая статус (READ → SENT — баг после перезапуска).
         upsertWithoutStatusDowngrade(entities)
+    }
+
+    override suspend fun fetchOlderMessages(chatId: String, beforeTimestamp: Long): Result<Boolean> = runCatching {
+        val chat = chatDao.getById(chatId) ?: error("Chat not found: $chatId")
+        val dtos = api.getMessages(chatId, before = beforeTimestamp, limit = 30).data.orEmpty()
+        if (dtos.isEmpty()) return@runCatching false // нет больше сообщений
+
+        val myPrivateKeyBase64 = localKeyStore.getPrivateKey() ?: error("No local private key")
+        val myPrivateKeyBytes = Base64.decode(myPrivateKeyBase64, Base64.NO_WRAP)
+
+        val sharedSecret: ByteArray? = if (chat.type == "DIRECT") {
+            val otherUserId = chat.otherUserId ?: error("otherUserId missing")
+            val otherUser = userDao.getById(otherUserId) ?: error("Other user not found")
+            val theirPublicKeyBytes = Base64.decode(otherUser.publicKey, Base64.NO_WRAP)
+            cryptoManager.computeSharedSecret(myPrivateKeyBytes, theirPublicKeyBytes)
+        } else null
+
+        val entities = dtos.map { dto ->
+            val decrypted = if (dto.type == "SYSTEM") {
+                dto.encryptedContent
+            } else if (sharedSecret != null) {
+                cryptoManager.decryptMessage(dto.encryptedContent, sharedSecret, dto.id)
+                    ?: "[Не удалось расшифровать]"
+            } else "[Групповые чаты не поддерживаются]"
+            MessageEntity(
+                id = dto.id, chatId = chatId, senderId = dto.senderId,
+                encryptedContent = dto.encryptedContent, decryptedContent = decrypted,
+                type = dto.type, status = dto.status,
+                timestamp = Instant.parse(dto.timestamp).toEpochMilli(),
+                replyToId = dto.replyToId, mediaUrl = dto.mediaUrl, isEdited = dto.isEdited,
+            )
+        }
+        upsertWithoutStatusDowngrade(entities)
+        true // есть ещё сообщения
     }
 
     override suspend fun syncChats(myUserId: String): Result<Unit> = runCatching {

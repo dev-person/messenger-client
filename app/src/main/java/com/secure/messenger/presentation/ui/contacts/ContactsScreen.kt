@@ -1,7 +1,5 @@
 package com.secure.messenger.presentation.ui.contacts
 
-import android.content.Intent
-import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -25,9 +23,8 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.People
-import androidx.compose.material.icons.filled.PersonAdd
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Share
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.shrinkVertically
@@ -49,7 +46,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -108,7 +104,8 @@ fun ContactsScreen(
             )
         }
     } else {
-        contacts
+        // Зарегистрированные контакты — первыми
+        contacts.sortedByDescending { it.isRegistered }
     }
 
     Column(
@@ -191,8 +188,6 @@ fun ContactsScreen(
                         items(displayList, key = { it.id }) { contact ->
                             ContactRow(
                                 contact = contact,
-                                onAddContact = { viewModel.addContact(contact.userId!!) },
-                                onInvite = { viewModel.inviteContact(contact.phone) },
                                 onOpenChat = { userId -> viewModel.openDirectChat(userId) },
                             )
                         }
@@ -276,12 +271,8 @@ private fun SearchBar(
 @Composable
 private fun ContactRow(
     contact: Contact,
-    onAddContact: () -> Unit,
-    onInvite: () -> String,
     onOpenChat: (chatId: String) -> Unit,
 ) {
-    val context = LocalContext.current
-
     Surface(
         shape = RoundedCornerShape(18.dp),
         color = MaterialTheme.colorScheme.surface,
@@ -316,27 +307,10 @@ private fun ContactRow(
             }
 
             if (contact.isRegistered && contact.userId != null) {
-                IconButton(onClick = onAddContact) {
+                IconButton(onClick = { onOpenChat(contact.userId!!) }) {
                     Icon(
-                        Icons.Default.PersonAdd,
-                        contentDescription = "Добавить контакт",
-                        tint = MaterialTheme.colorScheme.primary,
-                    )
-                }
-            } else {
-                IconButton(onClick = {
-                    val link = onInvite()
-                    val intent = Intent(Intent.ACTION_SENDTO).apply {
-                        data = Uri.parse("smsto:${contact.phone}")
-                        putExtra("sms_body", "Присоединяйся к SecureMessenger: $link")
-                    }
-                    if (intent.resolveActivity(context.packageManager) != null) {
-                        context.startActivity(intent)
-                    }
-                }) {
-                    Icon(
-                        Icons.Default.Share,
-                        contentDescription = "Пригласить",
+                        Icons.Default.Edit,
+                        contentDescription = "Написать",
                         tint = MaterialTheme.colorScheme.primary,
                     )
                 }

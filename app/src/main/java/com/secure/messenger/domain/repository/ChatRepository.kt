@@ -6,7 +6,7 @@ import kotlinx.coroutines.flow.Flow
 
 interface ChatRepository {
     fun observeChats(): Flow<List<Chat>>
-    fun observeMessages(chatId: String): Flow<List<Message>>
+    fun observeMessages(chatId: String, limit: Int = 50): Flow<List<Message>>
 
     suspend fun getOrCreateDirectChat(userId: String): Result<Chat>
     suspend fun createGroupChat(title: String, memberIds: List<String>): Result<Chat>
@@ -17,6 +17,7 @@ interface ChatRepository {
 
     suspend fun syncChats(myUserId: String): Result<Unit>
     suspend fun fetchMessages(chatId: String): Result<Unit>
+    suspend fun fetchOlderMessages(chatId: String, beforeTimestamp: Long): Result<Boolean>
 
     suspend fun markAsRead(chatId: String): Result<Unit>
     suspend fun pinChat(chatId: String): Result<Unit>

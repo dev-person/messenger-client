@@ -2,7 +2,10 @@ package com.secure.messenger.data.repository
 
 import android.content.Context
 import android.content.Intent
+import com.google.firebase.messaging.FirebaseMessaging
+import timber.log.Timber
 import com.secure.messenger.data.local.dao.UserDao
+import com.secure.messenger.data.local.database.AppDatabase
 import com.secure.messenger.data.local.entities.UserEntity
 import com.secure.messenger.data.remote.api.MessengerApi
 import com.secure.messenger.di.AuthTokenProvider
@@ -21,12 +24,19 @@ import kotlinx.coroutines.launch
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
+import retrofit2.HttpException
 import javax.inject.Inject
+
+/** Бросается когда сервер вернул 429 — слишком частые запросы OTP. */
+class OtpCooldownException(val retryAfterSeconds: Int) :
+    Exception("Подождите $retryAfterSeconds секунд перед повторной отправкой")
 
 class AuthRepositoryImpl @Inject constructor(
     @ApplicationContext private val context: Context,
     private val api: MessengerApi,
     private val userDao: UserDao,
+    private val db: AppDatabase,
     private val tokenProvider: AuthTokenProvider,
     private val localKeyStore: LocalKeyStore,
 ) : AuthRepository {
@@ -50,8 +60,23 @@ class AuthRepositoryImpl @Inject constructor(
         }
     }
 
-    override suspend fun requestOtp(phone: String): Result<Unit> = runCatching {
-        api.requestOtp(mapOf("phone" to phone))
+    override suspend fun requestOtp(phone: String): Result<Unit> {
+        return try {
+            api.requestOtp(mapOf("phone" to phone))
+            Result.success(Unit)
+        } catch (e: HttpException) {
+            if (e.code() == 429) {
+                val retryAfter = try {
+                    val body = e.response()?.errorBody()?.string() ?: ""
+                    JSONObject(body).optInt("retry_after", 300)
+                } catch (_: Exception) { 300 }
+                Result.failure(OtpCooldownException(retryAfter))
+            } else {
+                Result.failure(e)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
     }
 
     override suspend fun verifyOtp(phone: String, code: String): Result<User> = runCatching {
@@ -59,6 +84,18 @@ class AuthRepositoryImpl @Inject constructor(
             ?: error("Server returned null")
 
         tokenProvider.saveToken(response.token)
+
+        // Запускаем WebSocket-сервис сразу после получения токена
+        context.startService(Intent(context, MessagingService::class.java))
+
+        // Регистрируем FCM device token на сервере — чтобы push-уведомления
+        // приходили на это устройство когда приложение в фоне или убито
+        FirebaseMessaging.getInstance().token.addOnSuccessListener { fcmToken ->
+            scope.launch {
+                runCatching { api.registerFcmToken(mapOf("token" to fcmToken)) }
+                    .onFailure { Timber.e(it, "Не удалось зарегистрировать FCM токен") }
+            }
+        }
 
         val user = response.user.toDomain()
         userDao.upsert(UserEntity.fromDomain(user))
@@ -99,12 +136,15 @@ class AuthRepositoryImpl @Inject constructor(
     }
 
     override suspend fun logout() {
+        // Останавливаем WebSocket-сервис
         context.stopService(Intent(context, MessagingService::class.java))
+        // Очищаем авторизацию и ключи — быстрые синхронные операции
         tokenProvider.clearToken()
-        // Ключи НЕ удаляем: они привязаны к устройству, а не к сессии.
-        // Удаление ключей при выходе приводит к генерации новой пары при следующем входе,
-        // что делает все ранее зашифрованные сообщения нечитаемыми для собеседников.
+        localKeyStore.clear()
         _currentUser.value = null
+        // Очищаем БД в фоновом потоке — тяжёлая операция,
+        // нельзя вызывать на main-потоке (иначе краш/ANR)
+        scope.launch { db.clearAllTables() }
     }
 
     override fun isLoggedIn(): Boolean = tokenProvider.hasToken()

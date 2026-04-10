@@ -4,6 +4,7 @@ plugins {
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.hilt)
     alias(libs.plugins.ksp)
+    alias(libs.plugins.google.services)
 }
 
 android {
@@ -14,8 +15,8 @@ android {
         applicationId = "com.secure.messenger"
         minSdk = 26
         targetSdk = 35
-        versionCode = 12
-        versionName = "1.0.12 Alfa"
+        versionCode = 49
+        versionName = "1.0.49 alfa"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         // Room schema export for migrations
@@ -24,22 +25,31 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            storeFile = file("../grizzly.keystore")
+            storePassword = "3WgsBGNMmiQw66GxYqEeLiCw"
+            keyAlias = "grizzly"
+            keyPassword = "3WgsBGNMmiQw66GxYqEeLiCw"
+        }
+    }
+
     buildTypes {
         release {
+            signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            buildConfigField("String", "API_BASE_URL",  "\"http://82.22.187.136:8080/v1/\"")
-            buildConfigField("String", "WS_BASE_URL",   "\"ws://82.22.187.136:8080/ws\"")
+            buildConfigField("String", "API_BASE_URL",  "\"https://grizzly-messenger.ru/v1/\"")
+            buildConfigField("String", "WS_BASE_URL",   "\"wss://grizzly-messenger.ru/ws\"")
         }
         debug {
             isDebuggable = true
-            applicationIdSuffix = ".debug"
-            buildConfigField("String", "API_BASE_URL",  "\"http://82.22.187.136:8080/v1/\"")
-            buildConfigField("String", "WS_BASE_URL",   "\"ws://82.22.187.136:8080/ws\"")
+            buildConfigField("String", "API_BASE_URL",  "\"https://grizzly-messenger.ru/v1/\"")
+            buildConfigField("String", "WS_BASE_URL",   "\"wss://grizzly-messenger.ru/ws\"")
         }
     }
 
@@ -131,6 +141,13 @@ dependencies {
     // Permissions
     implementation(libs.accompanist.permissions)
 
+    // On-device Generative AI (Gemini Nano)
+    implementation(libs.generativeai)
+
     // Logging
     implementation(libs.timber)
+
+    // Firebase (push-уведомления через FCM)
+    implementation(platform(libs.firebase.bom))
+    implementation(libs.firebase.messaging)
 }

@@ -1,5 +1,7 @@
 package com.secure.messenger.presentation.ui.main
 
+import android.app.Activity
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -8,6 +10,7 @@ import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -15,9 +18,11 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
@@ -33,8 +38,37 @@ fun HomeScreen(
     onChatClick: (chatId: String) -> Unit,
     onLogout: () -> Unit,
 ) {
+    val activity = androidx.compose.ui.platform.LocalContext.current as? Activity
     // Индекс активной вкладки — сохраняется при повороте экрана
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
+    var showExitDialog by rememberSaveable { mutableStateOf(false) }
+
+    // Кнопка «Назад»: с любой вкладки → на Чаты, с Чатов → подтверждение выхода
+    BackHandler {
+        if (selectedTab != 0) {
+            selectedTab = 0
+        } else {
+            showExitDialog = true
+        }
+    }
+
+    if (showExitDialog) {
+        AlertDialog(
+            onDismissRequest = { showExitDialog = false },
+            title = { Text("Выход") },
+            text = { Text("Вы действительно хотите выйти из приложения?") },
+            confirmButton = {
+                TextButton(onClick = { activity?.finish() }) {
+                    Text("Выйти")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showExitDialog = false }) {
+                    Text("Отмена")
+                }
+            },
+        )
+    }
 
     Scaffold(
         // Отключаем автоматическое применение window insets в HomeScreen —

@@ -10,6 +10,7 @@ import retrofit2.http.GET
 import retrofit2.http.Multipart
 import retrofit2.http.PATCH
 import retrofit2.http.POST
+import retrofit2.http.PUT
 import retrofit2.http.Part
 import retrofit2.http.Path
 import retrofit2.http.Query
@@ -35,6 +36,12 @@ interface MessengerApi {
     @Multipart
     @POST("users/me/avatar")
     suspend fun uploadAvatar(@Part avatar: MultipartBody.Part): ApiResponse<UserDto>
+
+    @PUT("users/me/fcm-token")
+    suspend fun registerFcmToken(@Body body: Map<String, String>): ApiResponse<Unit>
+
+    @PUT("users/me/app-version")
+    suspend fun registerAppVersion(@Body body: Map<String, Any>): ApiResponse<Unit>
 
     @GET("users/{userId}")
     suspend fun getUserById(@Path("userId") userId: String): ApiResponse<UserDto>

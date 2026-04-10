@@ -1,10 +1,11 @@
 package com.secure.messenger.presentation.ui.chat
 
 import androidx.compose.animation.animateContentSize
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -12,6 +13,8 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -29,10 +32,15 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Call
+import androidx.compose.material.icons.filled.AlternateEmail
+import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Done
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.DropdownMenu
@@ -44,31 +52,43 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.ui.window.Dialog
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.ui.layout.ContentScale
+import coil.compose.AsyncImage
+import com.secure.messenger.BuildConfig
 import com.secure.messenger.domain.model.Chat
 import com.secure.messenger.domain.model.ChatType
 import com.secure.messenger.domain.model.Message
 import com.secure.messenger.domain.model.MessageStatus
 import com.secure.messenger.domain.model.MessageType
-import com.secure.messenger.presentation.theme.IncomingBubble
-import com.secure.messenger.presentation.theme.IncomingBubbleDark
-import com.secure.messenger.presentation.theme.OutgoingBubble
-import com.secure.messenger.presentation.theme.OutgoingBubbleDark
+import com.secure.messenger.domain.model.User
+import com.secure.messenger.presentation.theme.LocalMessengerColors
 import com.secure.messenger.presentation.viewmodel.ChatViewModel
 import com.secure.messenger.utils.formatDateSeparator
 import com.secure.messenger.utils.formatMessageTime
@@ -88,12 +108,44 @@ fun ChatScreen(
     val chatInfo by viewModel.chatInfo.collectAsStateWithLifecycle()
     val currentUserId by viewModel.currentUserId.collectAsStateWithLifecycle()
     val isOtherOnline by viewModel.isOtherUserOnline.collectAsStateWithLifecycle()
+    val otherUser by viewModel.otherUser.collectAsStateWithLifecycle()
     val isTyping by viewModel.isTyping.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     val listState = rememberLazyListState()
+    var showProfileUser by remember { mutableStateOf<User?>(null) }
 
+    // Диалог профиля пользователя
+    showProfileUser?.let { user ->
+        UserProfileDialog(
+            user = user,
+            isOnline = isOtherOnline,
+            onDismiss = { showProfileUser = null },
+        )
+    }
+
+    // Прокрутка к последнему сообщению при первом открытии чата
+    LaunchedEffect(Unit) {
+        snapshotFlow { messages.size }
+            .filter { it > 0 }
+            .first()
+        listState.scrollToItem(messages.size - 1)
+    }
+
+    // Авто-скролл при новом сообщении — только если уже у конца списка
     LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1)
+        if (messages.isNotEmpty()) {
+            val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1
+            if (lastVisible >= messages.size - 3) {
+                listState.animateScrollToItem(messages.size - 1)
+            }
+        }
+    }
+
+    // Подгрузка старых сообщений при скролле вверх
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.firstVisibleItemIndex }
+            .filter { it == 0 }
+            .collect { viewModel.loadOlderMessages() }
     }
 
     LaunchedEffect(uiState.error) {
@@ -117,34 +169,52 @@ fun ChatScreen(
                 isTyping = isTyping,
                 onBack = onBack,
                 onCallClick = onCallClick,
+                onAvatarClick = { otherUser?.let { showProfileUser = it } },
             )
 
-            // ── Список сообщений ───────────────────────────────────────────
-            LazyColumn(
-                state = listState,
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth(),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 8.dp),
-            ) {
-                itemsIndexed(messages, key = { _, msg -> msg.id }) { index, message ->
-                    val prevMessage = messages.getOrNull(index - 1)
-
-                    if (prevMessage == null || !isSameDay(prevMessage.timestamp, message.timestamp)) {
-                        DateSeparator(timestamp = message.timestamp)
+            // ── Список сообщений с обоями ────────────────────────────────
+            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                ChatWallpaper()
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 8.dp),
+                ) {
+                    // Индикатор загрузки старых сообщений
+                    if (uiState.isLoadingOlder) {
+                        item("loading_older") {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(8.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                androidx.compose.material3.CircularProgressIndicator(
+                                    modifier = Modifier.size(24.dp),
+                                    strokeWidth = 2.dp,
+                                )
+                            }
+                        }
                     }
+                    itemsIndexed(messages, key = { _, msg -> msg.id }) { index, message ->
+                        val prevMessage = messages.getOrNull(index - 1)
 
-                    if (message.type == MessageType.SYSTEM) {
-                        SystemMessage(text = message.content, timestamp = message.timestamp)
-                    } else {
-                        val isOutgoing = message.senderId == currentUserId
-                        MessageBubble(
+                        if (prevMessage == null || !isSameDay(prevMessage.timestamp, message.timestamp)) {
+                            DateSeparator(timestamp = message.timestamp)
+                        }
+
+                        if (message.type == MessageType.SYSTEM) {
+                            SystemMessage(text = message.content, timestamp = message.timestamp)
+                        } else {
+                            val isOutgoing = message.senderId == currentUserId
+                            MessageBubble(
                             message = message,
                             isOutgoing = isOutgoing,
                             onDelete = if (isOutgoing) { { viewModel.deleteMessage(message) } } else null,
                             onEdit   = if (isOutgoing) { { viewModel.startEditing(message) } } else null,
                         )
                     }
+                }
                 }
             }
 
@@ -155,6 +225,7 @@ fun ChatScreen(
                 onTextChange = viewModel::onInputChange,
                 onSend = viewModel::sendMessage,
                 onCancelEdit = viewModel::cancelEditing,
+                onEnhance = viewModel::enhanceText,
             )
         }
 
@@ -176,6 +247,7 @@ private fun ChatTopBar(
     isTyping: Boolean,
     onBack: () -> Unit,
     onCallClick: (userId: String, isVideo: Boolean, peerName: String) -> Unit,
+    onAvatarClick: () -> Unit = {},
 ) {
     val peerId   = chatInfo?.otherUserId ?: ""
     val peerName = chatInfo?.title ?: ""
@@ -199,8 +271,11 @@ private fun ChatTopBar(
                 )
             }
 
-            // Аватар с индикатором онлайн
-            Box {
+            // Аватар с индикатором онлайн (клик — профиль)
+            Box(
+                modifier = if (isDirectChat) Modifier.clickable(onClick = onAvatarClick)
+                else Modifier,
+            ) {
                 AvatarImage(url = chatInfo?.avatarUrl, name = chatInfo?.title ?: "?", size = 46)
                 if (isDirectChat && isOtherOnline) {
                     Box(
@@ -340,18 +415,14 @@ private fun MessageBubble(
     onDelete: (() -> Unit)?,
     onEdit: (() -> Unit)?,
 ) {
-    val darkTheme = isSystemInDarkTheme()
+    val extra = LocalMessengerColors.current
     var showMenu by remember { mutableStateOf(false) }
 
-    val bubbleColor = when {
-        isOutgoing && darkTheme -> OutgoingBubbleDark
-        isOutgoing -> OutgoingBubble
-        darkTheme -> IncomingBubbleDark
-        else -> IncomingBubble
-    }
+    val bubbleColor = if (isOutgoing) extra.outgoingBubble else extra.incomingBubble
 
-    val textColor = if (darkTheme) Color.White else Color.Black
-    val metaColor = if (darkTheme) Color.White.copy(alpha = 0.45f) else Color.Gray
+    val isDark = MaterialTheme.colorScheme.background.luminance() < 0.5f
+    val textColor = if (isDark) Color.White else Color.Black
+    val metaColor = if (isDark) Color.White.copy(alpha = 0.45f) else Color.Gray
 
     val shape = if (isOutgoing) {
         RoundedCornerShape(topStart = 18.dp, topEnd = 4.dp, bottomStart = 18.dp, bottomEnd = 18.dp)
@@ -455,6 +526,7 @@ private fun MessageInputBar(
     onTextChange: (String) -> Unit,
     onSend: () -> Unit,
     onCancelEdit: () -> Unit,
+    onEnhance: () -> Unit = {},
 ) {
     Surface(
         shadowElevation = 8.dp,
@@ -506,6 +578,7 @@ private fun MessageInputBar(
                 Box(
                     modifier = Modifier
                         .weight(1f)
+                        .heightIn(min = 46.dp)
                         .clip(RoundedCornerShape(24.dp))
                         .background(MaterialTheme.colorScheme.surfaceVariant)
                         .padding(horizontal = 16.dp, vertical = 10.dp),
@@ -529,7 +602,22 @@ private fun MessageInputBar(
                     )
                 }
 
-                Spacer(modifier = Modifier.width(8.dp))
+                // Кнопка улучшения текста (ИИ)
+                if (text.length >= 3) {
+                    IconButton(
+                        onClick = onEnhance,
+                        modifier = Modifier.size(36.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.AutoFixHigh,
+                            contentDescription = "Улучшить текст",
+                            tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                } else {
+                    Spacer(modifier = Modifier.width(8.dp))
+                }
 
                 IconButton(
                     onClick = onSend,
@@ -551,6 +639,242 @@ private fun MessageInputBar(
                     )
                 }
             }
+        }
+    }
+}
+
+// ── Диалог профиля пользователя ──────────────────────────────────────────────
+
+@Composable
+private fun UserProfileDialog(
+    user: User,
+    isOnline: Boolean,
+    onDismiss: () -> Unit,
+) {
+    val serverRoot = BuildConfig.API_BASE_URL.removeSuffix("v1/").trimEnd('/')
+    val resolvedAvatarUrl = user.avatarUrl?.let { url ->
+        when {
+            url.startsWith("http") -> url
+            url.startsWith("/") -> "$serverRoot$url"
+            else -> url
+        }
+    }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = RoundedCornerShape(22.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 4.dp,
+        ) {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                // ── Аватар-карточка (как в ProfileEditScreen) ────────────
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(220.dp)
+                        .clip(RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)),
+                ) {
+                    if (resolvedAvatarUrl != null) {
+                        AsyncImage(
+                            model = resolvedAvatarUrl,
+                            contentDescription = user.displayName,
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Crop,
+                        )
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(MaterialTheme.colorScheme.primaryContainer),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(
+                                Icons.Default.Person, null,
+                                tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                modifier = Modifier.size(72.dp),
+                            )
+                        }
+                    }
+
+                    // Градиент снизу
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(90.dp)
+                            .align(Alignment.BottomCenter)
+                            .background(
+                                Brush.verticalGradient(
+                                    0f to Color.Transparent,
+                                    1f to Color.Black.copy(alpha = 0.65f),
+                                )
+                            ),
+                    )
+
+                    // Имя и статус внизу
+                    Column(
+                        modifier = Modifier
+                            .align(Alignment.BottomStart)
+                            .padding(16.dp),
+                    ) {
+                        Text(
+                            text = user.displayName,
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White,
+                        )
+                        Text(
+                            text = if (isOnline) "в сети" else "не в сети",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (isOnline) Color(0xFF81C784) else Color.White.copy(alpha = 0.7f),
+                        )
+                    }
+
+                    // Индикатор онлайн
+                    if (isOnline) {
+                        Box(
+                            modifier = Modifier
+                                .padding(16.dp)
+                                .size(12.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFF4CAF50))
+                                .align(Alignment.TopEnd),
+                        )
+                    }
+                }
+
+                // ── Информация ──────────────────────────────────────────
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    // Username
+                    if (user.username.isNotEmpty()) {
+                        ProfileInfoRow(
+                            icon = Icons.Default.AlternateEmail,
+                            label = "Username",
+                            value = "@${user.username}",
+                        )
+                    }
+
+                    // Телефон
+                    if (user.phone.isNotEmpty()) {
+                        ProfileInfoRow(
+                            icon = Icons.Default.Phone,
+                            label = "Телефон",
+                            value = user.phone,
+                        )
+                    }
+
+                    // О себе
+                    if (!user.bio.isNullOrEmpty()) {
+                        ProfileInfoRow(
+                            icon = Icons.Default.Info,
+                            label = "О себе",
+                            value = user.bio,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProfileInfoRow(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    value: String,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(22.dp),
+        )
+        Spacer(modifier = Modifier.width(14.dp))
+        Column {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 11.sp,
+            )
+            Text(
+                text = value,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+        }
+    }
+}
+
+// ── Обои чата с паттерном (как в Telegram) ──────────────────────────────────
+
+@Composable
+private fun ChatWallpaper() {
+    val extra = LocalMessengerColors.current
+    val bgColor = extra.chatWallpaper
+    val patternColor = extra.chatPattern
+
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        drawRect(bgColor)
+
+        val cellSize = 80f
+        val cols = (size.width / cellSize).toInt() + 2
+        val rows = (size.height / cellSize).toInt() + 2
+
+        for (row in 0..rows) {
+            for (col in 0..cols) {
+                val cx = col * cellSize + if (row % 2 == 0) 0f else cellSize / 2
+                val cy = row * cellSize
+                val shape = (row * 7 + col * 3) % 5
+                drawPatternShape(shape, cx, cy, patternColor)
+            }
+        }
+    }
+}
+
+private fun DrawScope.drawPatternShape(shape: Int, cx: Float, cy: Float, color: Color) {
+    when (shape) {
+        0 -> {
+            // Маленький круг
+            drawCircle(color, radius = 4f, center = Offset(cx, cy))
+        }
+        1 -> {
+            // Ромб
+            val s = 6f
+            val path = Path().apply {
+                moveTo(cx, cy - s)
+                lineTo(cx + s, cy)
+                lineTo(cx, cy + s)
+                lineTo(cx - s, cy)
+                close()
+            }
+            drawPath(path, color)
+        }
+        2 -> {
+            // Крестик
+            val s = 5f
+            drawLine(color, Offset(cx - s, cy - s), Offset(cx + s, cy + s), strokeWidth = 1.5f)
+            drawLine(color, Offset(cx + s, cy - s), Offset(cx - s, cy + s), strokeWidth = 1.5f)
+        }
+        3 -> {
+            // Маленький квадрат (повёрнутый)
+            rotate(45f, Offset(cx, cy)) {
+                drawRect(color, topLeft = Offset(cx - 3.5f, cy - 3.5f), size = Size(7f, 7f))
+            }
+        }
+        4 -> {
+            // Точка
+            drawCircle(color, radius = 2.5f, center = Offset(cx, cy))
         }
     }
 }

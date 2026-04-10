@@ -21,6 +21,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -31,12 +32,17 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.navigation.compose.rememberNavController
+import com.secure.messenger.MessengerApp
 import com.secure.messenger.data.remote.api.MessengerApi
+import retrofit2.HttpException
 import com.secure.messenger.data.remote.api.UpdateInfoDto
+import com.secure.messenger.data.remote.websocket.SignalingClient
 import com.secure.messenger.di.AuthTokenProvider
 import com.secure.messenger.presentation.navigation.AppNavHost
 import com.secure.messenger.presentation.navigation.Screen
 import com.secure.messenger.presentation.theme.SecureMessengerTheme
+import com.secure.messenger.presentation.theme.ThemePreferences
+import com.secure.messenger.utils.TextEnhancer
 import com.secure.messenger.service.MessagingService
 import com.secure.messenger.utils.UpdateManager
 import dagger.hilt.android.AndroidEntryPoint
@@ -48,8 +54,10 @@ import javax.inject.Inject
 class MainActivity : ComponentActivity() {
 
     @Inject lateinit var authTokenProvider: AuthTokenProvider
+    @Inject lateinit var authRepository: com.secure.messenger.domain.repository.AuthRepository
     @Inject lateinit var api: MessengerApi
     @Inject lateinit var updateManager: UpdateManager
+    @Inject lateinit var signalingClient: SignalingClient
 
     // Launcher for POST_NOTIFICATIONS permission (Android 13+)
     private val notifPermLauncher = registerForActivityResult(
@@ -69,17 +77,22 @@ class MainActivity : ComponentActivity() {
         requestBatteryOptimizationExemption()
         requestFullScreenIntentPermission()
 
-        // Запускаем фоновый сервис если пользователь уже авторизован.
-        // startForegroundService обязателен на Android 8+ чтобы сервис не убили.
+        // Запускаем WebSocket сервис если пользователь уже авторизован.
+        // FCM обеспечивает доставку когда сервис убит, поэтому foreground не нужен.
         if (authTokenProvider.hasToken()) {
-            startForegroundService(Intent(this, MessagingService::class.java))
+            startService(Intent(this, MessagingService::class.java))
         }
+
+        // Инициализируем настройки цветовой схемы и on-device AI
+        ThemePreferences.init(this)
+        TextEnhancer.initAi()
 
         // Определяем начальный экран: Auth → ProfileSetup (если нет username) → Home
         val startDestination = resolveStartDestination()
 
         setContent {
-            SecureMessengerTheme {
+            val selectedScheme by ThemePreferences.colorScheme.collectAsState()
+            SecureMessengerTheme(colorScheme = selectedScheme) {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     val navController = rememberNavController()
                     AppNavHost(navController = navController, startDestination = startDestination)
@@ -91,6 +104,44 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        MessengerApp.isInForeground = true
+        // Приложение на переднем плане — сообщаем серверу что мы в сети
+        if (authTokenProvider.hasToken()) {
+            signalingClient.isAppForeground = true
+            signalingClient.sendPresence(true)
+            // Сообщаем серверу актуальную версию APK — нужно для админ-панели,
+            // чтобы видеть распределение версий по пользователям
+            registerAppVersion()
+        }
+    }
+
+    /**
+     * Шлёт текущую версию APK на сервер. Не блокирует запуск, ошибки игнорируются.
+     */
+    private fun registerAppVersion() {
+        val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO)
+        scope.launch {
+            runCatching {
+                api.registerAppVersion(mapOf(
+                    "versionCode" to com.secure.messenger.BuildConfig.VERSION_CODE,
+                    "versionName" to com.secure.messenger.BuildConfig.VERSION_NAME,
+                ))
+            }
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        MessengerApp.isInForeground = false
+        // Приложение свёрнуто — уходим в офлайн (WebSocket остаётся для сообщений/звонков)
+        if (authTokenProvider.hasToken()) {
+            signalingClient.isAppForeground = false
+            signalingClient.sendPresence(false)
+        }
+    }
+
     /**
      * Проверяет, заполнен ли username у авторизованного пользователя.
      * Если нет — отправляем на экран настройки профиля.
@@ -99,14 +150,23 @@ class MainActivity : ComponentActivity() {
         if (!authTokenProvider.hasToken()) return Screen.Auth.route
 
         // Быстрая проверка: загружаем профиль с сервера (блокирующий вызов во время splash)
-        val hasUsername = runCatching {
-            runBlocking {
-                val user = api.getMe().data
-                !user?.username.isNullOrBlank()
+        return try {
+            val user = runBlocking { api.getMe().data }
+            if (user?.username.isNullOrBlank()) Screen.ProfileSetup.route else Screen.Home.route
+        } catch (e: HttpException) {
+            // 401 — токен невалиден (истёк, другой сервер и т.д.) → сносим все локальные данные
+            if (e.code() == 401) {
+                runBlocking { authRepository.logout() }
+                Screen.Auth.route
+            } else {
+                // Другие HTTP-ошибки (500, 503...) — сеть есть, но сервер проблемный.
+                // Показываем кэш, пользователь увидит ошибку в UI.
+                Screen.Home.route
             }
-        }.getOrDefault(true) // При ошибке сети — считаем что username есть, не блокируем
-
-        return if (hasUsername) Screen.Home.route else Screen.ProfileSetup.route
+        } catch (_: Exception) {
+            // Нет сети — показываем кэш
+            Screen.Home.route
+        }
     }
 
     /**

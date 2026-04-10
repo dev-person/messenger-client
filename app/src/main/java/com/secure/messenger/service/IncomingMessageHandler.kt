@@ -57,8 +57,31 @@ class IncomingMessageHandler @Inject constructor(
             val senderId = payload["senderId"] as? String ?: return null
             val timestampStr = payload["timestamp"] as? String
 
+            val msgType = (payload["type"] as? String) ?: "TEXT"
+
             // Пропускаем дубликаты (WS + REST могут доставить одно и то же сообщение)
             if (messageDao.getById(messageId) != null) return null
+
+            // Системные сообщения (звонки и т.д.) — сохраняем как есть, без расшифровки.
+            // senderId на сервере хранится как реальный UUID (например, звонящего),
+            // потому что messages.sender_id NOT NULL с FK на users. На клиенте
+            // системные распознаются по type=SYSTEM, конкретный senderId не важен.
+            if (msgType == "SYSTEM") {
+                val timestamp = (payload["timestamp"] as? String)?.let {
+                    try { Instant.parse(it).toEpochMilli() } catch (_: Exception) { System.currentTimeMillis() }
+                } ?: System.currentTimeMillis()
+                if (chatDao.getById(chatId) != null) {
+                    chatDao.incrementUnread(chatId, timestamp)
+                }
+                messageDao.upsert(MessageEntity(
+                    id = messageId, chatId = chatId, senderId = senderId,
+                    encryptedContent = encryptedContent, decryptedContent = encryptedContent,
+                    type = MessageType.SYSTEM.name, status = MessageStatus.DELIVERED.name,
+                    timestamp = timestamp,
+                    replyToId = null, mediaUrl = null, isEdited = false,
+                ))
+                return null // системные сообщения не показываем в notification
+            }
 
             // Убеждаемся, что отправитель есть в локальной БД (нужен публичный ключ для расшифровки)
             val sender = userDao.getById(senderId) ?: run {
@@ -123,10 +146,11 @@ class IncomingMessageHandler @Inject constructor(
             } else System.currentTimeMillis()
 
             // Сохраняем в БД
+            val safeType = runCatching { MessageType.valueOf(msgType) }.getOrDefault(MessageType.TEXT).name
             messageDao.upsert(MessageEntity(
                 id = messageId, chatId = chatId, senderId = senderId,
                 encryptedContent = encryptedContent, decryptedContent = decryptedContent,
-                type = MessageType.TEXT.name, status = MessageStatus.DELIVERED.name,
+                type = safeType, status = MessageStatus.DELIVERED.name,
                 timestamp = timestamp,
                 replyToId = null, mediaUrl = null, isEdited = false,
             ))

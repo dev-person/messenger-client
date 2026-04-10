@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.widget.Toast
 import androidx.lifecycle.ViewModel
+import com.secure.messenger.presentation.theme.AppColorScheme
+import com.secure.messenger.presentation.theme.ThemePreferences
 import com.secure.messenger.utils.UpdateManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -16,6 +18,7 @@ data class SettingsUiState(
     val notificationsEnabled: Boolean = true,
     val soundEnabled: Boolean = true,
     val vibrationEnabled: Boolean = true,
+    val colorScheme: AppColorScheme = AppColorScheme.CLASSIC,
 )
 
 @HiltViewModel
@@ -34,6 +37,7 @@ class SettingsViewModel @Inject constructor(
         notificationsEnabled = prefs.getBoolean(KEY_NOTIFICATIONS, true),
         soundEnabled         = prefs.getBoolean(KEY_SOUND, true),
         vibrationEnabled     = prefs.getBoolean(KEY_VIBRATION, true),
+        colorScheme          = ThemePreferences.colorScheme.value,
     )
 
     fun toggleNotifications() {
@@ -52,6 +56,11 @@ class SettingsViewModel @Inject constructor(
         val newValue = !_uiState.value.vibrationEnabled
         prefs.edit().putBoolean(KEY_VIBRATION, newValue).apply()
         _uiState.value = _uiState.value.copy(vibrationEnabled = newValue)
+    }
+
+    fun setColorScheme(scheme: AppColorScheme) {
+        ThemePreferences.setColorScheme(scheme)
+        _uiState.value = _uiState.value.copy(colorScheme = scheme)
     }
 
     /** Проверяет обновление вручную и показывает Toast с результатом */

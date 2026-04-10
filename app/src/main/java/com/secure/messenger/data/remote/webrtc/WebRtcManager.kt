@@ -147,10 +147,13 @@ class WebRtcManager @Inject constructor(
         pendingIceCandidates.clear()
         remoteDescriptionSet = false
         startConnectionTimeout()
-        buildPeerConnection(callId)
-        if (isVideo) addVideoTrack()
-        addAudioTrack()
-        createOffer(callId, peerId, isVideo)
+        scope.launch {
+            refreshIceServersIfNeeded()
+            buildPeerConnection(callId)
+            if (isVideo) addVideoTrack()
+            addAudioTrack()
+            createOffer(callId, peerId, isVideo)
+        }
     }
 
     private fun createOffer(callId: String, peerId: String, isVideo: Boolean) {
@@ -181,14 +184,17 @@ class WebRtcManager @Inject constructor(
         setAudioMode(active = true)
         _callState.value = WebRtcCallState.CONNECTING
         startConnectionTimeout()
-        buildPeerConnection(callId)
-        if (isVideo) addVideoTrack()
-        addAudioTrack()
+        scope.launch {
+            refreshIceServersIfNeeded()
+            buildPeerConnection(callId)
+            if (isVideo) addVideoTrack()
+            addAudioTrack()
 
-        val buffered = pendingOfferSdp
-        if (buffered != null) {
-            pendingOfferSdp = null
-            processRemoteOffer(buffered)
+            val buffered = pendingOfferSdp
+            if (buffered != null) {
+                pendingOfferSdp = null
+                processRemoteOffer(buffered)
+            }
         }
     }
 
@@ -305,8 +311,7 @@ class WebRtcManager @Inject constructor(
     )
 
     private fun buildPeerConnection(callId: String) {
-        // Обновляем ICE-серверы перед каждым звонком если кеш устарел
-        kotlinx.coroutines.runBlocking { refreshIceServersIfNeeded() }
+        // ICE-серверы уже обновлены вызывающей корутиной (refreshIceServersIfNeeded)
         val iceServers = cachedIceServers?.takeIf { it.isNotEmpty() } ?: fallbackIceServers()
 
         val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
