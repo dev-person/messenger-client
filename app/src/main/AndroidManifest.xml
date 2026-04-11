@@ -45,6 +45,12 @@
     <!-- Авто-чтение OTP кода из входящего SMS -->
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
 
+    <!-- Сохранение картинок в галерею: на Android <10 нужен этот permission,
+         на Android 10+ работает MediaStore API без runtime permission -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.camera.front" android:required="false" />
     <uses-feature android:name="android.hardware.microphone" android:required="true" />

@@ -7,8 +7,12 @@ import javax.inject.Inject
 class SendMessageUseCase @Inject constructor(
     private val chatRepository: ChatRepository,
 ) {
-    suspend operator fun invoke(chatId: String, content: String): Result<Message> {
+    suspend operator fun invoke(
+        chatId: String,
+        content: String,
+        replyToId: String? = null,
+    ): Result<Message> {
         if (content.isBlank()) return Result.failure(IllegalArgumentException("Message cannot be empty"))
-        return chatRepository.sendMessage(chatId, content.trim())
+        return chatRepository.sendMessage(chatId, content.trim(), replyToId)
     }
 }

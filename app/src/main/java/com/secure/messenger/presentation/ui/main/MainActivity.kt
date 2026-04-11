@@ -13,13 +13,30 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.material3.AlertDialog
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -27,8 +44,18 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import com.secure.messenger.R
 import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.navigation.compose.rememberNavController
@@ -118,17 +145,21 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Шлёт текущую версию APK на сервер. Не блокирует запуск, ошибки игнорируются.
+     * Шлёт текущую версию APK на сервер. Не блокирует запуск, ошибки логируются.
+     * Используем строго типизированный data class — Map<String, Any> через Moshi
+     * для смешанных типов (Int + String) работал нестабильно.
      */
     private fun registerAppVersion() {
         val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO)
         scope.launch {
             runCatching {
-                api.registerAppVersion(mapOf(
-                    "versionCode" to com.secure.messenger.BuildConfig.VERSION_CODE,
-                    "versionName" to com.secure.messenger.BuildConfig.VERSION_NAME,
-                ))
-            }
+                api.registerAppVersion(
+                    com.secure.messenger.data.remote.api.AppVersionRequest(
+                        versionCode = com.secure.messenger.BuildConfig.VERSION_CODE,
+                        versionName = com.secure.messenger.BuildConfig.VERSION_NAME,
+                    )
+                )
+            }.onFailure { timber.log.Timber.e(it, "registerAppVersion failed") }
         }
     }
 
@@ -225,69 +256,245 @@ class MainActivity : ComponentActivity() {
 
 @androidx.compose.runtime.Composable
 private fun UpdateDialog(updateManager: UpdateManager) {
-    var updateInfo by remember { mutableStateOf<UpdateInfoDto?>(null) }
-    var isDownloading by remember { mutableStateOf(false) }
+    // Наблюдаем единый источник правды — UpdateManager.updateAvailable.
+    // Это позволяет триггерить диалог из любого места (например, из настроек),
+    // вызвав updateManager.checkForUpdate() — флоу обновится автоматически.
+    val updateInfo by updateManager.updateAvailable.collectAsState()
     var dismissed by remember { mutableStateOf(false) }
+
+    // Состояние скачивания: null = idle, иначе (downloaded, total). total=-1 если неизвестно.
+    var progress by remember { mutableStateOf<Pair<Long, Long>?>(null) }
+    var downloadJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    val isDownloading = downloadJob?.isActive == true
+
     val scope = rememberCoroutineScope()
     val context = androidx.compose.ui.platform.LocalContext.current
 
-    // Проверяем обновление при запуске и каждые 5 минут
+    // Сбрасываем dismissed когда приходит новый updateInfo (новая версия после dismiss)
+    LaunchedEffect(updateInfo?.versionCode) {
+        if (updateInfo != null) dismissed = false
+    }
+
+    // Фоновая проверка обновлений каждые 5 минут
     LaunchedEffect(Unit) {
         while (true) {
-            val info = updateManager.checkForUpdate()
-            if (info != null) {
-                updateInfo = info
-                dismissed = false // Показать снова если появилось новое обновление
-            }
-            kotlinx.coroutines.delay(5 * 60 * 1000L) // 5 минут
+            updateManager.checkForUpdate()
+            kotlinx.coroutines.delay(5 * 60 * 1000L)
         }
     }
 
-    if (updateInfo != null && !dismissed) {
-        val info = updateInfo!!
-        AlertDialog(
-            onDismissRequest = { dismissed = true },
-            title = { Text("Доступно обновление") },
-            text = {
-                Text(
-                    buildString {
-                        append("Версия ${info.versionName ?: info.versionCode}")
-                        if (!info.changelog.isNullOrBlank()) {
-                            append("\n\n${info.changelog}")
+    val info = updateInfo
+    if (info == null || dismissed) return
+
+    val scrollState = rememberScrollState()
+
+    Dialog(
+        onDismissRequest = {
+            // Во время скачивания диалог нельзя закрыть тапом снаружи / системным «назад» —
+            // только кнопкой «Отмена», которая ещё и job отменяет.
+            if (!isDownloading) dismissed = true
+        },
+        properties = DialogProperties(
+            dismissOnBackPress = !isDownloading,
+            dismissOnClickOutside = !isDownloading,
+            usePlatformDefaultWidth = true,
+        ),
+    ) {
+        Surface(
+            shape = RoundedCornerShape(24.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 6.dp,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                // Шапка с градиентом и круглой аватаркой медведя
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(140.dp)
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(
+                                    MaterialTheme.colorScheme.primary,
+                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
+                                )
+                            )
+                        ),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(104.dp)
+                            .clip(CircleShape)
+                            .background(Color.White.copy(alpha = 0.18f)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(88.dp)
+                                .clip(CircleShape)
+                                .background(Color.White),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Image(
+                                painter = painterResource(R.drawable.avatar_placeholder),
+                                contentDescription = null,
+                                modifier = Modifier.size(76.dp),
+                            )
                         }
                     }
+                }
+
+                Spacer(modifier = Modifier.height(20.dp))
+
+                Text(
+                    text = if (isDownloading) "Скачивание обновления" else "Доступно обновление",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
                 )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        if (!isDownloading) {
-                            isDownloading = true
-                            scope.launch {
-                                runCatching {
-                                    updateManager.downloadAndInstall(info.downloadUrl!!, context)
-                                }
-                                isDownloading = false
-                            }
+
+                Spacer(modifier = Modifier.height(4.dp))
+
+                Text(
+                    text = "Версия ${info.versionName ?: info.versionCode}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Medium,
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                if (isDownloading) {
+                    // ── Режим скачивания: прогресс-бар + размер ──────────────
+                    val (downloaded, total) = progress ?: (0L to -1L)
+                    val percent = if (total > 0) {
+                        ((downloaded * 100) / total).toInt().coerceIn(0, 100)
+                    } else 0
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        if (total > 0) {
+                            LinearProgressIndicator(
+                                progress = { percent / 100f },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(8.dp)
+                                    .clip(RoundedCornerShape(4.dp)),
+                            )
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Text(
+                                text = "$percent% — ${formatBytes(downloaded)} / ${formatBytes(total)}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        } else {
+                            // Сервер не вернул Content-Length — индикатор без процента
+                            LinearProgressIndicator(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(8.dp)
+                                    .clip(RoundedCornerShape(4.dp)),
+                            )
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Text(
+                                text = "Скачано ${formatBytes(downloaded)}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
                         }
-                    },
-                    enabled = !isDownloading,
+                    }
+                } else if (!info.changelog.isNullOrBlank()) {
+                    // ── Режим просмотра: список изменений ────────────────────
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 24.dp)
+                            .heightIn(max = 280.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                            .padding(16.dp),
+                    ) {
+                        Column(modifier = Modifier.verticalScroll(scrollState)) {
+                            Text(
+                                text = info.changelog!!,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                lineHeight = 20.sp,
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(20.dp))
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 20.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
                     if (isDownloading) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
-                            strokeWidth = 2.dp,
-                        )
+                        // Во время скачивания — единственная кнопка «Отмена» на всю ширину
+                        OutlinedButton(
+                            onClick = {
+                                downloadJob?.cancel()
+                                downloadJob = null
+                                progress = null
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("Отмена")
+                        }
                     } else {
-                        Text("Обновить")
+                        OutlinedButton(
+                            onClick = { dismissed = true },
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Text("Позже")
+                        }
+                        Button(
+                            onClick = {
+                                progress = 0L to -1L
+                                downloadJob = scope.launch {
+                                    runCatching {
+                                        updateManager.downloadAndInstall(
+                                            downloadUrl = info.downloadUrl!!,
+                                            activityContext = context,
+                                            onProgress = { downloaded, total ->
+                                                progress = downloaded to total
+                                            },
+                                        )
+                                    }
+                                    // По завершении (успех или ошибка) — сбрасываем
+                                    downloadJob = null
+                                    progress = null
+                                }
+                            },
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Text("Обновить")
+                        }
                     }
                 }
-            },
-            dismissButton = {
-                TextButton(onClick = { dismissed = true }) {
-                    Text("Позже")
-                }
-            },
-        )
+
+                Spacer(modifier = Modifier.height(20.dp))
+            }
+        }
     }
+}
+
+/** Форматирует байты в человекочитаемый размер: 12.3 МБ / 845 КБ. */
+private fun formatBytes(bytes: Long): String {
+    if (bytes <= 0) return "0 Б"
+    val mb = bytes / (1024.0 * 1024.0)
+    if (mb >= 1.0) return "%.1f МБ".format(mb)
+    val kb = bytes / 1024.0
+    return "%.0f КБ".format(kb)
 }

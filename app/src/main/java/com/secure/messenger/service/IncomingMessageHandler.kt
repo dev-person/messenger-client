@@ -147,15 +147,23 @@ class IncomingMessageHandler @Inject constructor(
 
             // Сохраняем в БД
             val safeType = runCatching { MessageType.valueOf(msgType) }.getOrDefault(MessageType.TEXT).name
+            // Извлекаем replyToId из payload (для цитат)
+            val replyToId = payload["replyToId"] as? String
             messageDao.upsert(MessageEntity(
                 id = messageId, chatId = chatId, senderId = senderId,
                 encryptedContent = encryptedContent, decryptedContent = decryptedContent,
                 type = safeType, status = MessageStatus.DELIVERED.name,
                 timestamp = timestamp,
-                replyToId = null, mediaUrl = null, isEdited = false,
+                replyToId = replyToId, mediaUrl = null, isEdited = false,
             ))
 
-            return Pair(sender.displayName, decryptedContent.take(120))
+            // В уведомлении не показываем base64 — для медиа ставим читаемую плашку
+            val notificationText = when (safeType) {
+                MessageType.AUDIO.name -> "Голосовое сообщение"
+                MessageType.IMAGE.name -> "Фото"
+                else -> decryptedContent.take(120)
+            }
+            return Pair(sender.displayName, notificationText)
 
         } catch (e: Exception) {
             Timber.e(e, "IncomingMessageHandler: failed to process message")

@@ -3,9 +3,12 @@ package com.secure.messenger.presentation.viewmodel
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import android.content.Context
 import com.secure.messenger.data.local.dao.UserDao
 import com.secure.messenger.data.remote.websocket.SignalingClient
 import com.secure.messenger.data.remote.websocket.SignalingEvent
+import com.secure.messenger.utils.VoiceRecorder
+import dagger.hilt.android.qualifiers.ApplicationContext
 import com.secure.messenger.domain.model.Chat
 import com.secure.messenger.domain.model.ChatType
 import com.secure.messenger.domain.model.Message
@@ -33,12 +36,15 @@ data class ChatUiState(
     val isLoading: Boolean = false,
     val error: String? = null,
     val editingMessage: Message? = null,
+    val replyingTo: Message? = null,
     val isLoadingOlder: Boolean = false,
     val hasOlderMessages: Boolean = true,
+    val showEmojiPicker: Boolean = false,
 )
 
 @HiltViewModel
 class ChatViewModel @Inject constructor(
+    @ApplicationContext context: Context,
     savedStateHandle: SavedStateHandle,
     private val chatRepository: ChatRepository,
     private val sendMessageUseCase: SendMessageUseCase,
@@ -46,6 +52,8 @@ class ChatViewModel @Inject constructor(
     private val userDao: UserDao,
     private val signalingClient: SignalingClient,
 ) : ViewModel() {
+
+    private val voiceRecorder = VoiceRecorder(context)
 
     private val chatId: String = checkNotNull(savedStateHandle["chatId"])
     private val displayLimit = MutableStateFlow(PAGE_SIZE)
@@ -154,6 +162,7 @@ class ChatViewModel @Inject constructor(
 
     fun sendMessage() {
         val editing = _uiState.value.editingMessage
+        val replyTo = _uiState.value.replyingTo
         val content = _inputText.value.trim()
         if (content.isEmpty()) return
 
@@ -170,12 +179,161 @@ class ChatViewModel @Inject constructor(
         }
 
         _inputText.value = ""
+        _uiState.value = _uiState.value.copy(replyingTo = null)
         viewModelScope.launch {
-            sendMessageUseCase(chatId, content)
+            sendMessageUseCase(chatId, content, replyToId = replyTo?.id)
                 .onFailure { e ->
                     Timber.e(e, "Не удалось отправить сообщение в чат $chatId")
                     _uiState.value = _uiState.value.copy(error = "Ошибка отправки: ${e.message}")
                 }
+        }
+    }
+
+    // ── Запись голосового ─────────────────────────────────────────────────
+
+    /** Записанное голосовое в ожидании превью / подтверждения отправки. */
+    data class PendingVoice(
+        val bytes: ByteArray,
+        val durationSeconds: Int,
+        val waveform: IntArray,
+    )
+
+    private val _isRecording = MutableStateFlow(false)
+    val isRecording: StateFlow<Boolean> = _isRecording.asStateFlow()
+
+    private val _recordingSeconds = MutableStateFlow(0)
+    val recordingSeconds: StateFlow<Int> = _recordingSeconds.asStateFlow()
+
+    /** После окончания записи здесь лежит результат для превью в модалке. */
+    private val _pendingVoice = MutableStateFlow<PendingVoice?>(null)
+    val pendingVoice: StateFlow<PendingVoice?> = _pendingVoice.asStateFlow()
+
+    private var recordingTimerJob: Job? = null
+
+    /** Отправляет картинку (после выбора через системный picker и сжатия в ImageCodec). */
+    fun sendImage(imageData: com.secure.messenger.utils.ImageCodec.ImageData) {
+        viewModelScope.launch {
+            chatRepository.sendImageMessage(chatId, imageData)
+                .onFailure { e ->
+                    Timber.e(e, "Не удалось отправить картинку")
+                    _uiState.value = _uiState.value.copy(error = "Ошибка отправки картинки: ${e.message}")
+                }
+        }
+    }
+
+    /** Начинает запись голосового сообщения. Должно вызываться после выдачи RECORD_AUDIO. */
+    fun startVoiceRecording() {
+        if (_isRecording.value) return
+        if (!voiceRecorder.start()) {
+            _uiState.value = _uiState.value.copy(error = "Не удалось начать запись")
+            return
+        }
+        _isRecording.value = true
+        _recordingSeconds.value = 0
+        recordingTimerJob?.cancel()
+        recordingTimerJob = viewModelScope.launch {
+            while (_isRecording.value) {
+                delay(1000)
+                _recordingSeconds.value += 1
+                // Жёсткий лимит — 60 секунд
+                if (_recordingSeconds.value >= 60) {
+                    stopVoiceRecording(cancel = false)
+                }
+            }
+        }
+    }
+
+    /**
+     * Останавливает запись. Если [cancel] = true — запись выбрасывается.
+     * Иначе байты сохраняются в [pendingVoice] для превью в модалке —
+     * пользователь решает в [confirmSendPendingVoice] / [discardPendingVoice].
+     */
+    fun stopVoiceRecording(cancel: Boolean) {
+        if (!_isRecording.value) return
+        _isRecording.value = false
+        recordingTimerJob?.cancel()
+        recordingTimerJob = null
+
+        if (cancel) {
+            voiceRecorder.cancel()
+            _recordingSeconds.value = 0
+            return
+        }
+
+        val result = voiceRecorder.stop()
+        _recordingSeconds.value = 0
+        if (result == null) {
+            _uiState.value = _uiState.value.copy(error = "Запись пуста")
+            return
+        }
+        _pendingVoice.value = PendingVoice(
+            bytes = result.bytes,
+            durationSeconds = result.durationSeconds,
+            waveform = result.waveform,
+        )
+    }
+
+    /** Отправка ранее записанного и подтверждённого в превью голосового. */
+    fun confirmSendPendingVoice() {
+        val pending = _pendingVoice.value ?: return
+        _pendingVoice.value = null
+        viewModelScope.launch {
+            chatRepository.sendVoiceMessage(chatId, pending.bytes, pending.durationSeconds, pending.waveform)
+                .onFailure { e ->
+                    Timber.e(e, "Не удалось отправить голосовое")
+                    _uiState.value = _uiState.value.copy(error = "Ошибка голосового: ${e.message}")
+                }
+        }
+    }
+
+    fun discardPendingVoice() {
+        _pendingVoice.value = null
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        if (_isRecording.value) voiceRecorder.cancel()
+        recordingTimerJob?.cancel()
+    }
+
+    /** Начать ответ на сообщение — показывает preview в инпуте. */
+    fun startReplying(message: Message) {
+        _uiState.value = _uiState.value.copy(replyingTo = message, editingMessage = null)
+    }
+
+    fun cancelReplying() {
+        _uiState.value = _uiState.value.copy(replyingTo = null)
+    }
+
+    fun toggleEmojiPicker() {
+        _uiState.value = _uiState.value.copy(showEmojiPicker = !_uiState.value.showEmojiPicker)
+    }
+
+    fun closeEmojiPicker() {
+        if (_uiState.value.showEmojiPicker) {
+            _uiState.value = _uiState.value.copy(showEmojiPicker = false)
+        }
+    }
+
+    fun appendEmoji(emoji: String) {
+        _inputText.value = _inputText.value + emoji
+    }
+
+    // ── Подсветка цитируемого сообщения при клике на цитату ──────────────
+
+    /** ID сообщения, которое сейчас подсвечено (после тапа на цитату). */
+    private val _highlightedMessageId = MutableStateFlow<String?>(null)
+    val highlightedMessageId: StateFlow<String?> = _highlightedMessageId.asStateFlow()
+
+    private var highlightJob: Job? = null
+
+    /** Подсвечивает сообщение и автоматически снимает подсветку через 1.5 сек. */
+    fun highlightMessage(messageId: String) {
+        _highlightedMessageId.value = messageId
+        highlightJob?.cancel()
+        highlightJob = viewModelScope.launch {
+            delay(1500)
+            _highlightedMessageId.value = null
         }
     }
 

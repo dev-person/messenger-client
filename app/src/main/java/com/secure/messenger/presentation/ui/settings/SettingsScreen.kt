@@ -224,17 +224,11 @@ fun SettingsScreen(
             // ── Обновление ─────────────────────────────────────────────────
             OneUiSectionLabel("Обновление")
 
-            OneUiCard {
-                OneUiClickItem(
-                    icon = Icons.Default.SystemUpdate,
-                    iconTint = MaterialTheme.colorScheme.tertiary,
-                    title = "Проверить обновления",
-                    subtitle = "Текущая версия: ${BuildConfig.VERSION_NAME}",
-                    onClick = {
-                        scope.launch { viewModel.checkForUpdate(context) }
-                    },
-                )
-            }
+            UpdateCard(
+                versionName = BuildConfig.VERSION_NAME,
+                versionCode = BuildConfig.VERSION_CODE,
+                onCheck = { scope.launch { viewModel.checkForUpdate(context) } },
+            )
 
             // ── О приложении ───────────────────────────────────────────────
             OneUiSectionLabel("О приложении")
@@ -291,6 +285,90 @@ private fun OneUiCard(content: @Composable () -> Unit) {
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
             content()
+        }
+    }
+}
+
+/**
+ * Большая красивая плашка проверки обновлений с круглой аватаркой медведя
+ * (логотип приложения) и градиентным фоном на левой части.
+ */
+@Composable
+private fun UpdateCard(
+    versionName: String,
+    versionCode: Int,
+    onCheck: () -> Unit,
+) {
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.surface,
+        tonalElevation = 1.dp,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onCheck),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // Круглая аватарка медведя на градиентном фоне
+            Box(
+                modifier = Modifier
+                    .size(64.dp)
+                    .clip(CircleShape)
+                    .background(
+                        androidx.compose.ui.graphics.Brush.linearGradient(
+                            listOf(
+                                MaterialTheme.colorScheme.primary,
+                                MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
+                            )
+                        )
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                androidx.compose.foundation.Image(
+                    painter = androidx.compose.ui.res.painterResource(
+                        com.secure.messenger.R.drawable.avatar_placeholder
+                    ),
+                    contentDescription = null,
+                    modifier = Modifier
+                        .size(54.dp)
+                        .clip(CircleShape),
+                )
+            }
+
+            Spacer(modifier = Modifier.width(16.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Grizzly Messenger",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = "Версия $versionName",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Medium,
+                )
+                Text(
+                    text = "Тап для проверки обновлений",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 12.sp,
+                )
+            }
+
+            Icon(
+                imageVector = Icons.Default.SystemUpdate,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(24.dp),
+            )
         }
     }
 }

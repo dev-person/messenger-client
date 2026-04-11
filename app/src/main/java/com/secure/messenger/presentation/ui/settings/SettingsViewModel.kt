@@ -63,16 +63,17 @@ class SettingsViewModel @Inject constructor(
         _uiState.value = _uiState.value.copy(colorScheme = scheme)
     }
 
-    /** Проверяет обновление вручную и показывает Toast с результатом */
+    /**
+     * Проверяет обновление вручную. Если найдено — UpdateManager обновит свой
+     * StateFlow `updateAvailable`, и UpdateDialog в MainActivity автоматически
+     * покажется с прогрессом скачивания и кнопкой отмены.
+     */
     suspend fun checkForUpdate(activityContext: Context) {
         val info = updateManager.checkForUpdate()
-        if (info != null) {
-            // Обновление найдено — скачиваем и устанавливаем
-            Toast.makeText(activityContext, "Скачивание v${info.versionName}…", Toast.LENGTH_SHORT).show()
-            updateManager.downloadAndInstall(info.downloadUrl!!, activityContext)
-        } else {
+        if (info == null) {
             Toast.makeText(activityContext, "У вас последняя версия", Toast.LENGTH_SHORT).show()
         }
+        // Если info != null — диалог покажется автоматически через наблюдение updateAvailable
     }
 
     companion object {

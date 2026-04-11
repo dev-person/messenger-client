@@ -92,6 +92,19 @@ object AppModule {
             // TODO: Replace fallbackToDestructiveMigration() with real migrations before production release.
             //  This destroys all data on schema change — acceptable only during early development.
             .fallbackToDestructiveMigration()
+            .addCallback(object : androidx.room.RoomDatabase.Callback() {
+                override fun onOpen(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    super.onOpen(db)
+                    // Защита от SQLiteBlobTooBigException: удаляем сообщения с
+                    // encryptedContent > 1.5 МБ — Android Cursor не может прочитать
+                    // строки больше своего window (~2 МБ) и приложение крашится
+                    // при открытии чата. Такие сообщения могли остаться после
+                    // отправки крупных анимаций до фикса MAX_RAW_BYTES.
+                    runCatching {
+                        db.execSQL("DELETE FROM messages WHERE LENGTH(encryptedContent) > 1500000")
+                    }
+                }
+            })
             .build()
 
     @Provides fun provideChatDao(db: AppDatabase) = db.chatDao()

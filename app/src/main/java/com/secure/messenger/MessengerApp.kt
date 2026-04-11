@@ -6,12 +6,17 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.media.AudioAttributes
 import android.media.RingtoneManager
+import android.os.Build
+import coil.ImageLoader
+import coil.ImageLoaderFactory
+import coil.decode.GifDecoder
+import coil.decode.ImageDecoderDecoder
 import com.secure.messenger.service.MessagingService
 import dagger.hilt.android.HiltAndroidApp
 import timber.log.Timber
 
 @HiltAndroidApp
-class MessengerApp : Application() {
+class MessengerApp : Application(), ImageLoaderFactory {
 
     companion object {
         /**
@@ -31,6 +36,22 @@ class MessengerApp : Application() {
         }
         createNotificationChannels()
     }
+
+    /**
+     * Глобальный Coil ImageLoader с поддержкой анимированных GIF/WebP.
+     * Без явного декодера AsyncImage показывает только первый кадр гифа —
+     * этим методом включаем встроенный системный декодер (Android 9+) или
+     * fallback GifDecoder для более старых версий.
+     */
+    override fun newImageLoader(): ImageLoader = ImageLoader.Builder(this)
+        .components {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                add(ImageDecoderDecoder.Factory())
+            } else {
+                add(GifDecoder.Factory())
+            }
+        }
+        .build()
 
     /**
      * Создаём каналы уведомлений при старте приложения — до любого сервиса.

@@ -15,8 +15,8 @@ android {
         applicationId = "com.secure.messenger"
         minSdk = 26
         targetSdk = 35
-        versionCode = 49
-        versionName = "1.0.49 alfa"
+        versionCode = 63
+        versionName = "1.0.63 alfa"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         // Room schema export for migrations
@@ -81,6 +81,7 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.splashscreen)
+    implementation(libs.androidx.appcompat)
 
     // Compose
     implementation(platform(libs.compose.bom))
@@ -137,6 +138,7 @@ dependencies {
 
     // Image loading
     implementation(libs.coil.compose)
+    implementation(libs.coil.gif)
 
     // Permissions
     implementation(libs.accompanist.permissions)

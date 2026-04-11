@@ -8,9 +8,11 @@ import com.secure.messenger.BuildConfig
 import com.secure.messenger.data.remote.api.UpdateInfoDto
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
+import java.io.IOException
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
@@ -74,49 +76,85 @@ class UpdateManager @Inject constructor(
     }
 
     /**
-     * Скачивает APK по указанному URL в кеш и запускает установку.
+     * Скачивает APK с прогрессом и запускает установку.
+     *
+     * Корутинно отменяемая: при cancel() coroutine — частично скачанный файл
+     * удаляется. Прогресс репортится через [onProgress] не чаще ~10 раз/сек,
+     * чтобы UI не моргал.
+     *
+     * @param onProgress (downloaded, total) — total = -1 если сервер не вернул Content-Length
      */
-    suspend fun downloadAndInstall(downloadUrl: String, activityContext: Context) {
-        withContext(Dispatchers.IO) {
-            try {
-                val dir = File(context.cacheDir, "updates")
-                dir.mkdirs()
-                val file = File(dir, "update.apk")
+    suspend fun downloadAndInstall(
+        downloadUrl: String,
+        activityContext: Context,
+        onProgress: (downloaded: Long, total: Long) -> Unit,
+    ) = withContext(Dispatchers.IO) {
+        val dir = File(context.cacheDir, "updates")
+        dir.mkdirs()
+        val file = File(dir, "update.apk")
+        if (file.exists()) file.delete()
 
-                // Скачиваем APK
-                val request = Request.Builder().url(downloadUrl).build()
-                val response = okHttpClient.newCall(request).execute()
-                response.body?.byteStream()?.use { input ->
-                    file.outputStream().use { output -> input.copyTo(output) }
-                } ?: run {
-                    Timber.e("UpdateManager: пустое тело ответа при скачивании APK")
-                    return@withContext
-                }
+        try {
+            val request = Request.Builder().url(downloadUrl).build()
+            val response = okHttpClient.newCall(request).execute()
+            if (!response.isSuccessful) {
+                throw IOException("HTTP ${response.code}")
+            }
+            val body = response.body ?: throw IOException("Пустое тело ответа")
+            val total = body.contentLength()
 
-                // Запускаем установку через FileProvider
-                withContext(Dispatchers.Main) {
-                    try {
-                        val uri = FileProvider.getUriForFile(
-                            activityContext,
-                            "${activityContext.packageName}.fileprovider",
-                            file,
-                        )
-                        val intent = Intent(Intent.ACTION_VIEW).apply {
-                            setDataAndType(uri, "application/vnd.android.package-archive")
-                            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION
+            body.byteStream().use { input ->
+                file.outputStream().use { output ->
+                    val buffer = ByteArray(16 * 1024)
+                    var downloaded = 0L
+                    var lastReport = 0L
+                    onProgress(0L, total)
+                    while (true) {
+                        ensureActive() // Кооперативная отмена
+                        val read = input.read(buffer)
+                        if (read == -1) break
+                        output.write(buffer, 0, read)
+                        downloaded += read
+                        val now = System.currentTimeMillis()
+                        if (now - lastReport >= 100) {
+                            lastReport = now
+                            onProgress(downloaded, total)
                         }
-                        activityContext.startActivity(intent)
-                    } catch (e: Exception) {
-                        Timber.e(e, "Не удалось запустить установщик")
-                        Toast.makeText(activityContext, "Ошибка установки: ${e.message}", Toast.LENGTH_LONG).show()
                     }
-                }
-            } catch (e: Exception) {
-                Timber.e(e, "Ошибка скачивания обновления")
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(activityContext, "Ошибка скачивания: ${e.message}", Toast.LENGTH_LONG).show()
+                    onProgress(downloaded, total)
                 }
             }
+
+            // Запускаем установку через FileProvider
+            withContext(Dispatchers.Main) {
+                try {
+                    val uri = FileProvider.getUriForFile(
+                        activityContext,
+                        "${activityContext.packageName}.fileprovider",
+                        file,
+                    )
+                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(uri, "application/vnd.android.package-archive")
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    }
+                    activityContext.startActivity(intent)
+                } catch (e: Exception) {
+                    Timber.e(e, "Не удалось запустить установщик")
+                    Toast.makeText(activityContext, "Ошибка установки: ${e.message}", Toast.LENGTH_LONG).show()
+                    throw e
+                }
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // Пользователь отменил — чистим частично скачанный APK
+            runCatching { file.delete() }
+            throw e
+        } catch (e: Exception) {
+            Timber.e(e, "Ошибка скачивания обновления")
+            runCatching { file.delete() }
+            withContext(Dispatchers.Main) {
+                Toast.makeText(activityContext, "Ошибка скачивания: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+            throw e
         }
     }
 }

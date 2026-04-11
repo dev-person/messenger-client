@@ -41,7 +41,7 @@ interface MessengerApi {
     suspend fun registerFcmToken(@Body body: Map<String, String>): ApiResponse<Unit>
 
     @PUT("users/me/app-version")
-    suspend fun registerAppVersion(@Body body: Map<String, Any>): ApiResponse<Unit>
+    suspend fun registerAppVersion(@Body body: AppVersionRequest): ApiResponse<Unit>
 
     @GET("users/{userId}")
     suspend fun getUserById(@Path("userId") userId: String): ApiResponse<UserDto>
@@ -123,6 +123,12 @@ data class SendMessageRequest(
     val encryptedContent: String,
     val type: String = "TEXT",
     val replyToId: String? = null,
+)
+
+/** Версия APK у клиента — отправляется при каждом старте для админ-панели. */
+data class AppVersionRequest(
+    val versionCode: Int,
+    val versionName: String,
 )
 
 data class AuthResponseDto(val token: String, val user: UserDto)

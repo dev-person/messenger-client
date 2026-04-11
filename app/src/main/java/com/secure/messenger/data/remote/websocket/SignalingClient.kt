@@ -126,8 +126,13 @@ class SignalingClient @Inject constructor(
                 // Сервер добавляет "from" = callerId при пересылке offer
                 val from = payload["from"] as? String ?: ""
                 if (from.isNotEmpty()) peerUserId = from
+                val incomingCallId = payload["callId"] as? String ?: ""
+                // Запоминаем callId — нужен для sendAnswer чтобы сервер пометил
+                // звонок как принятый (state CONNECTED). Без этого end_call
+                // придёт со state=CALLING и звонок попадёт в «Пропущенные».
+                if (incomingCallId.isNotEmpty()) currentCallId = incomingCallId
                 SignalingEvent.Offer(
-                    callId = payload["callId"] as? String ?: "",
+                    callId = incomingCallId,
                     from = from,
                     sdp = payload["sdp"] as? String ?: return,
                 )
@@ -144,8 +149,11 @@ class SignalingClient @Inject constructor(
                 // Устанавливаем пира, чтобы answer/ICE маршрутизировались даже до прихода offer
                 val callerId = payload["callerId"] as? String ?: ""
                 if (callerId.isNotEmpty()) peerUserId = callerId
+                val incomingCallId = payload["callId"] as? String ?: ""
+                // Запоминаем callId — нужен для sendAnswer и sendEndCall.
+                if (incomingCallId.isNotEmpty()) currentCallId = incomingCallId
                 SignalingEvent.IncomingCall(
-                    callId = payload["callId"] as? String ?: "",
+                    callId = incomingCallId,
                     callerId = callerId,
                     isVideo = payload["isVideo"] as? Boolean ?: false,
                 )
@@ -208,7 +216,11 @@ class SignalingClient @Inject constructor(
 
     fun sendAnswer(sdp: String) {
         val peer = peerUserId ?: run { Timber.w("sendAnswer: peerUserId not set"); return }
-        send("answer", mapOf("to" to peer, "sdp" to sdp))
+        // Передаём callId — сервер по нему помечает звонок как принятый
+        // (state CONNECTED). Без этого end_call попадёт в БД как пропущенный.
+        val payload = mutableMapOf<String, Any?>("to" to peer, "sdp" to sdp)
+        currentCallId?.let { payload["callId"] = it }
+        send("answer", payload)
     }
 
     fun sendIceCandidate(callId: String, candidate: String, sdpMid: String?, sdpMLineIndex: Int) {

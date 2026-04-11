@@ -6,10 +6,8 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -34,8 +32,6 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -57,6 +53,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -69,6 +66,10 @@ import com.secure.messenger.domain.model.Chat
 import com.secure.messenger.domain.model.ChatType
 import com.secure.messenger.domain.model.MessageType
 import com.secure.messenger.domain.model.User
+import com.secure.messenger.presentation.ui.components.ActionMenu
+import com.secure.messenger.presentation.ui.components.ActionMenuItem
+import com.secure.messenger.presentation.ui.components.longPressActionable
+import com.secure.messenger.presentation.ui.components.toIntOffset
 import com.secure.messenger.presentation.viewmodel.ChatListViewModel
 import com.secure.messenger.utils.formatTimestamp
 import kotlin.math.abs
@@ -334,7 +335,6 @@ private fun SupportAuthorDialog(onDismiss: () -> Unit) {
 
 // ── Строка одного чата (в карточке) ──────────────────────────────────────────
 
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ChatRow(
     chat: Chat,
@@ -343,7 +343,8 @@ private fun ChatRow(
     onDeleteChat: () -> Unit,
     onBlockUser: () -> Unit,
 ) {
-    var showMenu by remember { mutableStateOf(false) }
+    var menuVisible by remember { mutableStateOf(false) }
+    var menuOffset by remember { mutableStateOf(IntOffset.Zero) }
 
     Surface(
         shape = RoundedCornerShape(18.dp),
@@ -355,9 +356,12 @@ private fun ChatRow(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .combinedClickable(
+                    .longPressActionable(
                         onClick = onClick,
-                        onLongClick = { showMenu = true },
+                        onLongPress = { offset ->
+                            menuOffset = offset.toIntOffset()
+                            menuVisible = true
+                        },
                     )
                     .padding(horizontal = 16.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -445,7 +449,7 @@ private fun ChatRow(
                                         MessageType.TEXT   -> msg.content
                                         MessageType.IMAGE  -> "📷 Фото"
                                         MessageType.VIDEO  -> "🎬 Видео"
-                                        MessageType.AUDIO  -> "🎵 Аудио"
+                                        MessageType.AUDIO  -> "🎤 Аудиосообщение"
                                         MessageType.FILE   -> "📎 Файл"
                                         MessageType.SYSTEM -> msg.content
                                     }
@@ -471,28 +475,32 @@ private fun ChatRow(
                 }
             }
 
-            // Контекстное меню при долгом нажатии
-            DropdownMenu(
-                expanded = showMenu,
-                onDismissRequest = { showMenu = false },
-            ) {
-                DropdownMenuItem(
-                    text = { Text("Удалить чат") },
-                    onClick = { showMenu = false; onDeleteChat() },
-                    leadingIcon = {
-                        Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error)
-                    },
-                )
-                if (chat.type == ChatType.DIRECT && chat.otherUserId != null) {
-                    DropdownMenuItem(
-                        text = { Text("Заблокировать") },
-                        onClick = { showMenu = false; onBlockUser() },
-                        leadingIcon = {
-                            Icon(Icons.Default.Block, null, tint = MaterialTheme.colorScheme.error)
-                        },
+            // Контекстное меню при долгом нажатии — появляется в точке касания
+            ActionMenu(
+                visible = menuVisible,
+                anchorOffset = menuOffset,
+                onDismiss = { menuVisible = false },
+                actions = buildList {
+                    add(
+                        ActionMenuItem(
+                            label = "Удалить чат",
+                            icon = Icons.Default.Delete,
+                            danger = true,
+                            onClick = onDeleteChat,
+                        )
                     )
-                }
-            }
+                    if (chat.type == ChatType.DIRECT && chat.otherUserId != null) {
+                        add(
+                            ActionMenuItem(
+                                label = "Заблокировать",
+                                icon = Icons.Default.Block,
+                                danger = true,
+                                onClick = onBlockUser,
+                            )
+                        )
+                    }
+                },
+            )
         }
     }
 }

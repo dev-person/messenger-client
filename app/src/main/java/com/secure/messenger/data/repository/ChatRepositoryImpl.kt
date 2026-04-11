@@ -16,10 +16,13 @@ import com.secure.messenger.domain.model.ChatType
 import com.secure.messenger.domain.model.Message
 import com.secure.messenger.domain.model.MessageStatus
 import com.secure.messenger.domain.model.MessageType
+import com.secure.messenger.domain.repository.AuthRepository
 import com.secure.messenger.domain.repository.ChatRepository
 import com.secure.messenger.utils.CryptoManager
 import com.secure.messenger.utils.LocalKeyStore
+import dagger.Lazy
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import timber.log.Timber
 import java.time.Instant
@@ -34,7 +37,18 @@ class ChatRepositoryImpl @Inject constructor(
     private val cryptoManager: CryptoManager,
     private val localKeyStore: LocalKeyStore,
     private val signalingClient: SignalingClient,
+    // Lazy чтобы избежать циклической зависимости (AuthRepositoryImpl может зависеть от ChatRepository)
+    private val authRepository: Lazy<AuthRepository>,
 ) : ChatRepository {
+
+    /**
+     * Возвращает реальный UUID текущего пользователя для оптимистичной вставки сообщений.
+     * Без него senderId был "me", и MessageBubble сначала рисовал сообщение слева
+     * (как входящее), а после ответа сервера резко перепрыгивал направо.
+     * Fallback на "me" — если не удалось получить (новые пользователи без профиля).
+     */
+    private suspend fun currentUserIdSync(): String =
+        runCatching { authRepository.get().currentUser.first()?.id }.getOrNull() ?: "me"
 
     override fun observeChats(): Flow<List<Chat>> =
         chatDao.observeAllWithLastMessage().map { rows -> rows.map { it.toChat() } }
@@ -91,24 +105,36 @@ class ChatRepositoryImpl @Inject constructor(
         entity.toChat()
     }
 
-    override suspend fun sendMessage(chatId: String, content: String): Result<Message> = runCatching {
+    override suspend fun sendMessage(
+        chatId: String,
+        content: String,
+        replyToId: String?,
+    ): Result<Message> = runCatching {
         val chatEntity = chatDao.getById(chatId) ?: error("Chat not found: $chatId")
         val messageId = UUID.randomUUID().toString()
+        val myUserId = currentUserIdSync()
 
         // Шифруем сообщение публичным ключом получателя
         val encryptedContent = encryptForChat(chatEntity, content, messageId)
 
-        // Оптимистичная вставка в локальную БД со статусом SENDING
+        // Оптимистичная вставка в локальную БД со статусом SENDING.
+        // senderId сразу ставим реальным — иначе MessageBubble нарисует сообщение
+        // как входящее (слева) до ответа сервера, а потом перепрыгнет вправо.
         val optimisticEntity = MessageEntity(
-            id = messageId, chatId = chatId, senderId = "me", // replaced on server response
+            id = messageId, chatId = chatId, senderId = myUserId,
             encryptedContent = encryptedContent, decryptedContent = content,
             type = MessageType.TEXT.name, status = MessageStatus.SENDING.name,
-            timestamp = System.currentTimeMillis(), replyToId = null, mediaUrl = null, isEdited = false,
+            timestamp = System.currentTimeMillis(),
+            replyToId = replyToId, mediaUrl = null, isEdited = false,
         )
         messageDao.upsert(optimisticEntity)
 
         // Отправляем на сервер
-        val request = SendMessageRequest(messageId = messageId, encryptedContent = encryptedContent)
+        val request = SendMessageRequest(
+            messageId = messageId,
+            encryptedContent = encryptedContent,
+            replyToId = replyToId,
+        )
         val dto = api.sendMessage(chatId, request).data ?: error("Send failed")
 
         // Обновляем подтверждённым ответом сервера
@@ -121,6 +147,103 @@ class ChatRepositoryImpl @Inject constructor(
         messageDao.upsert(confirmedEntity)
 
         // Дополнительно отправляем через WebSocket для доставки в реальном времени
+        signalingClient.sendChatMessage(chatId, encryptedContent, dto.id)
+
+        confirmedEntity.toDomain()
+    }
+
+    /**
+     * Отправляет голосовое сообщение. Аудио-байты + waveform упаковываются в JSON
+     * и шифруются обычным текстовым пайплайном — сервер ничего не знает о голосовых
+     * сообщениях, для него это просто encryptedContent с типом AUDIO.
+     * Файлы на сервере не хранятся.
+     */
+    override suspend fun sendVoiceMessage(
+        chatId: String,
+        audioBytes: ByteArray,
+        durationSeconds: Int,
+        waveform: IntArray,
+    ): Result<Message> = runCatching {
+        val chatEntity = chatDao.getById(chatId) ?: error("Chat not found: $chatId")
+        val messageId = UUID.randomUUID().toString()
+        val myUserId = currentUserIdSync()
+
+        val payload = com.secure.messenger.utils.VoiceCodec.encode(audioBytes, durationSeconds, waveform)
+        val encryptedContent = encryptForChat(chatEntity, payload, messageId)
+
+        val optimisticEntity = MessageEntity(
+            id = messageId, chatId = chatId, senderId = myUserId,
+            encryptedContent = encryptedContent,
+            decryptedContent = payload, // локально храним JSON в decryptedContent
+            type = MessageType.AUDIO.name,
+            status = MessageStatus.SENDING.name,
+            timestamp = System.currentTimeMillis(),
+            replyToId = null, mediaUrl = null, isEdited = false,
+        )
+        messageDao.upsert(optimisticEntity)
+
+        val request = SendMessageRequest(
+            messageId = messageId,
+            encryptedContent = encryptedContent,
+            type = MessageType.AUDIO.name,
+        )
+        val dto = api.sendMessage(chatId, request).data ?: error("Send failed")
+
+        val confirmedEntity = optimisticEntity.copy(
+            id = dto.id,
+            senderId = dto.senderId,
+            status = MessageStatus.SENT.name,
+            timestamp = Instant.parse(dto.timestamp).toEpochMilli(),
+        )
+        messageDao.upsert(confirmedEntity)
+
+        // Доставка в реальном времени через WebSocket
+        signalingClient.sendChatMessage(chatId, encryptedContent, dto.id)
+
+        confirmedEntity.toDomain()
+    }
+
+    /**
+     * Отправляет картинку. Картинка уже сжата (см. ImageCodec.loadAndCompress),
+     * упаковывается в JSON и идёт через тот же шифрованный пайп что и текст.
+     */
+    override suspend fun sendImageMessage(
+        chatId: String,
+        imageData: com.secure.messenger.utils.ImageCodec.ImageData,
+    ): Result<Message> = runCatching {
+        val chatEntity = chatDao.getById(chatId) ?: error("Chat not found: $chatId")
+        val messageId = UUID.randomUUID().toString()
+        val myUserId = currentUserIdSync()
+
+        val payload = com.secure.messenger.utils.ImageCodec.encode(imageData)
+        val encryptedContent = encryptForChat(chatEntity, payload, messageId)
+
+        val optimisticEntity = MessageEntity(
+            id = messageId, chatId = chatId, senderId = myUserId,
+            encryptedContent = encryptedContent,
+            decryptedContent = payload, // локально храним JSON
+            type = MessageType.IMAGE.name,
+            status = MessageStatus.SENDING.name,
+            timestamp = System.currentTimeMillis(),
+            replyToId = null, mediaUrl = null, isEdited = false,
+        )
+        messageDao.upsert(optimisticEntity)
+
+        val request = SendMessageRequest(
+            messageId = messageId,
+            encryptedContent = encryptedContent,
+            type = MessageType.IMAGE.name,
+        )
+        val dto = api.sendMessage(chatId, request).data ?: error("Send failed")
+
+        val confirmedEntity = optimisticEntity.copy(
+            id = dto.id,
+            senderId = dto.senderId,
+            status = MessageStatus.SENT.name,
+            timestamp = Instant.parse(dto.timestamp).toEpochMilli(),
+        )
+        messageDao.upsert(confirmedEntity)
+
         signalingClient.sendChatMessage(chatId, encryptedContent, dto.id)
 
         confirmedEntity.toDomain()
