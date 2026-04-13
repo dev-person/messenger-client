@@ -12,9 +12,13 @@ import kotlinx.coroutines.flow.Flow
 @Dao
 interface ChatDao {
 
-    @Query("SELECT * FROM chats ORDER BY isPinned DESC, updatedAt DESC")
+    @Query("SELECT * FROM chats WHERE isHidden = 0 ORDER BY isPinned DESC, updatedAt DESC")
     fun observeAll(): Flow<List<ChatEntity>>
 
+    // Список чатов: + последнее сообщение через LEFT JOIN на messages,
+    // + онлайн-статус собеседника через LEFT JOIN на users (otherUserId).
+    // Скрытые чаты (isHidden = 1) исключаем — они остаются в БД как «помнить
+    // что юзер скрыл», но в UI не показываются.
     @Query("""
         SELECT c.*,
                m.id        AS lastMsgId,
@@ -23,11 +27,14 @@ interface ChatDao {
                m.type      AS lastMsgType,
                m.status    AS lastMsgStatus,
                m.timestamp AS lastMsgTimestamp,
-               m.isEdited  AS lastMsgIsEdited
+               m.isEdited  AS lastMsgIsEdited,
+               u.isOnline  AS otherIsOnline
         FROM chats c
         LEFT JOIN messages m ON m.id = (
             SELECT id FROM messages WHERE chatId = c.id ORDER BY timestamp DESC LIMIT 1
         )
+        LEFT JOIN users u ON u.id = c.otherUserId
+        WHERE c.isHidden = 0
         ORDER BY c.isPinned DESC, c.updatedAt DESC
     """)
     fun observeAllWithLastMessage(): Flow<List<ChatWithLastMessage>>
@@ -53,6 +60,20 @@ interface ChatDao {
     @Query("UPDATE chats SET isMuted = :muted WHERE id = :chatId")
     suspend fun setMuted(chatId: String, muted: Boolean)
 
+    /**
+     * Soft-delete: помечаем чат скрытым вместо физического удаления. Это нужно
+     * чтобы syncChats() не «оживлял» чат при следующей загрузке списка с сервера.
+     * Запись в БД остаётся, при приходе нового сообщения чат можно «разспрятать»
+     * (см. unhide ниже).
+     */
+    @Query("UPDATE chats SET isHidden = 1 WHERE id = :chatId")
+    suspend fun hideById(chatId: String)
+
+    /** Разспрятать чат — вызывается при приходе нового сообщения в скрытый чат. */
+    @Query("UPDATE chats SET isHidden = 0 WHERE id = :chatId")
+    suspend fun unhideById(chatId: String)
+
+    /** Полное физическое удаление — оставляем для совместимости/тестов. */
     @Query("DELETE FROM chats WHERE id = :chatId")
     suspend fun deleteById(chatId: String)
 

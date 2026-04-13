@@ -32,6 +32,32 @@ import javax.inject.Inject
 class OtpCooldownException(val retryAfterSeconds: Int) :
     Exception("Подождите $retryAfterSeconds секунд перед повторной отправкой")
 
+/**
+ * Ошибка проверки OTP-кода. errorCode — машинный код от сервера для логики
+ * (invalid_code / expired / too_many_attempts), message — готовый русский
+ * текст для UI, который отдал сервер.
+ */
+class OtpVerifyException(
+    val errorCode: String,
+    message: String,
+) : Exception(message)
+
+/**
+ * Парсит JSON-тело ошибки от сервера. Сервер возвращает структуру:
+ * {"success": false, "error": "Русский текст", "errorCode": "...optional..."}.
+ * Возвращает (errorCode, errorMessage). Если не удалось распарсить — пустые
+ * строки, в этом случае вызывающий показывает свой fallback.
+ */
+private fun parseErrorBody(errorBody: String?): Pair<String, String> {
+    if (errorBody.isNullOrBlank()) return "" to ""
+    return runCatching {
+        val obj = JSONObject(errorBody)
+        val code = obj.optString("errorCode", "")
+        val msg = obj.optString("error", "")
+        code to msg
+    }.getOrDefault("" to "")
+}
+
 class AuthRepositoryImpl @Inject constructor(
     @ApplicationContext private val context: Context,
     private val api: MessengerApi,
@@ -65,42 +91,56 @@ class AuthRepositoryImpl @Inject constructor(
             api.requestOtp(mapOf("phone" to phone))
             Result.success(Unit)
         } catch (e: HttpException) {
+            val body = e.response()?.errorBody()?.string()
+            val (_, serverMsg) = parseErrorBody(body)
             if (e.code() == 429) {
-                val retryAfter = try {
-                    val body = e.response()?.errorBody()?.string() ?: ""
-                    JSONObject(body).optInt("retry_after", 300)
-                } catch (_: Exception) { 300 }
+                val retryAfter = runCatching {
+                    JSONObject(body ?: "").optInt("retry_after", 300)
+                }.getOrDefault(300)
                 Result.failure(OtpCooldownException(retryAfter))
             } else {
-                Result.failure(e)
+                // Если сервер прислал русский текст ошибки — пробрасываем его,
+                // иначе ставим понятный fallback вместо «HTTP 500 Server Error».
+                val msg = serverMsg.ifBlank { "Не удалось отправить код. Проверьте интернет и повторите" }
+                Result.failure(Exception(msg))
             }
         } catch (e: Exception) {
-            Result.failure(e)
+            Result.failure(Exception("Нет связи с сервером. Проверьте интернет"))
         }
     }
 
-    override suspend fun verifyOtp(phone: String, code: String): Result<User> = runCatching {
-        val response = api.verifyOtp(mapOf("phone" to phone, "code" to code)).data
-            ?: error("Server returned null")
+    override suspend fun verifyOtp(phone: String, code: String): Result<User> {
+        return try {
+            val response = api.verifyOtp(mapOf("phone" to phone, "code" to code)).data
+                ?: return Result.failure(Exception("Сервер вернул пустой ответ"))
 
-        tokenProvider.saveToken(response.token)
+            tokenProvider.saveToken(response.token)
 
-        // Запускаем WebSocket-сервис сразу после получения токена
-        context.startService(Intent(context, MessagingService::class.java))
+            // Запускаем WebSocket-сервис сразу после получения токена
+            context.startService(Intent(context, MessagingService::class.java))
 
-        // Регистрируем FCM device token на сервере — чтобы push-уведомления
-        // приходили на это устройство когда приложение в фоне или убито
-        FirebaseMessaging.getInstance().token.addOnSuccessListener { fcmToken ->
-            scope.launch {
-                runCatching { api.registerFcmToken(mapOf("token" to fcmToken)) }
-                    .onFailure { Timber.e(it, "Не удалось зарегистрировать FCM токен") }
+            // Регистрируем FCM device token на сервере
+            FirebaseMessaging.getInstance().token.addOnSuccessListener { fcmToken ->
+                scope.launch {
+                    runCatching { api.registerFcmToken(mapOf("token" to fcmToken)) }
+                        .onFailure { Timber.e(it, "Не удалось зарегистрировать FCM токен") }
+                }
             }
-        }
 
-        val user = response.user.toDomain()
-        userDao.upsert(UserEntity.fromDomain(user))
-        _currentUser.value = user
-        user
+            val user = response.user.toDomain()
+            userDao.upsert(UserEntity.fromDomain(user))
+            _currentUser.value = user
+            Result.success(user)
+        } catch (e: HttpException) {
+            // Сервер вернул структурированную ошибку — парсим её и
+            // подставляем русское сообщение от сервера, не голый "HTTP 401".
+            val body = e.response()?.errorBody()?.string()
+            val (errorCode, serverMsg) = parseErrorBody(body)
+            val msg = serverMsg.ifBlank { "Не удалось проверить код. Повторите попытку" }
+            Result.failure(OtpVerifyException(errorCode = errorCode, message = msg))
+        } catch (e: Exception) {
+            Result.failure(Exception("Нет связи с сервером. Проверьте интернет"))
+        }
     }
 
     override suspend fun updateProfile(

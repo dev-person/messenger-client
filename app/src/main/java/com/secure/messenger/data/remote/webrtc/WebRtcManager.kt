@@ -330,11 +330,14 @@ class WebRtcManager @Inject constructor(
     private fun startConnectionTimeout() {
         connectionTimeoutJob?.cancel()
         connectionTimeoutJob = scope.launch {
-            delay(30_000L)
+            // 5 минут — стандартное время дозвона как в Telegram/WhatsApp.
+            // Раньше было 30 сек, и звонок сам завершался даже если собеседник
+            // просто тянулся к телефону.
+            delay(CALL_RING_TIMEOUT_MS)
             if (_callState.value != WebRtcCallState.CONNECTED &&
                 _callState.value != WebRtcCallState.IDLE &&
                 _callState.value != WebRtcCallState.ENDED) {
-                Timber.w("WebRTC: connection timeout after 30s, ending call")
+                Timber.w("WebRTC: connection timeout after ${CALL_RING_TIMEOUT_MS / 1000}s, ending call")
                 handleRemoteCallEnded()
             }
         }
@@ -524,6 +527,12 @@ class WebRtcManager @Inject constructor(
         endCall()
         if (factoryInitialized) peerConnectionFactory.dispose()
         eglBase.release()
+    }
+
+    private companion object {
+        // Сколько максимум висит дозвон без ответа собеседника. По истечении —
+        // звонок автоматически завершается. 5 минут — стандарт Telegram/WhatsApp.
+        const val CALL_RING_TIMEOUT_MS = 5 * 60 * 1000L
     }
 }
 

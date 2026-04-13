@@ -114,6 +114,9 @@ class MessagingService : Service() {
                     is SignalingEvent.UserStatus -> scope.launch {
                         incomingMessageHandler.handleUserStatus(event.userId, event.isOnline)
                     }
+                    is SignalingEvent.UserUpdated -> scope.launch {
+                        incomingMessageHandler.handleUserUpdated(event.userId, event.payload)
+                    }
                     is SignalingEvent.Disconnected -> {
                         Timber.w("WS disconnected — reconnect in ${reconnectDelayMs}ms")
                         scheduleReconnect()
@@ -168,7 +171,7 @@ class MessagingService : Service() {
             PowerManager.FULL_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
             "messenger:incoming_call_wake",
         )
-        wl.acquire(45_000L) // auto-release matches notification timeout
+        wl.acquire(5 * 60_000L) // auto-release matches notification timeout (5 min)
 
         val openIntent = PendingIntent.getActivity(
             this, NOTIF_ID_CALL,
@@ -189,7 +192,7 @@ class MessagingService : Service() {
             .setVibrate(longArrayOf(0, 500, 300, 500, 300, 500))
             .setSound(ringtoneUri)
             .setAutoCancel(true)
-            .setTimeoutAfter(45_000L)
+            .setTimeoutAfter(5 * 60_000L)
 
         nm.notify(NOTIF_ID_CALL, builder.build())
     }

@@ -72,7 +72,9 @@ import com.secure.messenger.presentation.theme.ThemePreferences
 import com.secure.messenger.utils.TextEnhancer
 import com.secure.messenger.service.MessagingService
 import com.secure.messenger.utils.UpdateManager
+import androidx.lifecycle.lifecycleScope
 import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import javax.inject.Inject
@@ -85,6 +87,7 @@ class MainActivity : ComponentActivity() {
     @Inject lateinit var api: MessengerApi
     @Inject lateinit var updateManager: UpdateManager
     @Inject lateinit var signalingClient: SignalingClient
+    @Inject lateinit var chatRepository: com.secure.messenger.domain.repository.ChatRepository
 
     // Launcher for POST_NOTIFICATIONS permission (Android 13+)
     private val notifPermLauncher = registerForActivityResult(
@@ -141,6 +144,17 @@ class MainActivity : ComponentActivity() {
             // Сообщаем серверу актуальную версию APK — нужно для админ-панели,
             // чтобы видеть распределение версий по пользователям
             registerAppVersion()
+            // Re-sync чатов: подтягиваем актуальные имена/аватарки/онлайн-статусы
+            // партнёров. Нужно как fallback если пока приложение было свёрнуто
+            // юзер B обновил профиль и WS-event user_updated не дошёл (или WS
+            // был отключён). Без этого аватарка партнёра в списке оставалась
+            // старой до перезапуска приложения.
+            lifecycleScope.launch {
+                runCatching {
+                    val me = authRepository.currentUser.firstOrNull() ?: return@runCatching
+                    chatRepository.syncChats(me.id)
+                }
+            }
         }
     }
 

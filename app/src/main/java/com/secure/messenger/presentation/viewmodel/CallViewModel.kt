@@ -13,6 +13,7 @@ import com.secure.messenger.domain.model.CallType
 import com.secure.messenger.domain.repository.CallRepository
 import com.secure.messenger.domain.usecase.StartCallUseCase
 import com.secure.messenger.service.MessagingService
+import com.secure.messenger.utils.SoundManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -40,6 +41,7 @@ class CallViewModel @Inject constructor(
     private val userDao: UserDao,
     @ApplicationContext private val context: Context,
     val webRtcManager: WebRtcManager,
+    private val soundManager: SoundManager,
 ) : ViewModel() {
 
     val localVideoTrack: StateFlow<VideoTrack?> = webRtcManager.localVideoTrackFlow
@@ -59,6 +61,10 @@ class CallViewModel @Inject constructor(
     private val _peerAvatarUrl = MutableStateFlow<String?>(null)
     val peerAvatarUrl: StateFlow<String?> = _peerAvatarUrl.asStateFlow()
 
+    // true если этот юзер сам инициировал звонок (нужно для гудка ringback —
+    // его проигрывают только инициатору). false для входящих звонков.
+    @Volatile private var isOutgoingCall = false
+
     init {
         // Keep uiState.call in sync with repository's activeCall
         viewModelScope.launch {
@@ -66,10 +72,37 @@ class CallViewModel @Inject constructor(
                 _uiState.value = _uiState.value.copy(call = call)
                 // For incoming calls, resolve caller's display name + avatar automatically
                 if (call != null && call.state == CallState.RINGING) {
+                    isOutgoingCall = false
                     resolvePeer(call.callerId)
                 }
             }
         }
+
+        // Гудок исходящего вызова: проигрываем только когда мы сами звоним
+        // (isOutgoingCall = true). Запускается при CALLING / CONNECTING,
+        // останавливается на CONNECTED / ENDED / IDLE. Для входящих звонков
+        // (isOutgoingCall = false) гудок никогда не запускается — там играет
+        // рингтон системного уведомления.
+        viewModelScope.launch {
+            webRtcState.collect { state ->
+                val shouldRingback = isOutgoingCall && (
+                    state == WebRtcCallState.CALLING ||
+                    state == WebRtcCallState.CONNECTING
+                )
+                if (shouldRingback) {
+                    soundManager.startOutgoingRingback()
+                } else {
+                    soundManager.stopOutgoingRingback()
+                }
+            }
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        // Страховка: если ViewModel разрушается во время ringback (например,
+        // навигация назад с экрана звонка) — обязательно гасим звук.
+        soundManager.stopOutgoingRingback()
     }
 
     /**
@@ -87,6 +120,9 @@ class CallViewModel @Inject constructor(
     }
 
     fun startCall(userId: String, type: CallType) {
+        // Помечаем что МЫ инициировали звонок — нужно для гудка ringback,
+        // его проигрывают только инициатору пока удалённая сторона не ответит.
+        isOutgoingCall = true
         viewModelScope.launch {
             startCallUseCase(userId, type)
                 .onFailure { e -> Timber.e(e, "Failed to start call") }

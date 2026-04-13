@@ -23,6 +23,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
@@ -33,6 +34,16 @@ import com.secure.messenger.presentation.ui.settings.SettingsScreen
 
 // ── Главный экран с нижней навигацией ─────────────────────────────────────────
 
+/**
+ * Запрос на показ круглого crop-оверлея над всем HomeScreen-ом (включая нижнюю
+ * навигацию). Поднимается «снизу» из вложенных экранов через колбэк, а
+ * рендерится здесь — поверх Scaffold-а, чтобы фон полностью покрывал bottomBar.
+ */
+private data class CropRequest(
+    val bitmap: android.graphics.Bitmap,
+    val onConfirmCrop: (android.graphics.Bitmap) -> Unit,
+)
+
 @Composable
 fun HomeScreen(
     onChatClick: (chatId: String) -> Unit,
@@ -42,6 +53,9 @@ fun HomeScreen(
     // Индекс активной вкладки — сохраняется при повороте экрана
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
     var showExitDialog by rememberSaveable { mutableStateOf(false) }
+    // Активный crop-запрос. null = крепер скрыт. ProfileEditScreen вызывает
+    // setCropRequest() после выбора фото, мы рисуем оверлей в самом верху Box-а.
+    var cropRequest by remember { mutableStateOf<CropRequest?>(null) }
 
     // Кнопка «Назад»: с любой вкладки → на Чаты, с Чатов → подтверждение выхода
     BackHandler {
@@ -70,6 +84,10 @@ fun HomeScreen(
         )
     }
 
+    // Корневой Box: внутри Scaffold + сверху crop-оверлей. Box нужен чтобы
+    // оверлей мог накрыть И контент И bottom-bar Scaffold-а — сам Scaffold
+    // «забирает» bottomBar-ом часть экрана и не даёт его покрыть изнутри.
+    Box(modifier = Modifier.fillMaxSize()) {
     Scaffold(
         // Отключаем автоматическое применение window insets в HomeScreen —
         // каждый вложенный экран сам управляет своими отступами (статусбар, навбар).
@@ -123,9 +141,27 @@ fun HomeScreen(
                     showBackButton = true,
                     onBack = { selectedTab = 0 },
                     onLogout = onLogout,
+                    onRequestCrop = { bmp, onResult ->
+                        cropRequest = CropRequest(bmp, onResult)
+                    },
                 )
                 3 -> SettingsScreen(onBack = { selectedTab = 0 })
             }
+        }
+    }
+
+        // Crop-оверлей рендерится ПОВЕРХ Scaffold-а, поэтому покрывает и
+        // контент, и bottomBar — а cropper внутри сам сделает fillMaxSize().
+        val activeCropRequest = cropRequest
+        if (activeCropRequest != null) {
+            com.secure.messenger.presentation.ui.components.AvatarCropDialog(
+                sourceBitmap = activeCropRequest.bitmap,
+                onCancel = { cropRequest = null },
+                onConfirm = { cropped ->
+                    activeCropRequest.onConfirmCrop(cropped)
+                    cropRequest = null
+                },
+            )
         }
     }
 }

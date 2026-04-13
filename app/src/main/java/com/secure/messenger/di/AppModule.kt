@@ -89,8 +89,10 @@ object AppModule {
     @Singleton
     fun provideDatabase(@ApplicationContext context: Context): AppDatabase =
         Room.databaseBuilder(context, AppDatabase::class.java, "messenger.db")
-            // TODO: Replace fallbackToDestructiveMigration() with real migrations before production release.
-            //  This destroys all data on schema change — acceptable only during early development.
+            // Реальные миграции — когда у юзера уже накоплена история, ронять её
+            // на каждый ALTER TABLE недопустимо. Если миграции не хватит — fallback,
+            // чтобы не крашиться в проде.
+            .addMigrations(AppDatabase.MIGRATION_1_2)
             .fallbackToDestructiveMigration()
             .addCallback(object : androidx.room.RoomDatabase.Callback() {
                 override fun onOpen(db: androidx.sqlite.db.SupportSQLiteDatabase) {

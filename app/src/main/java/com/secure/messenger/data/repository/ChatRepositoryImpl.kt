@@ -334,14 +334,8 @@ class ChatRepositoryImpl @Inject constructor(
         } else null
 
         val entities = dtos.map { dto ->
-            val decrypted = if (dto.type == "SYSTEM") {
-                dto.encryptedContent // системные сообщения — plain text
-            } else if (sharedSecret != null) {
-                cryptoManager.decryptMessage(dto.encryptedContent, sharedSecret, dto.id)
-                    ?: "[Не удалось расшифровать]"
-            } else {
-                "[Групповые чаты не поддерживаются]"
-            }
+            val existing = messageDao.getById(dto.id)
+            val decrypted = decryptOrKeepExisting(dto, sharedSecret, existing)
             MessageEntity(
                 id = dto.id, chatId = chatId, senderId = dto.senderId,
                 encryptedContent = dto.encryptedContent, decryptedContent = decrypted,
@@ -369,12 +363,8 @@ class ChatRepositoryImpl @Inject constructor(
         } else null
 
         val entities = dtos.map { dto ->
-            val decrypted = if (dto.type == "SYSTEM") {
-                dto.encryptedContent
-            } else if (sharedSecret != null) {
-                cryptoManager.decryptMessage(dto.encryptedContent, sharedSecret, dto.id)
-                    ?: "[Не удалось расшифровать]"
-            } else "[Групповые чаты не поддерживаются]"
+            val existing = messageDao.getById(dto.id)
+            val decrypted = decryptOrKeepExisting(dto, sharedSecret, existing)
             MessageEntity(
                 id = dto.id, chatId = chatId, senderId = dto.senderId,
                 encryptedContent = dto.encryptedContent, decryptedContent = decrypted,
@@ -387,10 +377,44 @@ class ChatRepositoryImpl @Inject constructor(
         true // есть ещё сообщения
     }
 
+    /**
+     * Расшифровывает сообщение от сервера с защитой от потери уже расшифрованного
+     * текста. Если новый decrypt падает (например, собеседник сменил ключевую
+     * пару с момента отправки), а у нас в локальной БД уже есть успешно
+     * расшифрованный текст этого же сообщения — возвращаем СУЩЕСТВУЮЩИЙ. Так
+     * мы не затираем правильный исторический текст плашкой «не удалось».
+     *
+     * Без этой защиты при ре-фетче (открытие чата, syncChats, refresh)
+     * сообщения, успешно расшифрованные в прошлом, превращались в плашку
+     * «[Не удалось расшифровать]» — потому что для них больше нет валидного
+     * sharedSecret-а.
+     */
+    private fun decryptOrKeepExisting(
+        dto: com.secure.messenger.data.remote.api.dto.MessageDto,
+        sharedSecret: ByteArray?,
+        existing: MessageEntity?,
+    ): String {
+        if (dto.type == "SYSTEM") return dto.encryptedContent
+        if (sharedSecret != null) {
+            val fresh = cryptoManager.decryptMessage(dto.encryptedContent, sharedSecret, dto.id)
+            if (fresh != null) return fresh
+        }
+        // Decrypt не удался — пытаемся сохранить уже существующий текст,
+        // если он есть и не является fail-плашкой.
+        val prev = existing?.decryptedContent
+        if (!prev.isNullOrEmpty() && prev != "[Не удалось расшифровать]" && prev != "[Групповые чаты не поддерживаются]") {
+            return prev
+        }
+        return if (sharedSecret == null) "[Групповые чаты не поддерживаются]" else "[Не удалось расшифровать]"
+    }
+
     override suspend fun syncChats(myUserId: String): Result<Unit> = runCatching {
         val dtos = api.getChats().data.orEmpty()
         for (dto in dtos) {
-            // Сохраняем участников в локальную БД — нужно для шифрования и отображения
+            // Сохраняем участников в локальную БД — нужно для шифрования и отображения.
+            // isOnline у участников приходит с сервера актуальным — это второй
+            // источник правды, помимо WebSocket-событий user_status (на случай
+            // если событие было пропущено из-за реконнекта).
             dto.members?.forEach { memberDto ->
                 val existing = userDao.getById(memberDto.id)
                 userDao.upsert(UserEntity(
@@ -403,9 +427,11 @@ class ChatRepositoryImpl @Inject constructor(
                 ))
             }
 
+            val existingChat = chatDao.getById(dto.id)
+
             val otherUserId = if (dto.type == "DIRECT") {
                 dto.members?.firstOrNull { it.id != myUserId }?.id
-                    ?: chatDao.getById(dto.id)?.otherUserId
+                    ?: existingChat?.otherUserId
             } else null
 
             val otherMember = if (dto.type == "DIRECT") {
@@ -414,7 +440,7 @@ class ChatRepositoryImpl @Inject constructor(
 
             val title = if (dto.type == "DIRECT" && dto.title.isEmpty()) {
                 otherMember?.displayName
-                    ?: chatDao.getById(dto.id)?.title
+                    ?: existingChat?.title
                     ?: ""
             } else {
                 dto.title
@@ -428,6 +454,9 @@ class ChatRepositoryImpl @Inject constructor(
                 unreadCount = dto.unreadCount, isPinned = dto.isPinned, isMuted = dto.isMuted,
                 updatedAt = Instant.parse(dto.updatedAt).toEpochMilli(),
                 otherUserId = otherUserId,
+                // ВАЖНО: сохраняем флаг скрытости. Без этого синхронизация с сервера
+                // «оживляла» удалённые юзером чаты при следующем запуске приложения.
+                isHidden = existingChat?.isHidden ?: false,
             ))
         }
     }
@@ -446,8 +475,15 @@ class ChatRepositoryImpl @Inject constructor(
         chatDao.setMuted(chatId, mutedUntil != null)
     }
 
+    /**
+     * Удаление чата = soft-delete: помечаем isHidden=1.
+     * Без soft-delete syncChats() оживлял бы чат при следующей синхронизации
+     * списка с сервера (DELETE /chats endpoint-а нет, сервер ничего не знает
+     * о «скрытых» чатах). При получении нового сообщения чат снова показывается —
+     * см. IncomingMessageHandler.handle.
+     */
     override suspend fun deleteChat(chatId: String): Result<Unit> = runCatching {
-        chatDao.deleteById(chatId)
+        chatDao.hideById(chatId)
     }
 
     // ── Защита от понижения статуса при синхронизации ────────────────────────
@@ -507,10 +543,11 @@ class ChatRepositoryImpl @Inject constructor(
                 timestamp = lastMsgTimestamp ?: 0L,
                 isEdited = lastMsgIsEdited ?: false,
             )
-        }
+        },
+        isOtherOnline = otherIsOnline == true,
     )
 
-    private fun ChatEntity.toChat(lastMessage: Message? = null) = Chat(
+    private fun ChatEntity.toChat(lastMessage: Message? = null, isOtherOnline: Boolean = false) = Chat(
         id = id,
         type = ChatType.valueOf(type),
         title = title,
@@ -522,5 +559,6 @@ class ChatRepositoryImpl @Inject constructor(
         isPinned = isPinned,
         isMuted = isMuted,
         updatedAt = updatedAt,
+        isOtherOnline = isOtherOnline,
     )
 }

@@ -52,6 +52,7 @@ import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.EmojiEmotions
+import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreVert
@@ -135,6 +136,7 @@ fun ChatScreen(
     val isTyping by viewModel.isTyping.collectAsStateWithLifecycle()
     val isRecording by viewModel.isRecording.collectAsStateWithLifecycle()
     val recordingSeconds by viewModel.recordingSeconds.collectAsStateWithLifecycle()
+    val recordingWaveform by viewModel.recordingWaveform.collectAsStateWithLifecycle()
     val pendingVoice by viewModel.pendingVoice.collectAsStateWithLifecycle()
     val highlightedMessageId by viewModel.highlightedMessageId.collectAsStateWithLifecycle()
     val coroutineScope = androidx.compose.runtime.rememberCoroutineScope()
@@ -274,7 +276,15 @@ fun ChatScreen(
                         }
 
                         if (message.type == MessageType.SYSTEM) {
-                            SystemMessage(text = message.content, timestamp = message.timestamp)
+                            // Системные сообщения о звонках одинаковые на сервере для
+                            // обоих участников: "Пропущенный звонок" / "Пропущенный
+                            // видеозвонок". У звонящего это нелогично — он же сам
+                            // звонил, не пропускал. Переписываем текст с его перспективы.
+                            val displayText = displaySystemMessageText(
+                                rawText = message.content,
+                                isOwnMessage = message.senderId == currentUserId,
+                            )
+                            SystemMessage(text = displayText, timestamp = message.timestamp)
                         } else {
                             val isOutgoing = message.senderId == currentUserId
                             // Найти цитируемое сообщение в текущем списке (если оно ещё на странице)
@@ -315,6 +325,7 @@ fun ChatScreen(
                 showEmojiPicker = uiState.showEmojiPicker,
                 isRecording = isRecording,
                 recordingSeconds = recordingSeconds,
+                recordingWaveform = recordingWaveform,
                 onTextChange = viewModel::onInputChange,
                 onSend = viewModel::sendMessage,
                 onCancelEdit = viewModel::cancelEditing,
@@ -514,6 +525,25 @@ private fun DateSeparator(timestamp: Long) {
                 .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.85f))
                 .padding(horizontal = 12.dp, vertical = 4.dp),
         )
+    }
+}
+
+/**
+ * Перерасчёт текста системного сообщения с учётом перспективы текущего юзера.
+ *
+ * Сервер кладёт в БД одну строку для обоих участников звонка ("Пропущенный
+ * звонок"), но звонящему такое формулирование некорректно — он не пропускал,
+ * это он звонил и не дозвонился. Для звонящего меняем на "Звонок без ответа".
+ *
+ * Текст «Звонок · 1:23» / «Звонок отклонён» / «Видеозвонок · 0:14» оставляем
+ * как есть — они одинаково подходят обоим.
+ */
+private fun displaySystemMessageText(rawText: String, isOwnMessage: Boolean): String {
+    if (!isOwnMessage) return rawText
+    return when {
+        rawText == "Пропущенный Звонок"      -> "Звонок без ответа"
+        rawText == "Пропущенный Видеозвонок" -> "Видеозвонок без ответа"
+        else                                  -> rawText
     }
 }
 
@@ -1118,10 +1148,13 @@ private fun ImageMessageContent(
     val context = androidx.compose.ui.platform.LocalContext.current
 
     if (imageData == null) {
-        Text(
-            text = "[не удалось загрузить картинку]",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.error,
+        // Заглушка для битого / отсутствующего payload-а: показываем плашку
+        // вместо красного текста об ошибке. Картинка может быть «недоступна»
+        // если: payload пришёл повреждённым, JSON не парсится, base64 битый.
+        // Размер совпадает с обычной картинкой, чтобы пузырь не «прыгал».
+        ImagePlaceholder(
+            modifier = Modifier.size(220.dp, 160.dp),
+            label = "Изображение недоступно",
         )
         return
     }
@@ -1179,40 +1212,96 @@ private fun ImageMessageContent(
                 .build()
         } else null
     }
-    coil.compose.AsyncImage(
-        model = animationModel ?: imageData.bytes,
-        contentDescription = if (imageData.isSticker) "Стикер" else "Картинка",
-        contentScale = if (isAnimation) ContentScale.Crop else ContentScale.Fit,
-        modifier = Modifier
-            .then(sizeModifier)
-            // Скругления у всех кроме статичных стикеров — у стикеров своя
-            // прозрачная форма, которую clip искажает. Анимации теперь
-            // кадрированы через Crop (фиксированный квадрат), так что
-            // скруглять можно безопасно.
-            .then(
-                if (imageData.isSticker && !isAnimation) Modifier
-                else Modifier.clip(RoundedCornerShape(14.dp))
-            )
-            .pointerInput(imageData.isSticker, isAnimation) {
-                detectTapGestures(
-                    onTap = when {
-                        // Тап по анимации перезапускает 3 цикла
-                        isAnimation -> { _ -> animationPlay++ }
-                        // Тап по обычной картинке открывает fullscreen
-                        !imageData.isSticker -> { _ -> fullscreenOpen = true }
-                        // Статичные стикеры — тап ничего не делает
-                        else -> null
-                    },
-                    onLongPress = onLongPress,
+    // Если Coil не смог декодировать байты (битый формат / неподдерживаемый
+    // кодек) — показываем плашку-заглушку вместо «битой иконки» по умолчанию.
+    var loadFailed by remember(payload) { mutableStateOf(false) }
+
+    if (loadFailed) {
+        ImagePlaceholder(
+            modifier = Modifier
+                .then(sizeModifier)
+                .pointerInput(Unit) {
+                    detectTapGestures(onLongPress = onLongPress)
+                },
+            label = "Изображение недоступно",
+        )
+    } else {
+        coil.compose.AsyncImage(
+            model = animationModel ?: imageData.bytes,
+            contentDescription = if (imageData.isSticker) "Стикер" else "Картинка",
+            contentScale = if (isAnimation) ContentScale.Crop else ContentScale.Fit,
+            onError = { loadFailed = true },
+            modifier = Modifier
+                .then(sizeModifier)
+                // Скругления у всех кроме статичных стикеров — у стикеров своя
+                // прозрачная форма, которую clip искажает. Анимации теперь
+                // кадрированы через Crop (фиксированный квадрат), так что
+                // скруглять можно безопасно.
+                .then(
+                    if (imageData.isSticker && !isAnimation) Modifier
+                    else Modifier.clip(RoundedCornerShape(14.dp))
                 )
-            },
-    )
+                .pointerInput(imageData.isSticker, isAnimation) {
+                    detectTapGestures(
+                        onTap = when {
+                            // Тап по анимации перезапускает 3 цикла
+                            isAnimation -> { _ -> animationPlay++ }
+                            // Тап по обычной картинке открывает fullscreen
+                            !imageData.isSticker -> { _ -> fullscreenOpen = true }
+                            // Статичные стикеры — тап ничего не делает
+                            else -> null
+                        },
+                        onLongPress = onLongPress,
+                    )
+                },
+        )
+    }
 
     if (fullscreenOpen && !imageData.isSticker) {
         FullscreenImageViewer(
             imageBytes = imageData.bytes,
             onDismiss = { fullscreenOpen = false },
         )
+    }
+}
+
+// ── Заглушка для битой/недоступной картинки ──────────────────────────────────
+
+/**
+ * Плашка-заглушка вместо красного текста об ошибке. Показывается:
+ *  - когда ImageCodec.decode не смог распарсить payload
+ *  - когда Coil не смог декодировать байты (битый формат)
+ * Стиль — нейтральная карточка с иконкой «сломанного фото» по центру.
+ */
+@Composable
+private fun ImagePlaceholder(
+    modifier: Modifier = Modifier,
+    label: String,
+) {
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            Icon(
+                imageVector = Icons.Default.Image,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                modifier = Modifier.size(36.dp),
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            )
+        }
     }
 }
 
@@ -1324,6 +1413,7 @@ private fun MessageInputBar(
     showEmojiPicker: Boolean,
     isRecording: Boolean,
     recordingSeconds: Int,
+    recordingWaveform: IntArray,
     onTextChange: (String) -> Unit,
     onSend: () -> Unit,
     onCancelEdit: () -> Unit,
@@ -1359,34 +1449,33 @@ private fun MessageInputBar(
                 )
             }
 
-            // Если идёт запись — показываем индикатор записи вместо обычного инпута
-            if (isRecording) {
-                RecordingBar(
-                    seconds = recordingSeconds,
-                    onCancel = { onStopRecording(true) },
-                    onSend = { onStopRecording(false) },
-                )
-            } else {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(
-                            start = 8.dp,
-                            end = 8.dp,
-                            top = 8.dp,
-                            // Когда панель эмоджи открыта — убираем нижний отступ,
-                            // чтобы инпут и панель были визуально одним блоком
-                            bottom = if (showEmojiPicker) 0.dp else 8.dp,
-                        )
-                        .then(
-                            // Когда панель эмоджи открыта — её padding обрабатывает
-                            // системную навигацию, не дублируем здесь
-                            if (showEmojiPicker) Modifier.imePadding()
-                            else Modifier.navigationBarsPadding().imePadding()
-                        ),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    // Кнопка эмоджи слева
+            // Row не убираем при isRecording — иначе кнопка микрофона уходит из
+            // композиции, pointerInput умирает и волны вокруг пальца негде
+            // рисовать. Вместо этого подменяем содержимое инпута на индикатор
+            // записи (красный кружок + таймер + «Отпустите для отправки»),
+            // а сам микрофон остаётся на своём месте — палец на нём, волны
+            // вокруг него рисуются.
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(
+                        start = 8.dp,
+                        end = 8.dp,
+                        top = 8.dp,
+                        // Когда панель эмоджи открыта — убираем нижний отступ,
+                        // чтобы инпут и панель были визуально одним блоком
+                        bottom = if (showEmojiPicker) 0.dp else 8.dp,
+                    )
+                    .then(
+                        // Когда панель эмоджи открыта — её padding обрабатывает
+                        // системную навигацию, не дублируем здесь
+                        if (showEmojiPicker) Modifier.imePadding()
+                        else Modifier.navigationBarsPadding().imePadding()
+                    ),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                // Кнопка эмоджи слева — во время записи скрываем
+                if (!isRecording) {
                     IconButton(
                         onClick = onToggleEmoji,
                         modifier = Modifier.size(42.dp),
@@ -1399,7 +1488,20 @@ private fun MessageInputBar(
                             modifier = Modifier.size(24.dp),
                         )
                     }
+                }
 
+                if (isRecording) {
+                    // Полоска записи на месте инпута: красный «дышащий» кружок +
+                    // таймер + живая waveform-волна, реагирующая на громкость.
+                    RecordingInlineIndicator(
+                        seconds = recordingSeconds,
+                        amplitudes = recordingWaveform,
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 46.dp)
+                            .padding(horizontal = 4.dp),
+                    )
+                } else {
                     // RichInputField оборачивает AppCompatEditText через AndroidView —
                     // это даёт реальную поддержку commitContent от Gboard (стикеры/гифы),
                     // которой нет в BasicTextField (его contentReceiver не пробрасывает
@@ -1430,57 +1532,33 @@ private fun MessageInputBar(
                             modifier = Modifier.size(22.dp),
                         )
                     }
+                }
 
-                    // Кнопка отправки (если есть текст) или микрофон-удержание (если пусто)
-                    if (text.isNotEmpty()) {
-                        Box(
-                            modifier = Modifier
-                                .size(46.dp)
-                                .clip(CircleShape)
-                                .background(MaterialTheme.colorScheme.primary)
-                                .clickable(onClick = onSend),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.Send,
-                                contentDescription = "Отправить",
-                                tint = MaterialTheme.colorScheme.onPrimary,
-                                modifier = Modifier.size(20.dp),
-                            )
-                        }
-                    } else {
-                        // Hold-to-record как в Telegram: записываем пока палец удерживается,
-                        // отпустили — отправили; уехали пальцем вверх (отмена) — не реализовано
-                        // в этой версии, можно отменить кнопкой корзины в RecordingBar.
-                        Box(
-                            modifier = Modifier
-                                .size(46.dp)
-                                .clip(CircleShape)
-                                .background(MaterialTheme.colorScheme.primary)
-                                .pointerInput(Unit) {
-                                    awaitEachGesture {
-                                        // Ждём первое касание → начало записи
-                                        awaitFirstDown(requireUnconsumed = false)
-                                        onStartRecording()
-                                        // Ждём отпускание пальца → стоп → откроется модалка превью
-                                        var allReleased = false
-                                        while (!allReleased) {
-                                            val event = awaitPointerEvent()
-                                            allReleased = event.changes.none { it.pressed }
-                                        }
-                                        onStopRecording(false)
-                                    }
-                                },
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Mic,
-                                contentDescription = "Удерживайте для записи",
-                                tint = MaterialTheme.colorScheme.onPrimary,
-                                modifier = Modifier.size(22.dp),
-                            )
-                        }
+                // Кнопка отправки (если есть текст) или микрофон-удержание (если пусто).
+                // Микрофон остаётся в дереве и во время записи — иначе pointer
+                // up-event теряется и волны исчезают.
+                if (text.isNotEmpty() && !isRecording) {
+                    Box(
+                        modifier = Modifier
+                            .size(46.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.primary)
+                            .clickable(onClick = onSend),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.Send,
+                            contentDescription = "Отправить",
+                            tint = MaterialTheme.colorScheme.onPrimary,
+                            modifier = Modifier.size(20.dp),
+                        )
                     }
+                } else {
+                    HoldToRecordMicButton(
+                        isRecording = isRecording,
+                        onStart = onStartRecording,
+                        onStop = { onStopRecording(false) },
+                    )
                 }
             }
 
@@ -1561,43 +1639,150 @@ private fun InputContextBar(
     }
 }
 
-// ── Полоска записи голосового ─────────────────────────────────────────────────
+// ── Кнопка «удерживайте для записи» с пульсирующими волнами ──────────────────
 
+/**
+ * Кнопка микрофона: пока палец на иконке — идёт запись, вокруг кнопки
+ * крутятся пульсирующие волны (как в Telegram). Отпустили палец — стоп.
+ *
+ * Жесты ловим через [pointerInput] + awaitFirstDown / awaitPointerEvent —
+ * это надёжнее clickable + ACTION_UP, который часто терялся при свайпах.
+ *
+ * Анимация:
+ *  - 3 концентрических круга расходятся наружу с задержками 0/300/600 мс
+ *  - используется единый infiniteTransition, чтобы гарантировать совпадение фаз
+ *  - кнопка чуть увеличивается (scale 1.0 → 1.08) пока запись активна
+ */
 @Composable
-private fun RecordingBar(
-    seconds: Int,
-    onCancel: () -> Unit,
-    onSend: () -> Unit,
+private fun HoldToRecordMicButton(
+    isRecording: Boolean,
+    onStart: () -> Unit,
+    onStop: () -> Unit,
 ) {
-    val pulse by androidx.compose.animation.core.rememberInfiniteTransition(label = "rec_pulse")
+    val infiniteTransition = androidx.compose.animation.core.rememberInfiniteTransition(label = "mic_pulse")
+    // Три волны с разными задержками — расширяются от 1.0 до 2.4 от размера
+    // кнопки, прозрачность плавно уходит в 0.
+    val waveSpec = androidx.compose.animation.core.infiniteRepeatable<Float>(
+        animation = androidx.compose.animation.core.tween(1500, easing = androidx.compose.animation.core.LinearOutSlowInEasing),
+        repeatMode = androidx.compose.animation.core.RepeatMode.Restart,
+    )
+    val wave1 by infiniteTransition.animateFloat(0f, 1f, waveSpec, label = "w1")
+    val wave2 by infiniteTransition.animateFloat(
+        0f, 1f,
+        androidx.compose.animation.core.infiniteRepeatable(
+            animation = androidx.compose.animation.core.tween(1500, delayMillis = 500, easing = androidx.compose.animation.core.LinearOutSlowInEasing),
+            repeatMode = androidx.compose.animation.core.RepeatMode.Restart,
+        ),
+        label = "w2",
+    )
+    val wave3 by infiniteTransition.animateFloat(
+        0f, 1f,
+        androidx.compose.animation.core.infiniteRepeatable(
+            animation = androidx.compose.animation.core.tween(1500, delayMillis = 1000, easing = androidx.compose.animation.core.LinearOutSlowInEasing),
+            repeatMode = androidx.compose.animation.core.RepeatMode.Restart,
+        ),
+        label = "w3",
+    )
+    // Лёгкий «вдох» самой кнопки во время записи
+    val scale by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = if (isRecording) 1.12f else 1f,
+        animationSpec = androidx.compose.animation.core.spring(
+            dampingRatio = androidx.compose.animation.core.Spring.DampingRatioMediumBouncy,
+        ),
+        label = "mic_scale",
+    )
+
+    val primaryColor = MaterialTheme.colorScheme.primary
+
+    Box(
+        modifier = Modifier.size(72.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        // Рисуем волны только когда идёт запись — иначе кнопка спокойная
+        if (isRecording) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val baseRadius = size.minDimension * 0.28f // ~46dp / 2
+                val maxRadius = size.minDimension * 0.5f
+                fun drawWave(progress: Float) {
+                    val radius = baseRadius + (maxRadius - baseRadius) * progress * 1.6f
+                    val alpha = (1f - progress).coerceIn(0f, 1f) * 0.55f
+                    drawCircle(
+                        color = primaryColor.copy(alpha = alpha),
+                        radius = radius,
+                        center = center,
+                    )
+                }
+                drawWave(wave1)
+                drawWave(wave2)
+                drawWave(wave3)
+            }
+        }
+
+        Box(
+            modifier = Modifier
+                .size(46.dp)
+                .graphicsLayer { scaleX = scale; scaleY = scale }
+                .clip(CircleShape)
+                .background(
+                    if (isRecording) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.primary
+                )
+                .pointerInput(Unit) {
+                    awaitEachGesture {
+                        awaitFirstDown(requireUnconsumed = false)
+                        onStart()
+                        var allReleased = false
+                        while (!allReleased) {
+                            val event = awaitPointerEvent()
+                            allReleased = event.changes.none { it.pressed }
+                        }
+                        onStop()
+                    }
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = Icons.Default.Mic,
+                contentDescription = "Удерживайте для записи",
+                tint = MaterialTheme.colorScheme.onPrimary,
+                modifier = Modifier.size(22.dp),
+            )
+        }
+    }
+}
+
+// ── Компактный индикатор записи (на месте инпута) ────────────────────────────
+
+/**
+ * Показывается на месте текстового инпута пока пользователь держит палец на
+ * микрофоне. Красный «дышащий» кружок + таймер + живая waveform-волна,
+ * реагирующая на громкость микрофона. Сама кнопка микрофона остаётся справа
+ * в Row-е и слушает pointer-события.
+ */
+@Composable
+private fun RecordingInlineIndicator(
+    seconds: Int,
+    amplitudes: IntArray,
+    modifier: Modifier = Modifier,
+) {
+    val pulse by androidx.compose.animation.core.rememberInfiniteTransition(label = "rec_dot_pulse")
         .animateFloat(
-            initialValue = 0.3f,
+            initialValue = 0.35f,
             targetValue = 1f,
             animationSpec = androidx.compose.animation.core.infiniteRepeatable(
                 animation = androidx.compose.animation.core.tween(700),
                 repeatMode = androidx.compose.animation.core.RepeatMode.Reverse,
             ),
-            label = "pulse",
+            label = "rec_dot_alpha",
         )
+    val accent = MaterialTheme.colorScheme.primary
     Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 12.dp)
-            .navigationBarsPadding(),
+        modifier = modifier
+            .clip(RoundedCornerShape(24.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(horizontal = 14.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        IconButton(
-            onClick = onCancel,
-            modifier = Modifier.size(42.dp),
-        ) {
-            Icon(
-                Icons.Default.Delete,
-                contentDescription = "Отменить запись",
-                tint = MaterialTheme.colorScheme.error,
-            )
-        }
-        Spacer(modifier = Modifier.width(8.dp))
-        // Красный мигающий индикатор
         Box(
             modifier = Modifier
                 .size(12.dp)
@@ -1606,28 +1791,75 @@ private fun RecordingBar(
         )
         Spacer(modifier = Modifier.width(10.dp))
         Text(
-            text = "Запись · ${formatVoiceDuration(seconds)}",
+            text = formatVoiceDuration(seconds),
             color = MaterialTheme.colorScheme.onSurface,
-            style = MaterialTheme.typography.bodyMedium,
             fontWeight = FontWeight.Medium,
-            modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.bodyMedium,
         )
-        IconButton(
-            onClick = onSend,
+        Spacer(modifier = Modifier.width(12.dp))
+        // Живая waveform-волна — последние ~40 сэмплов амплитуды плывут справа
+        // налево, новые приходят справа. Высота каждого бара = sqrt(amp/MAX),
+        // sqrt-шкала смягчает разницу между тихим и громким голосом.
+        LiveWaveform(
+            amplitudes = amplitudes,
+            color = accent,
             modifier = Modifier
-                .size(46.dp)
-                .clip(CircleShape)
-                .background(MaterialTheme.colorScheme.primary),
-        ) {
-            Icon(
-                imageVector = Icons.AutoMirrored.Filled.Send,
-                contentDescription = "Отправить",
-                tint = MaterialTheme.colorScheme.onPrimary,
-                modifier = Modifier.size(20.dp),
+                .weight(1f)
+                .height(28.dp),
+        )
+    }
+}
+
+/**
+ * Canvas-волна из вертикальных баров. Отображает последние [BAR_COUNT] значений
+ * амплитуды; новый сэмпл появляется справа, старый уходит слева. Если данных
+ * меньше BAR_COUNT — слева остаются «тихие» бары минимальной высоты.
+ *
+ * Нормализация: maxAmplitude у MediaRecorder может доходить до ~32767, но
+ * обычная речь редко выходит за 8000–15000 — поэтому делим на 16000 + sqrt
+ * чтобы голос «играл» по высоте, а не плющился к минимуму.
+ */
+@Composable
+private fun LiveWaveform(
+    amplitudes: IntArray,
+    color: Color,
+    modifier: Modifier = Modifier,
+) {
+    val barCount = 40
+    Canvas(modifier = modifier) {
+        val totalWidth = size.width
+        val maxBarHeight = size.height
+        val gap = 2.dp.toPx()
+        val barWidth = ((totalWidth - gap * (barCount - 1)) / barCount).coerceAtLeast(1f)
+        val cornerRadius = androidx.compose.ui.geometry.CornerRadius(barWidth / 2f, barWidth / 2f)
+        val minBar = maxBarHeight * 0.15f
+
+        // Берём последние barCount значений; если меньше — добиваем нулями слева
+        val visible = if (amplitudes.size >= barCount) {
+            amplitudes.copyOfRange(amplitudes.size - barCount, amplitudes.size)
+        } else {
+            IntArray(barCount - amplitudes.size) + amplitudes
+        }
+
+        for (i in 0 until barCount) {
+            val raw = visible[i].coerceAtLeast(0)
+            val norm = (raw / 16_000f).coerceIn(0f, 1f)
+            val scaled = kotlin.math.sqrt(norm) // более «живая» шкала
+            val barHeight = (minBar + (maxBarHeight - minBar) * scaled).coerceAtMost(maxBarHeight)
+            val x = i * (barWidth + gap)
+            val y = (maxBarHeight - barHeight) / 2f
+            // Старые бары (слева) чуть прозрачнее — даёт ощущение «уплывания»
+            val alpha = 0.5f + 0.5f * (i.toFloat() / barCount)
+            drawRoundRect(
+                color = color.copy(alpha = alpha),
+                topLeft = androidx.compose.ui.geometry.Offset(x, y),
+                size = androidx.compose.ui.geometry.Size(barWidth, barHeight),
+                cornerRadius = cornerRadius,
             )
         }
     }
 }
+
 
 // ── Диалог профиля пользователя ──────────────────────────────────────────────
 

@@ -11,9 +11,12 @@ import com.secure.messenger.data.remote.api.MessengerApi
 import com.secure.messenger.data.remote.websocket.SignalingMessage
 import com.secure.messenger.domain.model.MessageStatus
 import com.secure.messenger.domain.model.MessageType
+import com.secure.messenger.domain.repository.AuthRepository
 import com.secure.messenger.utils.CryptoManager
 import com.secure.messenger.utils.LocalKeyStore
 import com.squareup.moshi.Moshi
+import dagger.Lazy
+import kotlinx.coroutines.flow.first
 import java.time.Instant
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -38,8 +41,15 @@ class IncomingMessageHandler @Inject constructor(
     private val cryptoManager: CryptoManager,
     private val localKeyStore: LocalKeyStore,
     private val moshi: Moshi,
+    // Lazy чтобы избежать циклической зависимости (AuthRepository не должна
+    // тащить за собой весь handler в свой граф инициализации).
+    private val authRepository: Lazy<AuthRepository>,
 ) {
     private val adapter = moshi.adapter(SignalingMessage::class.java)
+
+    /** Возвращает UUID текущего пользователя (или null если не авторизован). */
+    private suspend fun currentUserIdSync(): String? =
+        runCatching { authRepository.get().currentUser.first()?.id }.getOrNull()
 
     /**
      * Разбирает, расшифровывает и сохраняет входящее WebSocket-сообщение.
@@ -63,14 +73,18 @@ class IncomingMessageHandler @Inject constructor(
             if (messageDao.getById(messageId) != null) return null
 
             // Системные сообщения (звонки и т.д.) — сохраняем как есть, без расшифровки.
-            // senderId на сервере хранится как реальный UUID (например, звонящего),
-            // потому что messages.sender_id NOT NULL с FK на users. На клиенте
-            // системные распознаются по type=SYSTEM, конкретный senderId не важен.
+            // senderId на сервере хранится как UUID звонящего: для случая «пропущенный
+            // звонок» это caller. Если caller — это я, то такое сообщение пришло
+            // ко мне как звонящему (я же сам звонил, не пропускал). UI ChatScreen
+            // переписывает текст («Звонок без ответа»), а здесь — НЕ инкрементим
+            // unread-счётчик: иначе у звонящего висел бы +1 непрочитанный за свой
+            // же исходящий неудачный вызов.
             if (msgType == "SYSTEM") {
                 val timestamp = (payload["timestamp"] as? String)?.let {
                     try { Instant.parse(it).toEpochMilli() } catch (_: Exception) { System.currentTimeMillis() }
                 } ?: System.currentTimeMillis()
-                if (chatDao.getById(chatId) != null) {
+                val myId = currentUserIdSync()
+                if (chatDao.getById(chatId) != null && senderId != myId) {
                     chatDao.incrementUnread(chatId, timestamp)
                 }
                 messageDao.upsert(MessageEntity(
@@ -99,7 +113,8 @@ class IncomingMessageHandler @Inject constructor(
             }
 
             // Убеждаемся, что чат существует в локальной БД для отображения в UI
-            if (chatDao.getById(chatId) == null) {
+            val existingChat = chatDao.getById(chatId)
+            if (existingChat == null) {
                 chatDao.upsert(ChatEntity(
                     id = chatId, type = "DIRECT",
                     title = sender.displayName,
@@ -110,6 +125,11 @@ class IncomingMessageHandler @Inject constructor(
                     otherUserId = senderId,
                 ))
             } else {
+                // Если чат был скрыт пользователем — разспрятываем при новом сообщении.
+                // Это даёт «второй шанс»: если отправитель снова пишет — чат снова виден.
+                if (existingChat.isHidden) {
+                    chatDao.unhideById(chatId)
+                }
                 // Инкрементируем счётчик непрочитанных и обновляем timestamp
                 chatDao.incrementUnread(chatId, System.currentTimeMillis())
             }
@@ -195,6 +215,52 @@ class IncomingMessageHandler @Inject constructor(
     /** Обновляет онлайн-статус пользователя в локальной БД. */
     suspend fun handleUserStatus(userId: String, isOnline: Boolean) {
         userDao.updateOnlineStatus(userId, isOnline, System.currentTimeMillis())
+    }
+
+    /**
+     * Обрабатывает событие user_updated от сервера: чат-партнёр поменял свой
+     * профиль (имя/аватар/bio). Обновляем UserEntity в локальной БД, плюс
+     * синхронно подтягиваем avatarUrl у direct-чатов с этим юзером — иначе
+     * в списке чатов аватар продолжит показываться старый (он копируется в
+     * ChatEntity при syncChats и не обновляется автоматически).
+     */
+    suspend fun handleUserUpdated(userId: String, payload: Map<String, Any?>) {
+        val existing = userDao.getById(userId)
+        val phone       = payload["phone"]       as? String ?: existing?.phone ?: ""
+        val username    = payload["username"]    as? String ?: existing?.username ?: ""
+        val displayName = payload["displayName"] as? String ?: existing?.displayName ?: ""
+        val avatarUrl   = payload["avatarUrl"]   as? String
+        val bio         = payload["bio"]         as? String
+        val isOnline    = payload["isOnline"]    as? Boolean ?: existing?.isOnline ?: false
+        val publicKey   = payload["publicKey"]   as? String ?: existing?.publicKey ?: ""
+        val lastSeenStr = payload["lastSeen"]    as? String
+        val lastSeen    = lastSeenStr?.let {
+            runCatching { Instant.parse(it).toEpochMilli() }.getOrNull()
+        } ?: existing?.lastSeen ?: System.currentTimeMillis()
+
+        userDao.upsert(UserEntity(
+            id = userId,
+            phone = phone,
+            username = username,
+            displayName = displayName,
+            avatarUrl = avatarUrl,
+            bio = bio,
+            isOnline = isOnline,
+            lastSeen = lastSeen,
+            publicKey = publicKey,
+            isContact = existing?.isContact ?: false,
+        ))
+
+        // Обновляем avatarUrl и title у direct-чата с этим юзером — chat list
+        // рендерит аватар из ChatEntity, а не из UserEntity, поэтому без этого
+        // апдейта в списке чатов аватар оставался бы старый.
+        val chat = chatDao.getByOtherUserId(userId)
+        if (chat != null) {
+            val newTitle = if (chat.title.isEmpty() || chat.title == existing?.displayName) {
+                displayName
+            } else chat.title
+            chatDao.upsert(chat.copy(title = newTitle, avatarUrl = avatarUrl ?: chat.avatarUrl))
+        }
     }
 
     /** Помечает все сообщения от других пользователей в чате как READ, когда собеседник открывает чат. */

@@ -5,6 +5,7 @@ import android.util.Base64
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.secure.messenger.data.repository.OtpCooldownException
+import com.secure.messenger.data.repository.OtpVerifyException
 import com.secure.messenger.di.AuthTokenProvider
 import com.secure.messenger.domain.repository.AuthRepository
 import com.secure.messenger.utils.CryptoManager
@@ -238,7 +239,29 @@ class AuthViewModel @Inject constructor(
                     onSuccess(isNewUser)
                 }
                 .onFailure { e ->
-                    _uiState.value = _uiState.value.copy(error = e.message)
+                    when {
+                        e is OtpVerifyException && e.errorCode == "too_many_attempts" -> {
+                            // Лимит попыток исчерпан — очищаем поле, чтобы юзер
+                            // не пытался долбить тот же код, и сообщение явно
+                            // намекает запросить новый.
+                            _uiState.value = _uiState.value.copy(
+                                otp = "",
+                                error = e.message,
+                            )
+                        }
+                        e is OtpVerifyException && e.errorCode == "invalid_code" -> {
+                            // Неверный код — чистим поле, чтобы было удобно
+                            // ввести заново. Сообщение от сервера содержит
+                            // оставшееся число попыток.
+                            _uiState.value = _uiState.value.copy(
+                                otp = "",
+                                error = e.message,
+                            )
+                        }
+                        else -> {
+                            _uiState.value = _uiState.value.copy(error = e.message)
+                        }
+                    }
                 }
 
             _uiState.value = _uiState.value.copy(isLoading = false)

@@ -16,4 +16,8 @@ data class ChatWithLastMessage(
     @ColumnInfo(name = "lastMsgStatus")   val lastMsgStatus: String?,
     @ColumnInfo(name = "lastMsgTimestamp")val lastMsgTimestamp: Long?,
     @ColumnInfo(name = "lastMsgIsEdited") val lastMsgIsEdited: Boolean?,
+    // Онлайн-статус собеседника для DIRECT-чатов — JOIN с таблицей users.
+    // Нужен в списке чатов: «зелёный кружок» на аватарке. Без JOIN-а пришлось
+    // бы строить отдельный Flow и мерджить с чатами в ViewModel-е.
+    @ColumnInfo(name = "otherIsOnline")   val otherIsOnline: Boolean?,
 )

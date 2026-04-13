@@ -82,6 +82,10 @@ fun ProfileEditScreen(
     onBack: () -> Unit,
     onLogout: () -> Unit,
     showBackButton: Boolean = true,
+    // Колбэк к родителю (HomeScreen) — поднимаем запрос на кроп туда, чтобы
+    // оверлей мог покрыть И bottomBar Scaffold-а. Локально (внутри ProfileEditScreen)
+    // оверлей был ограничен content area Scaffold-а и не доходил до нижней навигации.
+    onRequestCrop: (Bitmap, (Bitmap) -> Unit) -> Unit = { _, _ -> },
     viewModel: ProfileEditViewModel = hiltViewModel(),
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
@@ -92,18 +96,28 @@ fun ProfileEditScreen(
     val sheetState = rememberModalBottomSheetState()
     val scope = rememberCoroutineScope()
 
+    // Общий колбэк после успешного кропа: уже квадратный 512×512 bitmap
+    // упаковываем в JPEG и грузим на сервер.
+    val onCroppedReady: (Bitmap) -> Unit = { cropped ->
+        viewModel.uploadAvatar(cropped.toJpegBytes(), "jpg")
+    }
+
     // ── Лаунчер галереи ──────────────────────────────────────────────────────
+    // После выбора картинки поднимаем запрос на кроп в HomeScreen — там
+    // оверлей рисуется ВЫШЕ Scaffold-а и накрывает в т.ч. bottomBar.
     val galleryLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         uri ?: return@rememberLauncherForActivityResult
         val raw = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            ImageDecoder.decodeBitmap(ImageDecoder.createSource(context.contentResolver, uri))
+            ImageDecoder.decodeBitmap(ImageDecoder.createSource(context.contentResolver, uri)) { decoder, _, _ ->
+                decoder.isMutableRequired = true
+            }
         } else {
             @Suppress("DEPRECATION")
             MediaStore.Images.Media.getBitmap(context.contentResolver, uri)
         }
-        viewModel.uploadAvatar(raw.prepareForUpload().toJpegBytes(), "jpg")
+        onRequestCrop(raw, onCroppedReady)
     }
 
     // ── Лаунчер камеры ─────────────────────────────────────────────────────
@@ -111,7 +125,7 @@ fun ProfileEditScreen(
         ActivityResultContracts.TakePicturePreview()
     ) { bitmap: Bitmap? ->
         bitmap ?: return@rememberLauncherForActivityResult
-        viewModel.uploadAvatar(bitmap.prepareForUpload().toJpegBytes(), "jpg")
+        onRequestCrop(bitmap, onCroppedReady)
     }
 
     // ── Лаунчер разрешения камеры ─────────────────────────────────────────

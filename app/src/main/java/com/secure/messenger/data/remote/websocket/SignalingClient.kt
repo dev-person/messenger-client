@@ -32,6 +32,8 @@ sealed class SignalingEvent {
     data class MessagesRead(val chatId: String, val readerId: String) : SignalingEvent()
     data class UserStatus(val userId: String, val isOnline: Boolean) : SignalingEvent()
     data class Typing(val chatId: String, val userId: String) : SignalingEvent()
+    /** Профиль чат-партнёра обновился (имя, аватар и т.д.) — payload это полный UserDto. */
+    data class UserUpdated(val userId: String, val payload: Map<String, Any?>) : SignalingEvent()
     object Connected : SignalingEvent()
     object Disconnected : SignalingEvent()
 }
@@ -178,6 +180,10 @@ class SignalingClient @Inject constructor(
             "user_status" -> SignalingEvent.UserStatus(
                 userId = payload["userId"] as? String ?: return,
                 isOnline = payload["isOnline"] as? Boolean ?: false,
+            )
+            "user_updated" -> SignalingEvent.UserUpdated(
+                userId = payload["id"] as? String ?: return,
+                payload = payload,
             )
             "typing" -> SignalingEvent.Typing(
                 chatId = payload["chatId"] as? String ?: return,

@@ -93,13 +93,38 @@ class FcmService : FirebaseMessagingService() {
                     showMessageNotification(data)
                 }
             }
-            "incoming_call" -> showCallNotification(data)
+            "incoming_call" -> {
+                // Дополнительная защита от «фантомных» звонков: даже если
+                // Google FCM проигнорировал TTL=60s и доставил старый push,
+                // мы сами отбрасываем всё что старше 60 секунд по timestamp
+                // в payload (sentAt). Фантомы случаются когда юзер был долго
+                // оффлайн и Google копил пуши.
+                if (!isFreshPush(data, maxAgeSeconds = 60)) {
+                    return
+                }
+                showCallNotification(data)
+            }
             "missed_call" -> {
                 if (!com.secure.messenger.MessengerApp.isInForeground) {
+                    // Пропущенные звонки актуальны до часа — старше уже мусор.
+                    if (!isFreshPush(data, maxAgeSeconds = 3600)) {
+                        return
+                    }
                     showMissedCallNotification(data)
                 }
             }
         }
+    }
+
+    /**
+     * Проверяет, что push не «протух»: разница между сейчас и `sentAt`
+     * в payload меньше [maxAgeSeconds]. Если поля sentAt нет — считаем
+     * push свежим (для совместимости со старыми клиентами/серверами).
+     */
+    private fun isFreshPush(data: Map<String, String>, maxAgeSeconds: Long): Boolean {
+        val sentAt = data["sentAt"]?.toLongOrNull() ?: return true
+        val ageSeconds = (System.currentTimeMillis() / 1000L) - sentAt
+        return ageSeconds in 0..maxAgeSeconds
     }
 
     // ── Показ уведомлений ─────────────────────────────────────────────────────
@@ -188,7 +213,7 @@ class FcmService : FirebaseMessagingService() {
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setAutoCancel(true)
-            .setTimeoutAfter(45_000L)
+            .setTimeoutAfter(5 * 60_000L)
             .build()
 
         NotificationManagerCompat.from(this)

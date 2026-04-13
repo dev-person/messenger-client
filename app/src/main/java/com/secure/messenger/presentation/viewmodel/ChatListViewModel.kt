@@ -56,9 +56,36 @@ class ChatListViewModel @Inject constructor(
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
 
+    // Флаг «первой загрузки» — true пока syncChats() не отработал хотя бы раз.
+    // Используется в UI для показа скелетон-плейсхолдеров вместо «Нет чатов»
+    // при пустом списке: иначе при первом запуске мелькает заглушка пустого
+    // состояния, потом резко появляются реальные чаты.
+    private val _isInitialLoading = MutableStateFlow(true)
+    val isInitialLoading: StateFlow<Boolean> = _isInitialLoading.asStateFlow()
+
     init {
         syncChats()
         observeTyping()
+        // При каждом восстановлении WebSocket-соединения — повторно синхронизируем
+        // список чатов. Это обновляет онлайн-статус собеседников: пока WS был
+        // отключён, события user_status могли быть пропущены, а сервер при
+        // GET /chats возвращает актуальные is_online из БД.
+        observeReconnect()
+    }
+
+    private fun observeReconnect() {
+        viewModelScope.launch {
+            // Пропускаем самое первое значение (false до подключения), реагируем
+            // только на переход из false → true.
+            var prev = signalingClient.isConnected.value
+            signalingClient.isConnected.collect { connected ->
+                if (connected && !prev) {
+                    Timber.d("WS reconnected — re-syncing chats for fresh online statuses")
+                    syncChats()
+                }
+                prev = connected
+            }
+        }
     }
 
     private fun observeTyping() {
@@ -85,6 +112,10 @@ class ChatListViewModel @Inject constructor(
                     Timber.e(e, "Ошибка синхронизации чатов")
                     _error.value = "Не удалось загрузить чаты"
                 }
+            // После первого syncChats — UI больше не должен показывать скелетон.
+            // Делаем независимо от success/failure: даже если сервер недоступен,
+            // дальше пользователь увидит либо локальный кэш, либо «Нет чатов».
+            _isInitialLoading.value = false
         }
     }
 

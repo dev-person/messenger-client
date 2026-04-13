@@ -27,9 +27,9 @@ sealed class Screen(val route: String) {
     object Chat         : Screen("chat/{chatId}") {
         fun navigate(chatId: String) = "chat/$chatId"
     }
-    object Call         : Screen("call/{userId}/{isVideo}/{peerName}") {
-        fun navigate(userId: String, isVideo: Boolean, peerName: String) =
-            "call/$userId/$isVideo/${Uri.encode(peerName)}"
+    object Call         : Screen("call/{userId}/{isVideo}/{peerName}/{isIncoming}") {
+        fun navigate(userId: String, isVideo: Boolean, peerName: String, isIncoming: Boolean) =
+            "call/$userId/$isVideo/${Uri.encode(peerName)}/$isIncoming"
     }
 }
 
@@ -43,13 +43,20 @@ fun AppNavHost(
     val callViewModel: CallViewModel = hiltViewModel()
     val activeCall by callViewModel.activeCallState.collectAsStateWithLifecycle()
 
-    // Navigate to CallScreen when an incoming call arrives (RINGING state)
+    // Navigate to CallScreen when an incoming call arrives (RINGING state).
+    // ВАЖНО: передаём isIncoming=true, чтобы CallScreen НЕ начал автоматически
+    // исходящий вызов. Раньше при гонке incoming_call → end_call (звонящий
+    // бросил трубку до того как абонент успел открыть приложение) экран открывался,
+    // call к этому моменту уже null, и LaunchedEffect автостарта думал что это
+    // исходящий → запускал реальный исходящий звонок «А → B», хотя B уже отбой.
     LaunchedEffect(activeCall?.id) {
         val call = activeCall ?: return@LaunchedEffect
         if (call.state == CallState.RINGING) {
             val peerName = call.callerId   // will be resolved to display name when user info is loaded
             val isVideo = call.type == CallType.VIDEO
-            navController.navigate(Screen.Call.navigate(call.callerId, isVideo, peerName)) {
+            navController.navigate(
+                Screen.Call.navigate(call.callerId, isVideo, peerName, isIncoming = true)
+            ) {
                 launchSingleTop = true
             }
         }
@@ -92,7 +99,10 @@ fun AppNavHost(
             ChatScreen(
                 onBack = { navController.popBackStack() },
                 onCallClick = { userId, isVideo, peerName ->
-                    navController.navigate(Screen.Call.navigate(userId, isVideo, peerName))
+                    // Из чата — это всегда ИСХОДЯЩИЙ звонок (юзер сам нажал кнопку)
+                    navController.navigate(
+                        Screen.Call.navigate(userId, isVideo, peerName, isIncoming = false)
+                    )
                 },
             )
         }
@@ -100,20 +110,23 @@ fun AppNavHost(
         composable(
             route = Screen.Call.route,
             arguments = listOf(
-                navArgument("userId")   { type = NavType.StringType },
-                navArgument("isVideo")  { type = NavType.BoolType },
-                navArgument("peerName") { type = NavType.StringType },
+                navArgument("userId")     { type = NavType.StringType },
+                navArgument("isVideo")    { type = NavType.BoolType },
+                navArgument("peerName")   { type = NavType.StringType },
+                navArgument("isIncoming") { type = NavType.BoolType },
             ),
         ) { backStackEntry ->
-            val userId   = backStackEntry.arguments?.getString("userId")   ?: ""
-            val isVideo  = backStackEntry.arguments?.getBoolean("isVideo") ?: false
-            val peerName = backStackEntry.arguments?.getString("peerName") ?: ""
+            val userId     = backStackEntry.arguments?.getString("userId")     ?: ""
+            val isVideo    = backStackEntry.arguments?.getBoolean("isVideo")   ?: false
+            val peerName   = backStackEntry.arguments?.getString("peerName")   ?: ""
+            val isIncoming = backStackEntry.arguments?.getBoolean("isIncoming") ?: false
             CallScreen(
-                userId   = userId,
-                isVideo  = isVideo,
-                peerName = peerName,
-                onCallEnd = { navController.popBackStack() },
-                viewModel = callViewModel,
+                userId     = userId,
+                isVideo    = isVideo,
+                peerName   = peerName,
+                isIncoming = isIncoming,
+                onCallEnd  = { navController.popBackStack() },
+                viewModel  = callViewModel,
             )
         }
     }

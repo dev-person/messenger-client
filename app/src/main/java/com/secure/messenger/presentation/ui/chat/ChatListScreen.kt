@@ -98,6 +98,7 @@ fun ChatListScreen(
     val isConnected by viewModel.isConnected.collectAsStateWithLifecycle()
     val typingChats by viewModel.typingChats.collectAsStateWithLifecycle()
     val error by viewModel.error.collectAsStateWithLifecycle()
+    val isInitialLoading by viewModel.isInitialLoading.collectAsStateWithLifecycle()
 
     // Задержка перед показом "Нет соединения" — убирает мигание при первом запуске.
     // isConnected стартует как false пока WS устанавливается (~1-2с после запуска).
@@ -170,33 +171,49 @@ fun ChatListScreen(
 
                         Spacer(modifier = Modifier.width(14.dp))
 
-                        // Имя пользователя + статус сети — тап → профиль
+                        // Имя пользователя + статус сети — тап → профиль.
+                        // Пока currentUser ещё не подгрузился, рисуем скелетон-плашки
+                        // вместо «прыгающего» текста заглушки.
                         Column(modifier = Modifier.weight(1f).clickable { onProfileClick() }) {
-                            val title = when {
-                                currentUser?.displayName?.isNotEmpty() == true -> currentUser!!.displayName
-                                currentUser?.username?.isNotEmpty() == true -> "@${currentUser!!.username}"
-                                else -> "Чаты"
+                            if (currentUser == null) {
+                                com.secure.messenger.presentation.ui.components.SkeletonBox(
+                                    modifier = Modifier
+                                        .width(160.dp)
+                                        .height(24.dp),
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                                com.secure.messenger.presentation.ui.components.SkeletonBox(
+                                    modifier = Modifier
+                                        .width(80.dp)
+                                        .height(14.dp),
+                                )
+                            } else {
+                                val title = when {
+                                    currentUser?.displayName?.isNotEmpty() == true -> currentUser!!.displayName
+                                    currentUser?.username?.isNotEmpty() == true -> "@${currentUser!!.username}"
+                                    else -> "Чаты"
+                                }
+                                Text(
+                                    text = title,
+                                    style = MaterialTheme.typography.headlineMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 26.sp,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    text = when {
+                                        isConnected -> "В сети"
+                                        showDisconnected -> "Нет соединения"
+                                        else -> "Подключение..."
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (isConnected) Color(0xFF4CAF50)
+                                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    fontSize = 13.sp,
+                                )
                             }
-                            Text(
-                                text = title,
-                                style = MaterialTheme.typography.headlineMedium,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 26.sp,
-                                color = MaterialTheme.colorScheme.onSurface,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            Text(
-                                text = when {
-                                    isConnected -> "В сети"
-                                    showDisconnected -> "Нет соединения"
-                                    else -> "Подключение..."
-                                },
-                                style = MaterialTheme.typography.bodySmall,
-                                color = if (isConnected) Color(0xFF4CAF50)
-                                        else MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontSize = 13.sp,
-                            )
                         }
 
                         // Иконка «Поддержать автора»
@@ -212,7 +229,11 @@ fun ChatListScreen(
             }
 
             // ── Список чатов ───────────────────────────────────────────────
-            if (chats.isEmpty()) {
+            if (chats.isEmpty() && isInitialLoading) {
+                // Первая загрузка: показываем 7 скелетон-строк вместо «Нет чатов»,
+                // чтобы не мелькала заглушка пустого состояния.
+                ChatListSkeleton(modifier = Modifier.weight(1f))
+            } else if (chats.isEmpty()) {
                 EmptyChatList(modifier = Modifier.weight(1f))
             } else {
                 LazyColumn(
@@ -224,6 +245,7 @@ fun ChatListScreen(
                     items(chats, key = { it.id }) { chat ->
                         ChatRow(
                             chat = chat,
+                            currentUserId = currentUser?.id,
                             isTyping = chat.id in typingChats,
                             onClick = { onChatClick(chat.id) },
                             onDeleteChat = { viewModel.deleteChat(chat.id) },
@@ -338,6 +360,7 @@ private fun SupportAuthorDialog(onDismiss: () -> Unit) {
 @Composable
 private fun ChatRow(
     chat: Chat,
+    currentUserId: String?,
     isTyping: Boolean,
     onClick: () -> Unit,
     onDeleteChat: () -> Unit,
@@ -366,8 +389,11 @@ private fun ChatRow(
                     .padding(horizontal = 16.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                // Аватар с индикатором онлайн-статуса / печатает
-                val isOtherUserOnline = chat.members.firstOrNull { it.id == chat.otherUserId }?.isOnline == true
+                // Аватар с индикатором онлайн-статуса / печатает.
+                // Источник правды — isOtherOnline из ChatRepository.observeChats()
+                // (формируется через JOIN с users в SQL DAO). chat.members в Flow
+                // из Room всегда пустой — это поле остаётся для совместимости.
+                val isOtherUserOnline = chat.isOtherOnline
                 Box {
                     AvatarImage(url = chat.avatarUrl, name = chat.title, size = 52)
                     if (chat.isPinned && !isTyping) {
@@ -451,7 +477,13 @@ private fun ChatRow(
                                         MessageType.VIDEO  -> "🎬 Видео"
                                         MessageType.AUDIO  -> "🎤 Аудиосообщение"
                                         MessageType.FILE   -> "📎 Файл"
-                                        MessageType.SYSTEM -> msg.content
+                                        // SYSTEM-сообщения о звонках одинаковы для обоих
+                                        // участников; для звонящего «Пропущенный звонок»
+                                        // нелогично — переписываем на «Звонок без ответа».
+                                        MessageType.SYSTEM -> displaySystemPreviewText(
+                                            rawText = msg.content,
+                                            isOwnMessage = msg.senderId == currentUserId,
+                                        )
                                     }
                                 } ?: "Нет сообщений"
                             },
@@ -526,6 +558,62 @@ private fun UnreadBadge(count: Int, muted: Boolean, modifier: Modifier = Modifie
     }
 }
 
+// ── Скелетон-плейсхолдер списка чатов на время первой загрузки ───────────────
+
+@Composable
+private fun ChatListSkeleton(modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        // Семь строк-скелетонов имитируют примерное содержимое списка
+        repeat(7) {
+            ChatRowSkeleton()
+        }
+    }
+}
+
+@Composable
+private fun ChatRowSkeleton() {
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.surface,
+        tonalElevation = 1.dp,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // Кружок-аватар
+            com.secure.messenger.presentation.ui.components.SkeletonBox(
+                modifier = Modifier.size(52.dp),
+                shape = CircleShape,
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                // Имя
+                com.secure.messenger.presentation.ui.components.SkeletonBox(
+                    modifier = Modifier
+                        .fillMaxWidth(0.55f)
+                        .height(16.dp),
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                // Превью последнего сообщения
+                com.secure.messenger.presentation.ui.components.SkeletonBox(
+                    modifier = Modifier
+                        .fillMaxWidth(0.85f)
+                        .height(12.dp),
+                )
+            }
+        }
+    }
+}
+
 // ── Пустое состояние ──────────────────────────────────────────────────────────
 
 @Composable
@@ -555,6 +643,21 @@ private fun EmptyChatList(modifier: Modifier = Modifier) {
             color = MaterialTheme.colorScheme.outline,
             textAlign = TextAlign.Center,
         )
+    }
+}
+
+/**
+ * Перерасчёт текста системного сообщения для превью в списке чатов.
+ * Дублирует логику ChatScreen.displaySystemMessageText, но локально — чтобы
+ * не тащить cross-screen зависимости. Если перечень кейсов разрастётся,
+ * вынесу в общий util.
+ */
+private fun displaySystemPreviewText(rawText: String, isOwnMessage: Boolean): String {
+    if (!isOwnMessage) return rawText
+    return when {
+        rawText == "Пропущенный Звонок"      -> "Звонок без ответа"
+        rawText == "Пропущенный Видеозвонок" -> "Видеозвонок без ответа"
+        else                                  -> rawText
     }
 }
 

@@ -5,6 +5,9 @@ import android.media.MediaRecorder
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import timber.log.Timber
 import java.io.File
 
@@ -32,12 +35,21 @@ class VoiceRecorder(private val context: Context) {
     private val amplitudes = mutableListOf<Int>()
     private var sampleTicker: Runnable? = null
 
+    /**
+     * «Живые» амплитуды для отрисовки waveform-анимации в UI прямо во время
+     * записи. Обновляется тем же тикером что и [amplitudes] (раз в 50 мс),
+     * но как иммутабельный snapshot — Compose может подписаться через collectAsState.
+     */
+    private val _liveAmplitudes = MutableStateFlow(IntArray(0))
+    val liveAmplitudes: StateFlow<IntArray> = _liveAmplitudes.asStateFlow()
+
     /** Начало записи. Возвращает true если успешно. */
     fun start(): Boolean {
         return runCatching {
             val file = File(context.cacheDir, "voice_${System.currentTimeMillis()}.m4a")
             outputFile = file
             amplitudes.clear()
+            _liveAmplitudes.value = IntArray(0)
 
             @Suppress("DEPRECATION")
             val mr = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -122,6 +134,9 @@ class VoiceRecorder(private val context: Context) {
                     val amp = mr.maxAmplitude
                     if (amp > 0 || amplitudes.isNotEmpty()) {
                         amplitudes.add(amp)
+                        // Публикуем snapshot — Compose-индикатор записи
+                        // переподписывается и перерисовывает волну на каждом тике.
+                        _liveAmplitudes.value = amplitudes.toIntArray()
                     }
                 }
                 mainHandler.postDelayed(this, 50)

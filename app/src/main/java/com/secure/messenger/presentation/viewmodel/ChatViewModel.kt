@@ -7,6 +7,7 @@ import android.content.Context
 import com.secure.messenger.data.local.dao.UserDao
 import com.secure.messenger.data.remote.websocket.SignalingClient
 import com.secure.messenger.data.remote.websocket.SignalingEvent
+import com.secure.messenger.utils.SoundManager
 import com.secure.messenger.utils.VoiceRecorder
 import dagger.hilt.android.qualifiers.ApplicationContext
 import com.secure.messenger.domain.model.Chat
@@ -51,6 +52,7 @@ class ChatViewModel @Inject constructor(
     authRepository: AuthRepository,
     private val userDao: UserDao,
     private val signalingClient: SignalingClient,
+    private val soundManager: SoundManager,
 ) : ViewModel() {
 
     private val voiceRecorder = VoiceRecorder(context)
@@ -182,6 +184,7 @@ class ChatViewModel @Inject constructor(
         _uiState.value = _uiState.value.copy(replyingTo = null)
         viewModelScope.launch {
             sendMessageUseCase(chatId, content, replyToId = replyTo?.id)
+                .onSuccess { soundManager.playMessageSent() }
                 .onFailure { e ->
                     Timber.e(e, "Не удалось отправить сообщение в чат $chatId")
                     _uiState.value = _uiState.value.copy(error = "Ошибка отправки: ${e.message}")
@@ -204,6 +207,13 @@ class ChatViewModel @Inject constructor(
     private val _recordingSeconds = MutableStateFlow(0)
     val recordingSeconds: StateFlow<Int> = _recordingSeconds.asStateFlow()
 
+    /**
+     * Live-амплитуды микрофона во время записи — для рисования реактивной
+     * волны в индикаторе записи. Берётся напрямую из VoiceRecorder, который
+     * сэмплирует maxAmplitude каждые 50 мс.
+     */
+    val recordingWaveform: StateFlow<IntArray> = voiceRecorder.liveAmplitudes
+
     /** После окончания записи здесь лежит результат для превью в модалке. */
     private val _pendingVoice = MutableStateFlow<PendingVoice?>(null)
     val pendingVoice: StateFlow<PendingVoice?> = _pendingVoice.asStateFlow()
@@ -214,6 +224,7 @@ class ChatViewModel @Inject constructor(
     fun sendImage(imageData: com.secure.messenger.utils.ImageCodec.ImageData) {
         viewModelScope.launch {
             chatRepository.sendImageMessage(chatId, imageData)
+                .onSuccess { soundManager.playMessageSent() }
                 .onFailure { e ->
                     Timber.e(e, "Не удалось отправить картинку")
                     _uiState.value = _uiState.value.copy(error = "Ошибка отправки картинки: ${e.message}")
@@ -279,6 +290,7 @@ class ChatViewModel @Inject constructor(
         _pendingVoice.value = null
         viewModelScope.launch {
             chatRepository.sendVoiceMessage(chatId, pending.bytes, pending.durationSeconds, pending.waveform)
+                .onSuccess { soundManager.playMessageSent() }
                 .onFailure { e ->
                     Timber.e(e, "Не удалось отправить голосовое")
                     _uiState.value = _uiState.value.copy(error = "Ошибка голосового: ${e.message}")
