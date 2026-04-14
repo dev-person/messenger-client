@@ -11,12 +11,13 @@ import kotlinx.coroutines.flow.Flow
 @Dao
 interface MessageDao {
 
-    /** Последние N сообщений — для начальной загрузки и пагинации */
-    @Query("SELECT * FROM (SELECT * FROM messages WHERE chatId = :chatId ORDER BY timestamp DESC LIMIT :limit) sub ORDER BY timestamp ASC")
+    /** Последние N сообщений — для начальной загрузки и пагинации.
+     *  Скрываем сообщения, которые не удалось расшифровать. */
+    @Query("SELECT * FROM (SELECT * FROM messages WHERE chatId = :chatId AND decryptedContent NOT IN ('[Не удалось расшифровать]', '[Групповые чаты не поддерживаются]') ORDER BY timestamp DESC LIMIT :limit) sub ORDER BY timestamp ASC")
     fun observeMessages(chatId: String, limit: Int): Flow<List<MessageEntity>>
 
     /** Сообщения старше указанного timestamp — для подгрузки истории */
-    @Query("SELECT * FROM (SELECT * FROM messages WHERE chatId = :chatId AND timestamp < :before ORDER BY timestamp DESC LIMIT :limit) sub ORDER BY timestamp ASC")
+    @Query("SELECT * FROM (SELECT * FROM messages WHERE chatId = :chatId AND decryptedContent NOT IN ('[Не удалось расшифровать]', '[Групповые чаты не поддерживаются]') AND timestamp < :before ORDER BY timestamp DESC LIMIT :limit) sub ORDER BY timestamp ASC")
     suspend fun loadBefore(chatId: String, before: Long, limit: Int): List<MessageEntity>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
@@ -30,6 +31,9 @@ interface MessageDao {
 
     @Query("DELETE FROM messages WHERE id = :messageId")
     suspend fun deleteById(messageId: String)
+
+    @Query("DELETE FROM messages")
+    suspend fun deleteAll()
 
     @Query("SELECT * FROM messages WHERE id = :messageId")
     suspend fun getById(messageId: String): MessageEntity?

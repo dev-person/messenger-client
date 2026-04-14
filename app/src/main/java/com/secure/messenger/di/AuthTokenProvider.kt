@@ -21,6 +21,7 @@ class AuthTokenProvider @Inject constructor(
     companion object {
         private const val PREFS_NAME = "encrypted_auth"
         private const val KEY_TOKEN = "auth_token"
+        private const val KEY_SESSION_ID = "session_id"
     }
 
     private val prefs: SharedPreferences by lazy {
@@ -60,12 +61,18 @@ class AuthTokenProvider @Inject constructor(
     val token: String?
         get() = prefs.getString(KEY_TOKEN, null)
 
-    fun saveToken(token: String) {
-        prefs.edit().putString(KEY_TOKEN, token).apply()
+    val sessionId: String?
+        get() = prefs.getString(KEY_SESSION_ID, null)
+
+    fun saveToken(token: String, sessionId: String = "") {
+        prefs.edit()
+            .putString(KEY_TOKEN, token)
+            .putString(KEY_SESSION_ID, sessionId)
+            .apply()
     }
 
     fun clearToken() {
-        prefs.edit().remove(KEY_TOKEN).apply()
+        prefs.edit().remove(KEY_TOKEN).remove(KEY_SESSION_ID).apply()
     }
 
     fun hasToken(): Boolean = token != null

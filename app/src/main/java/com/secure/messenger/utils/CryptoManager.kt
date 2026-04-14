@@ -10,7 +10,9 @@ import org.bouncycastle.crypto.params.HKDFParameters
 import org.bouncycastle.crypto.digests.SHA256Digest
 import java.security.SecureRandom
 import javax.crypto.Cipher
+import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.PBEKeySpec
 import javax.crypto.spec.SecretKeySpec
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -37,13 +39,14 @@ class CryptoManager @Inject constructor(
         private const val IV_LENGTH_BYTES = 12   // 96-bit IV recommended for AES-GCM
         private const val KEY_LENGTH_BYTES = 32  // AES-256
         private const val HKDF_INFO_MESSAGES = "secure-messenger-msg-v1"
+        private const val PBKDF2_ITERATIONS = 100_000
     }
 
     private val secureRandom = SecureRandom()
 
     // ── Key Generation ────────────────────────────────────────────────────────
 
-    /** Generates a new X25519 key pair. Returns (publicKeyBytes, privateKeyBytes). */
+    /** Generates a new random X25519 key pair. Returns (publicKeyBytes, privateKeyBytes). */
     fun generateKeyPair(): Pair<ByteArray, ByteArray> {
         val generator = X25519KeyPairGenerator()
         generator.init(X25519KeyGenerationParameters(secureRandom))
@@ -51,6 +54,24 @@ class CryptoManager @Inject constructor(
         val public = (keyPair.public as X25519PublicKeyParameters).encoded
         val private = (keyPair.private as X25519PrivateKeyParameters).encoded
         return Pair(public, private)
+    }
+
+    /**
+     * Derives a deterministic X25519 key pair from phone number + password.
+     * Same phone + same password = same key pair on any device.
+     *
+     * Uses PBKDF2-HMAC-SHA256 (100k iterations) to derive 32 bytes of key material,
+     * then uses it as X25519 private key seed. X25519 clamps the private key internally.
+     */
+    fun deriveKeyPairFromPassword(phone: String, password: String): Pair<ByteArray, ByteArray> {
+        val salt = "secure-messenger-key-v1:$phone".toByteArray(Charsets.UTF_8)
+        val spec = PBEKeySpec(password.toCharArray(), salt, PBKDF2_ITERATIONS, KEY_LENGTH_BYTES * 8)
+        val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+        val seed = factory.generateSecret(spec).encoded
+
+        val privateKey = X25519PrivateKeyParameters(seed)
+        val publicKey = privateKey.generatePublicKey()
+        return Pair(publicKey.encoded, privateKey.encoded)
     }
 
     // ── Shared Secret ─────────────────────────────────────────────────────────

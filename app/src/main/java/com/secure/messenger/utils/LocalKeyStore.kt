@@ -27,6 +27,8 @@ class LocalKeyStore @Inject constructor(
         private const val PREFS_NAME = "encrypted_key_store"
         private const val KEY_PRIVATE = "identity_private_key"
         private const val KEY_PUBLIC = "identity_public_key"
+        private const val KEY_FROM_PASSWORD = "key_from_password"
+        private const val KEY_OWNER_ID = "key_owner_user_id"
     }
 
     private val prefs: SharedPreferences by lazy {
@@ -81,12 +83,24 @@ class LocalKeyStore @Inject constructor(
         }
     }
 
-    fun saveKeyPair(publicKeyBase64: String, privateKeyBase64: String) {
+    fun saveKeyPair(publicKeyBase64: String, privateKeyBase64: String, fromPassword: Boolean = false) {
         prefs.edit()
             .putString(KEY_PUBLIC, publicKeyBase64)
             .putString(KEY_PRIVATE, privateKeyBase64)
+            .putBoolean(KEY_FROM_PASSWORD, fromPassword)
             .apply()
     }
+
+    /** Привязывает ключ к конкретному пользователю. */
+    fun setOwner(userId: String) {
+        prefs.edit().putString(KEY_OWNER_ID, userId).apply()
+    }
+
+    /** true если ключ принадлежит указанному пользователю. */
+    fun isOwner(userId: String): Boolean = prefs.getString(KEY_OWNER_ID, null) == userId
+
+    /** true если ключ сгенерирован из пароля (детерминированный), false если случайный. */
+    fun isKeyFromPassword(): Boolean = prefs.getBoolean(KEY_FROM_PASSWORD, false)
 
     fun getPublicKey(): String? = prefs.getString(KEY_PUBLIC, null)
 

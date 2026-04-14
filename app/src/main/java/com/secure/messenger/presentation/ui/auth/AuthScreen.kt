@@ -30,6 +30,10 @@ import androidx.compose.foundation.Image
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.res.painterResource
 import com.secure.messenger.R
 import androidx.compose.material3.Button
@@ -173,6 +177,27 @@ fun AuthScreen(
                             onSubmit = { viewModel.verifyOtp(onAuthSuccess) },
                             onResend = viewModel::resendOtp,
                         )
+                        AuthStep.PASSWORD -> {
+                            PasswordInputStep(
+                                state = state,
+                                onPasswordChange = viewModel::onPasswordChange,
+                                onPasswordConfirmChange = viewModel::onPasswordConfirmChange,
+                                onSubmit = { viewModel.submitPassword(onAuthSuccess) },
+                                onSkip = { viewModel.skipPassword(onAuthSuccess) },
+                                onDeleteKey = { viewModel.deleteEncryptionKey() },
+                            )
+                            // OTP-подтверждение для удаления ключа
+                            if (state.showDeleteKeyOtpInput) {
+                                DeleteKeyOtpDialog(
+                                    otp = state.deleteKeyOtp,
+                                    error = state.error,
+                                    isLoading = state.isLoading,
+                                    onOtpChange = viewModel::onDeleteKeyOtpChange,
+                                    onConfirm = viewModel::confirmDeleteKey,
+                                    onDismiss = viewModel::cancelDeleteKey,
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -248,11 +273,18 @@ private fun PhoneInputStep(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // Поле ввода номера (без кода страны)
+        // Поле ввода номера с маской через VisualTransformation
+        val maxLen = state.country.phoneLength
+        val mask = state.country.phoneMask
+
         OutlinedTextField(
             value = state.phoneNumber,
-            onValueChange = { onPhoneChange(it.filter { c -> c.isDigit() }) },
+            onValueChange = { newValue ->
+                val digits = newValue.filter { c -> c.isDigit() }.take(maxLen)
+                onPhoneChange(digits)
+            },
             placeholder = { Text("Номер телефона") },
+            visualTransformation = PhoneMaskTransformation(mask),
             prefix = {
                 Text(
                     text = state.country.dialCode + " ",
@@ -266,7 +298,7 @@ private fun PhoneInputStep(
             ),
             keyboardActions = KeyboardActions(onDone = {
                 keyboard?.hide()
-                if (state.phoneNumber.length >= 7) onSubmit()
+                if (state.phoneNumber.length == maxLen) onSubmit()
             }),
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
@@ -293,7 +325,7 @@ private fun PhoneInputStep(
         val onCooldown = state.resendCountdown > 0
         Button(
             onClick = onSubmit,
-            enabled = state.phoneNumber.length >= 7 && !state.isLoading && !onCooldown,
+            enabled = state.phoneNumber.length == state.country.phoneLength && !state.isLoading && !onCooldown,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(52.dp),
@@ -463,6 +495,332 @@ private fun OtpInputStep(
             }
         }
     }
+}
+
+// ── Шаг 3: Пароль шифрования ──────────────────────────────────────────────────
+
+@Composable
+private fun PasswordInputStep(
+    state: AuthUiState,
+    onPasswordChange: (String) -> Unit,
+    onPasswordConfirmChange: (String) -> Unit,
+    onSubmit: () -> Unit,
+    onSkip: () -> Unit,
+    onDeleteKey: () -> Unit,
+) {
+    val keyboard = LocalSoftwareKeyboardController.current
+    val isNewPassword = !state.hasPassword
+    var passwordVisible by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
+    var confirmVisible by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
+    var showDeleteWarning by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
+    var showSkipWarning by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
+
+    Column(
+        modifier = Modifier.padding(horizontal = 24.dp, vertical = 28.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            text = if (isNewPassword) "Пароль шифрования" else "Введите пароль",
+            style = MaterialTheme.typography.titleMedium.copy(fontSize = 20.sp),
+            fontWeight = FontWeight.Bold,
+        )
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            text = if (isNewPassword)
+                "Придумайте пароль для защиты переписки. Минимум 8 символов"
+            else
+                "Введите пароль для расшифровки сообщений",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
+        Spacer(modifier = Modifier.height(24.dp))
+
+        OutlinedTextField(
+            value = state.password,
+            onValueChange = onPasswordChange,
+            placeholder = { Text("Пароль") },
+            visualTransformation = if (passwordVisible)
+                androidx.compose.ui.text.input.VisualTransformation.None
+            else
+                androidx.compose.ui.text.input.PasswordVisualTransformation(),
+            trailingIcon = {
+                IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                    Icon(
+                        imageVector = if (passwordVisible)
+                            Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                        contentDescription = if (passwordVisible) "Скрыть" else "Показать",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            },
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Password,
+                imeAction = if (isNewPassword) ImeAction.Next else ImeAction.Done,
+            ),
+            keyboardActions = KeyboardActions(onDone = {
+                keyboard?.hide()
+                if (!isNewPassword) onSubmit()
+            }),
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(12.dp),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = MaterialTheme.colorScheme.primary,
+            ),
+            isError = state.error != null,
+        )
+
+        if (isNewPassword) {
+            Spacer(modifier = Modifier.height(12.dp))
+
+            OutlinedTextField(
+                value = state.passwordConfirm,
+                onValueChange = onPasswordConfirmChange,
+                placeholder = { Text("Повторите пароль") },
+                visualTransformation = if (confirmVisible)
+                    androidx.compose.ui.text.input.VisualTransformation.None
+                else
+                    androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                trailingIcon = {
+                    IconButton(onClick = { confirmVisible = !confirmVisible }) {
+                        Icon(
+                            imageVector = if (confirmVisible)
+                                Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                            contentDescription = if (confirmVisible) "Скрыть" else "Показать",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                },
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Password,
+                    imeAction = ImeAction.Done,
+                ),
+                keyboardActions = KeyboardActions(onDone = {
+                    keyboard?.hide()
+                    onSubmit()
+                }),
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = MaterialTheme.colorScheme.primary,
+                ),
+                isError = state.error != null,
+            )
+        }
+
+        AnimatedVisibility(visible = state.error != null) {
+            Text(
+                text = state.error ?: "",
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.labelSmall,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 4.dp),
+            )
+        }
+
+        Spacer(modifier = Modifier.height(20.dp))
+
+        Button(
+            onClick = onSubmit,
+            enabled = state.password.isNotEmpty() && !state.isLoading,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(52.dp),
+            shape = RoundedCornerShape(14.dp),
+        ) {
+            if (state.isLoading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(22.dp),
+                    color = Color.White,
+                    strokeWidth = 2.dp,
+                )
+            } else {
+                Text(
+                    if (isNewPassword) "Установить" else "Разблокировать",
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        if (!isNewPassword) {
+            // Есть пароль на сервере — можно удалить ключ
+            TextButton(onClick = { showDeleteWarning = true }) {
+                Text(
+                    text = "Забыли пароль? Удалить ключ",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        } else {
+            // Нового пароля нет — можно пропустить
+            TextButton(onClick = { showSkipWarning = true }) {
+                Text(
+                    text = "Пропустить",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+
+    if (showDeleteWarning) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showDeleteWarning = false },
+            title = { Text("Удалить ключ шифрования?") },
+            text = {
+                Text(
+                    "Все ранее зашифрованные сообщения будут потеряны безвозвратно. " +
+                    "Вы сможете задать новый пароль.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showDeleteWarning = false
+                    onDeleteKey()
+                }) {
+                    Text("Удалить безвозвратно", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteWarning = false }) {
+                    Text("Отмена")
+                }
+            },
+        )
+    }
+
+    if (showSkipWarning) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showSkipWarning = false },
+            title = { Text("Пропустить пароль?") },
+            text = {
+                Text(
+                    "Без пароля переписка не будет защищена при смене устройства. " +
+                    "Вы сможете задать пароль позже в настройках.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showSkipWarning = false
+                    onSkip()
+                }) {
+                    Text("Пропустить", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSkipWarning = false }) {
+                    Text("Отмена")
+                }
+            },
+        )
+    }
+}
+
+// ── Маска телефона ────────────────────────────────────────────────────────────
+
+/**
+ * VisualTransformation для маски телефона. Маска: # = цифра, остальное — разделители.
+ * Курсор корректно позиционируется благодаря offsetMapping.
+ */
+private class PhoneMaskTransformation(private val mask: String) :
+    androidx.compose.ui.text.input.VisualTransformation {
+
+    override fun filter(text: androidx.compose.ui.text.AnnotatedString): androidx.compose.ui.text.input.TransformedText {
+        val digits = text.text
+        val sb = StringBuilder()
+        var digitIdx = 0
+
+        for (ch in mask) {
+            if (digitIdx >= digits.length) break
+            if (ch == '#') {
+                sb.append(digits[digitIdx++])
+            } else {
+                sb.append(ch)
+            }
+        }
+
+        val formatted = sb.toString()
+
+        // Маппинг: позиция в сырых цифрах ↔ позиция в отформатированной строке
+        val offsetMapping = object : androidx.compose.ui.text.input.OffsetMapping {
+            override fun originalToTransformed(offset: Int): Int {
+                var d = 0
+                for (i in mask.indices) {
+                    if (d == offset) return i
+                    if (mask[i] == '#') d++
+                }
+                return formatted.length
+            }
+
+            override fun transformedToOriginal(offset: Int): Int {
+                var d = 0
+                for (i in 0 until minOf(offset, mask.length)) {
+                    if (mask[i] == '#') d++
+                }
+                return minOf(d, digits.length)
+            }
+        }
+
+        return androidx.compose.ui.text.input.TransformedText(
+            androidx.compose.ui.text.AnnotatedString(formatted),
+            offsetMapping,
+        )
+    }
+}
+
+// ── Подтверждение удаления ключа (OTP) ─────────────────────────────────────────
+
+@Composable
+private fun DeleteKeyOtpDialog(
+    otp: String,
+    error: String?,
+    isLoading: Boolean,
+    onOtpChange: (String) -> Unit,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Подтверждение") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "На ваш номер отправлен код. Введите его для подтверждения удаления ключа шифрования.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                OutlinedTextField(
+                    value = otp,
+                    onValueChange = { if (it.length <= 6 && it.all { c -> c.isDigit() }) onOtpChange(it) },
+                    placeholder = { Text("Код из SMS") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                )
+                if (error != null) {
+                    Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm, enabled = otp.length == 6 && !isLoading) {
+                if (isLoading) {
+                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                } else {
+                    Text("Удалить ключ", color = MaterialTheme.colorScheme.error)
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Отмена") }
+        },
+    )
 }
 
 // ── Выбор страны (Bottom Sheet) ────────────────────────────────────────────────

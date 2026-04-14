@@ -40,6 +40,8 @@ class MessagingService : Service() {
     @Inject lateinit var signalingClient: SignalingClient
     @Inject lateinit var tokenProvider: AuthTokenProvider
     @Inject lateinit var incomingMessageHandler: IncomingMessageHandler
+    @Inject lateinit var localKeyStore: com.secure.messenger.utils.LocalKeyStore
+    @Inject lateinit var db: com.secure.messenger.data.local.database.AppDatabase
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val nm get() = getSystemService(NotificationManager::class.java)
@@ -55,6 +57,7 @@ class MessagingService : Service() {
     private var reconnectDelayMs = 1_000L
 
     companion object {
+        const val ACTION_FORCE_LOGOUT = "com.secure.messenger.FORCE_LOGOUT"
         const val CHANNEL_CALL    = "call_channel"    // входящий звонок — максимальный приоритет
         const val CHANNEL_MESSAGE = "message_channel" // новое сообщение
         const val NOTIF_ID_CALL   = 1001              // уведомление о звонке (одно, заменяется)
@@ -117,6 +120,15 @@ class MessagingService : Service() {
                     is SignalingEvent.UserUpdated -> scope.launch {
                         incomingMessageHandler.handleUserUpdated(event.userId, event.payload)
                     }
+                    is SignalingEvent.ForceLogout -> {
+                        val mySessionId = tokenProvider.sessionId
+                        if (mySessionId != null && mySessionId == event.excludeSessionId) {
+                            Timber.d("Force logout excluded my session $mySessionId — ignoring")
+                        } else {
+                            Timber.w("Force logout: ${event.reason}")
+                            handleForceLogout()
+                        }
+                    }
                     is SignalingEvent.Disconnected -> {
                         Timber.w("WS disconnected — reconnect in ${reconnectDelayMs}ms")
                         scheduleReconnect()
@@ -125,6 +137,16 @@ class MessagingService : Service() {
                 }
             }
         }
+    }
+
+    private fun handleForceLogout() {
+        tokenProvider.clearToken()
+        localKeyStore.clear()
+        signalingClient.disconnect()
+        // Очищаем БД — чтобы расшифрованные сообщения не остались доступны
+        scope.launch { db.clearAllTables() }
+        sendBroadcast(Intent(ACTION_FORCE_LOGOUT).setPackage(packageName))
+        stopSelf()
     }
 
     private fun scheduleReconnect() {

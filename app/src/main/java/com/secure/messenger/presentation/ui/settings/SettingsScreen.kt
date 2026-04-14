@@ -27,6 +27,12 @@ import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.Campaign
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
+import androidx.compose.material.icons.filled.PhonelinkErase
+import androidx.compose.material.icons.filled.Devices
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.Palette
@@ -42,6 +48,7 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -49,7 +56,19 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
+import com.secure.messenger.data.remote.api.SessionDto
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.TextButton
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -219,6 +238,88 @@ fun SettingsScreen(
                         }
                     }
                 }
+            }
+
+            // ── Безопасность ──────────────────────────────────────────────
+            OneUiSectionLabel("Безопасность")
+
+            OneUiCard {
+                if (state.messagesLocked) {
+                    OneUiClickItem(
+                        icon = Icons.Default.LockOpen,
+                        iconTint = MaterialTheme.colorScheme.error,
+                        title = "Разблокировать сообщения",
+                        subtitle = "Введите пароль для расшифровки переписки",
+                        onClick = { viewModel.showUnlockDialog() },
+                    )
+                } else {
+                    OneUiClickItem(
+                        icon = Icons.Default.Lock,
+                        iconTint = MaterialTheme.colorScheme.primary,
+                        title = "Пароль шифрования",
+                        subtitle = "Установка или смена пароля",
+                        onClick = { viewModel.showChangePasswordDialog() },
+                    )
+                }
+
+                OneUiDivider()
+
+                OneUiClickItem(
+                    icon = Icons.Default.Devices,
+                    iconTint = MaterialTheme.colorScheme.primary,
+                    title = "Активные сессии",
+                    subtitle = "Управление входами на устройствах",
+                    onClick = { viewModel.showSessions() },
+                )
+            }
+
+            if (state.showSessionsDialog) {
+                SessionsDialog(
+                    sessions = state.sessions,
+                    isLoading = state.sessionsLoading,
+                    onTerminate = viewModel::terminateSession,
+                    onTerminateAll = viewModel::terminateAllOtherSessions,
+                    onDismiss = viewModel::dismissSessions,
+                )
+            }
+
+            if (state.showUnlockDialog) {
+                UnlockMessagesDialog(
+                    password = state.unlockPassword,
+                    error = state.unlockError,
+                    isLoading = state.unlockLoading,
+                    onPasswordChange = viewModel::onUnlockPasswordChange,
+                    onSubmit = viewModel::unlockMessages,
+                    onDeleteKey = viewModel::deleteKeyFromSettings,
+                    onDismiss = viewModel::dismissUnlockDialog,
+                )
+            }
+
+            if (state.showDeleteKeyOtp) {
+                DeleteKeyOtpSettingsDialog(
+                    otp = state.deleteKeyOtpCode,
+                    error = state.unlockError,
+                    isLoading = state.unlockLoading,
+                    onOtpChange = viewModel::onDeleteKeyOtpChange,
+                    onConfirm = viewModel::confirmDeleteKeyFromSettings,
+                    onDismiss = viewModel::cancelDeleteKeyOtp,
+                )
+            }
+
+            if (state.showPasswordDialog) {
+                ChangePasswordDialog(
+                    hasPassword = state.hasExistingPassword,
+                    oldPassword = state.oldPassword,
+                    newPassword = state.newPassword,
+                    confirmPassword = state.confirmPassword,
+                    error = state.passwordError,
+                    isLoading = state.passwordLoading,
+                    onOldPasswordChange = viewModel::onOldPasswordChange,
+                    onNewPasswordChange = viewModel::onNewPasswordChange,
+                    onConfirmPasswordChange = viewModel::onConfirmPasswordChange,
+                    onSubmit = viewModel::changePassword,
+                    onDismiss = viewModel::dismissChangePasswordDialog,
+                )
             }
 
             // ── Обновление ─────────────────────────────────────────────────
@@ -515,4 +616,325 @@ private fun OneUiInfoItem(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
+}
+
+// ── Диалог активных сессий ─────────────────────────────────────────────────────
+
+@Composable
+private fun SessionsDialog(
+    sessions: List<SessionDto>,
+    isLoading: Boolean,
+    onTerminate: (String) -> Unit,
+    onTerminateAll: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val fmt = DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm")
+        .withZone(ZoneId.systemDefault())
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Активные сессии") },
+        text = {
+            if (isLoading) {
+                Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator(modifier = Modifier.size(32.dp))
+                }
+            } else if (sessions.isEmpty()) {
+                Text("Нет активных сессий", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else {
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(sessions) { session ->
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = if (session.isCurrent)
+                                MaterialTheme.colorScheme.primaryContainer
+                            else MaterialTheme.colorScheme.surfaceVariant,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = session.deviceName.ifEmpty { "Неизвестное устройство" } +
+                                                if (session.isCurrent) " (текущая)" else "",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                    val locationText = if (session.location.isNotEmpty())
+                                        session.location else session.ip
+                                    Text(
+                                        text = locationText,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    val lastSeen = runCatching {
+                                        fmt.format(Instant.parse(session.lastSeenAt))
+                                    }.getOrDefault(session.lastSeenAt)
+                                    Text(
+                                        text = "Активность: $lastSeen",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                if (!session.isCurrent) {
+                                    Icon(
+                                        imageVector = Icons.Default.PhonelinkErase,
+                                        contentDescription = "Завершить",
+                                        tint = MaterialTheme.colorScheme.error,
+                                        modifier = Modifier
+                                            .size(24.dp)
+                                            .clickable { onTerminate(session.id) },
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            if (sessions.size > 1) {
+                TextButton(onClick = onTerminateAll) {
+                    Text("Завершить все другие", color = MaterialTheme.colorScheme.error)
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Закрыть") }
+        },
+    )
+}
+
+// ── OTP-подтверждение удаления ключа (настройки) ──────────────────────────────
+
+@Composable
+private fun DeleteKeyOtpSettingsDialog(
+    otp: String,
+    error: String?,
+    isLoading: Boolean,
+    onOtpChange: (String) -> Unit,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Подтверждение удаления") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "На ваш номер отправлен код. Введите его для подтверждения удаления ключа.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                OutlinedTextField(
+                    value = otp,
+                    onValueChange = { if (it.length <= 6 && it.all { c -> c.isDigit() }) onOtpChange(it) },
+                    label = { Text("Код из SMS") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                if (error != null) {
+                    Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm, enabled = otp.length == 6 && !isLoading) {
+                if (isLoading) {
+                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                } else {
+                    Text("Удалить ключ", color = MaterialTheme.colorScheme.error)
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Отмена") }
+        },
+    )
+}
+
+// ── Диалог разблокировки сообщений ─────────────────────────────────────────────
+
+@Composable
+private fun UnlockMessagesDialog(
+    password: String,
+    error: String?,
+    isLoading: Boolean,
+    onPasswordChange: (String) -> Unit,
+    onSubmit: () -> Unit,
+    onDeleteKey: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var passwordVisible by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
+    var showDeleteWarning by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Разблокировать сообщения") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "Введите пароль шифрования для восстановления доступа к переписке.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = onPasswordChange,
+                    label = { Text("Пароль") },
+                    singleLine = true,
+                    visualTransformation = if (passwordVisible)
+                        androidx.compose.ui.text.input.VisualTransformation.None
+                    else
+                        androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                    trailingIcon = {
+                        androidx.compose.material3.IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                            Icon(
+                                imageVector = if (passwordVisible)
+                                    Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                if (error != null) {
+                    Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                }
+
+                TextButton(
+                    onClick = { showDeleteWarning = true },
+                    modifier = Modifier.align(Alignment.Start),
+                ) {
+                    Text(
+                        "Забыли пароль? Удалить ключ",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onSubmit, enabled = !isLoading && password.isNotEmpty()) {
+                if (isLoading) {
+                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                } else {
+                    Text("Разблокировать")
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Отмена") }
+        },
+    )
+
+    if (showDeleteWarning) {
+        AlertDialog(
+            onDismissRequest = { showDeleteWarning = false },
+            title = { Text("Удалить ключ шифрования?") },
+            text = {
+                Text("Все ранее зашифрованные сообщения будут потеряны безвозвратно. " +
+                     "Вы сможете задать новый пароль.")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showDeleteWarning = false
+                    onDeleteKey()
+                }) {
+                    Text("Удалить безвозвратно", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteWarning = false }) { Text("Отмена") }
+            },
+        )
+    }
+}
+
+// ── Диалог смены пароля ───────────────────────────────────────────────────────
+
+@Composable
+private fun ChangePasswordDialog(
+    hasPassword: Boolean,
+    oldPassword: String,
+    newPassword: String,
+    confirmPassword: String,
+    error: String?,
+    isLoading: Boolean,
+    onOldPasswordChange: (String) -> Unit,
+    onNewPasswordChange: (String) -> Unit,
+    onConfirmPasswordChange: (String) -> Unit,
+    onSubmit: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Смена пароля") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (hasPassword) {
+                    OutlinedTextField(
+                        value = oldPassword,
+                        onValueChange = onOldPasswordChange,
+                        label = { Text("Текущий пароль") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+                OutlinedTextField(
+                    value = newPassword,
+                    onValueChange = onNewPasswordChange,
+                    label = { Text("Новый пароль") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = confirmPassword,
+                    onValueChange = onConfirmPasswordChange,
+                    label = { Text("Повторите пароль") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                if (error != null) {
+                    Text(
+                        text = error,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.errorContainer,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        text = "Все другие устройства будут разлогинены. " +
+                               "Ранее зашифрованные сообщения станут недоступны без нового пароля.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        modifier = Modifier.padding(8.dp),
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onSubmit, enabled = !isLoading) {
+                if (isLoading) {
+                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                } else {
+                    Text("Сменить пароль", color = MaterialTheme.colorScheme.error)
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Отмена") }
+        },
+    )
 }

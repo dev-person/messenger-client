@@ -11,6 +11,7 @@ import com.secure.messenger.data.remote.api.MessengerApi
 import com.secure.messenger.di.AuthTokenProvider
 import com.secure.messenger.domain.model.User
 import com.secure.messenger.domain.repository.AuthRepository
+import com.secure.messenger.domain.repository.VerifyOtpResult
 import com.secure.messenger.service.MessagingService
 import com.secure.messenger.utils.LocalKeyStore
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -38,6 +39,12 @@ class OtpCooldownException(val retryAfterSeconds: Int) :
  * текст для UI, который отдал сервер.
  */
 class OtpVerifyException(
+    val errorCode: String,
+    message: String,
+) : Exception(message)
+
+/** Ошибка при операциях с паролем шифрования. */
+class PasswordException(
     val errorCode: String,
     message: String,
 ) : Exception(message)
@@ -109,12 +116,13 @@ class AuthRepositoryImpl @Inject constructor(
         }
     }
 
-    override suspend fun verifyOtp(phone: String, code: String): Result<User> {
+    override suspend fun verifyOtp(phone: String, code: String): Result<VerifyOtpResult> {
         return try {
-            val response = api.verifyOtp(mapOf("phone" to phone, "code" to code)).data
+            val deviceName = android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL
+            val response = api.verifyOtp(mapOf("phone" to phone, "code" to code, "deviceName" to deviceName)).data
                 ?: return Result.failure(Exception("Сервер вернул пустой ответ"))
 
-            tokenProvider.saveToken(response.token)
+            tokenProvider.saveToken(response.token, response.sessionId)
 
             // Запускаем WebSocket-сервис сразу после получения токена
             context.startService(Intent(context, MessagingService::class.java))
@@ -130,16 +138,56 @@ class AuthRepositoryImpl @Inject constructor(
             val user = response.user.toDomain()
             userDao.upsert(UserEntity.fromDomain(user))
             _currentUser.value = user
-            Result.success(user)
+            Result.success(VerifyOtpResult(user = user, hasPassword = response.hasPassword))
         } catch (e: HttpException) {
-            // Сервер вернул структурированную ошибку — парсим её и
-            // подставляем русское сообщение от сервера, не голый "HTTP 401".
             val body = e.response()?.errorBody()?.string()
             val (errorCode, serverMsg) = parseErrorBody(body)
             val msg = serverMsg.ifBlank { "Не удалось проверить код. Повторите попытку" }
             Result.failure(OtpVerifyException(errorCode = errorCode, message = msg))
         } catch (e: Exception) {
             Result.failure(Exception("Нет связи с сервером. Проверьте интернет"))
+        }
+    }
+
+    override suspend fun setPassword(password: String, oldPassword: String?): Result<Unit> {
+        return try {
+            val body = buildMap {
+                put("password", password)
+                if (oldPassword != null) put("oldPassword", oldPassword)
+            }
+            api.setPassword(body)
+            Result.success(Unit)
+        } catch (e: HttpException) {
+            val (errorCode, serverMsg) = parseErrorBody(e.response()?.errorBody()?.string())
+            val msg = serverMsg.ifBlank { "Не удалось установить пароль" }
+            Result.failure(PasswordException(errorCode = errorCode, message = msg))
+        } catch (e: Exception) {
+            Result.failure(Exception("Нет связи с сервером"))
+        }
+    }
+
+    override suspend fun verifyPassword(password: String): Result<Unit> {
+        return try {
+            api.verifyPassword(mapOf("password" to password))
+            Result.success(Unit)
+        } catch (e: HttpException) {
+            val (errorCode, serverMsg) = parseErrorBody(e.response()?.errorBody()?.string())
+            val msg = serverMsg.ifBlank { "Неверный пароль" }
+            Result.failure(PasswordException(errorCode = errorCode, message = msg))
+        } catch (e: Exception) {
+            Result.failure(Exception("Нет связи с сервером"))
+        }
+    }
+
+    override suspend fun deletePassword(otpCode: String): Result<Unit> {
+        return try {
+            api.deletePassword(mapOf("code" to otpCode))
+            Result.success(Unit)
+        } catch (e: HttpException) {
+            val (_, serverMsg) = parseErrorBody(e.response()?.errorBody()?.string())
+            Result.failure(Exception(serverMsg.ifBlank { "Не удалось удалить ключ" }))
+        } catch (e: Exception) {
+            Result.failure(Exception("Нет связи с сервером"))
         }
     }
 
@@ -178,9 +226,10 @@ class AuthRepositoryImpl @Inject constructor(
     override suspend fun logout() {
         // Останавливаем WebSocket-сервис
         context.stopService(Intent(context, MessagingService::class.java))
-        // Очищаем авторизацию и ключи — быстрые синхронные операции
+        // Очищаем только токен авторизации — ключи шифрования сохраняем,
+        // чтобы при повторном входе на этом же устройстве не запрашивать пароль
+        // и не терять доступ к расшифрованным сообщениям.
         tokenProvider.clearToken()
-        localKeyStore.clear()
         _currentUser.value = null
         // Очищаем БД в фоновом потоке — тяжёлая операция,
         // нельзя вызывать на main-потоке (иначе краш/ANR)

@@ -6,6 +6,7 @@ import com.secure.messenger.data.remote.api.dto.UserDto
 import okhttp3.MultipartBody
 import retrofit2.http.Body
 import retrofit2.http.DELETE
+import retrofit2.http.HTTP
 import retrofit2.http.GET
 import retrofit2.http.Multipart
 import retrofit2.http.PATCH
@@ -24,6 +25,28 @@ interface MessengerApi {
 
     @POST("auth/otp/verify")
     suspend fun verifyOtp(@Body body: Map<String, String>): ApiResponse<AuthResponseDto>
+
+    @PUT("auth/password")
+    suspend fun setPassword(@Body body: Map<String, String>): ApiResponse<Unit>
+
+    @POST("auth/password/verify")
+    suspend fun verifyPassword(@Body body: Map<String, String>): ApiResponse<Unit>
+
+    @GET("auth/password/status")
+    suspend fun getPasswordStatus(): ApiResponse<PasswordStatusDto>
+
+    @HTTP(method = "DELETE", path = "auth/password", hasBody = true)
+    suspend fun deletePassword(@Body body: Map<String, String>): ApiResponse<Unit>
+
+    // Sessions
+    @GET("auth/sessions")
+    suspend fun getSessions(): ApiResponse<List<SessionDto>>
+
+    @DELETE("auth/sessions/{sessionId}")
+    suspend fun terminateSession(@Path("sessionId") sessionId: String): ApiResponse<Unit>
+
+    @DELETE("auth/sessions")
+    suspend fun terminateOtherSessions(): ApiResponse<TerminateResult>
 
     // ── Users ─────────────────────────────────────────────────────────────────
 
@@ -131,7 +154,18 @@ data class AppVersionRequest(
     val versionName: String,
 )
 
-data class AuthResponseDto(val token: String, val user: UserDto)
+data class AuthResponseDto(val token: String, val sessionId: String = "", val user: UserDto, val hasPassword: Boolean = false)
+data class SessionDto(
+    val id: String,
+    val deviceName: String,
+    val ip: String,
+    val location: String = "",
+    val isCurrent: Boolean,
+    val createdAt: String,
+    val lastSeenAt: String,
+)
+data class TerminateResult(val terminated: Int)
+data class PasswordStatusDto(val hasPassword: Boolean)
 data class CallDto(val id: String, val chatId: String, val type: String, val state: String, val startedAt: Long?, val durationSeconds: Int)
 
 // Конфигурация ICE-сервера (STUN/TURN) для WebRTC

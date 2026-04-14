@@ -477,13 +477,14 @@ private fun ChatRow(
                                         MessageType.VIDEO  -> "🎬 Видео"
                                         MessageType.AUDIO  -> "🎤 Аудиосообщение"
                                         MessageType.FILE   -> "📎 Файл"
-                                        // SYSTEM-сообщения о звонках одинаковы для обоих
-                                        // участников; для звонящего «Пропущенный звонок»
-                                        // нелогично — переписываем на «Звонок без ответа».
-                                        MessageType.SYSTEM -> displaySystemPreviewText(
-                                            rawText = msg.content,
-                                            isOwnMessage = msg.senderId == currentUserId,
-                                        )
+                                        MessageType.SYSTEM -> if (msg.senderId == "00000000-0000-0000-0000-000000000001") {
+                                            msg.content
+                                        } else {
+                                            displaySystemPreviewText(
+                                                rawText = msg.content,
+                                                isOwnMessage = msg.senderId == currentUserId,
+                                            )
+                                        }
                                     }
                                 } ?: "Нет сообщений"
                             },
@@ -670,7 +671,7 @@ fun AvatarImage(url: String?, name: String, size: Int) {
     val bgColor = remember(name) { AvatarPalette[abs(name.hashCode()) % AvatarPalette.size] }
 
     val resolvedUrl = when {
-        url == null -> null
+        url.isNullOrBlank() -> null
         url.startsWith("http") -> url
         url.startsWith("/") -> "$serverRoot$url"
         else -> url

@@ -34,6 +34,7 @@ sealed class SignalingEvent {
     data class Typing(val chatId: String, val userId: String) : SignalingEvent()
     /** Профиль чат-партнёра обновился (имя, аватар и т.д.) — payload это полный UserDto. */
     data class UserUpdated(val userId: String, val payload: Map<String, Any?>) : SignalingEvent()
+    data class ForceLogout(val excludeSessionId: String, val reason: String) : SignalingEvent()
     object Connected : SignalingEvent()
     object Disconnected : SignalingEvent()
 }
@@ -188,6 +189,10 @@ class SignalingClient @Inject constructor(
             "typing" -> SignalingEvent.Typing(
                 chatId = payload["chatId"] as? String ?: return,
                 userId = payload["userId"] as? String ?: return,
+            )
+            "force_logout" -> SignalingEvent.ForceLogout(
+                excludeSessionId = payload["excludeSessionId"] as? String ?: "",
+                reason = payload["reason"] as? String ?: "Сессия завершена",
             )
             else -> {
                 Timber.w("Unknown signaling type: ${msg.type}")

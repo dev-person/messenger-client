@@ -275,7 +275,8 @@ fun ChatScreen(
                             DateSeparator(timestamp = message.timestamp)
                         }
 
-                        if (message.type == MessageType.SYSTEM) {
+                        val isBotMessage = message.senderId == "00000000-0000-0000-0000-000000000001"
+                        if (message.type == MessageType.SYSTEM && !isBotMessage) {
                             // Системные сообщения о звонках одинаковые на сервере для
                             // обоих участников: "Пропущенный звонок" / "Пропущенный
                             // видеозвонок". У звонящего это нелогично — он же сам

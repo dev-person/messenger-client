@@ -2,7 +2,10 @@ package com.secure.messenger.presentation.ui.main
 
 import android.Manifest
 import android.app.NotificationManager
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -125,6 +128,23 @@ class MainActivity : ComponentActivity() {
             SecureMessengerTheme(colorScheme = selectedScheme) {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     val navController = rememberNavController()
+
+                    // Слушаем force_logout — при отзыве сессии перекидываем на авторизацию
+                    LaunchedEffect(Unit) {
+                        val receiver = object : BroadcastReceiver() {
+                            override fun onReceive(ctx: Context, intent: Intent) {
+                                navController.navigate(Screen.Auth.route) {
+                                    popUpTo(0) { inclusive = true }
+                                }
+                            }
+                        }
+                        ContextCompat.registerReceiver(
+                            this@MainActivity, receiver,
+                            IntentFilter(MessagingService.ACTION_FORCE_LOGOUT),
+                            ContextCompat.RECEIVER_NOT_EXPORTED,
+                        )
+                    }
+
                     AppNavHost(navController = navController, startDestination = startDestination)
 
                     // Диалог обновления приложения

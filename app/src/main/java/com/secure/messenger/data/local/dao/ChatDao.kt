@@ -31,7 +31,9 @@ interface ChatDao {
                u.isOnline  AS otherIsOnline
         FROM chats c
         LEFT JOIN messages m ON m.id = (
-            SELECT id FROM messages WHERE chatId = c.id ORDER BY timestamp DESC LIMIT 1
+            SELECT id FROM messages WHERE chatId = c.id
+            AND decryptedContent NOT IN ('[Не удалось расшифровать]', '[Групповые чаты не поддерживаются]')
+            ORDER BY timestamp DESC LIMIT 1
         )
         LEFT JOIN users u ON u.id = c.otherUserId
         WHERE c.isHidden = 0

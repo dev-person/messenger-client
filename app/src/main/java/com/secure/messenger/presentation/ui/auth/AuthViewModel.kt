@@ -6,6 +6,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.secure.messenger.data.repository.OtpCooldownException
 import com.secure.messenger.data.repository.OtpVerifyException
+import com.secure.messenger.data.repository.PasswordException
 import com.secure.messenger.di.AuthTokenProvider
 import com.secure.messenger.domain.repository.AuthRepository
 import com.secure.messenger.utils.CryptoManager
@@ -15,42 +16,62 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import timber.log.Timber
 import javax.inject.Inject
 
-enum class AuthStep { PHONE, OTP }
+enum class AuthStep { PHONE, OTP, PASSWORD }
 
 // Страна с телефонным кодом
 data class Country(
     val name: String,
     val dialCode: String,
     val flag: String,
+    /** Длина номера БЕЗ кода страны (только цифры) */
+    val phoneLength: Int = 10,
+    /** Маска для отображения: # = цифра, пробел/скобки/дефис — разделители */
+    val phoneMask: String = "### ### ## ##",
 )
 
+/** Применяет маску к строке цифр. # заменяется на цифру по порядку. */
+fun applyPhoneMask(digits: String, mask: String): String {
+    val sb = StringBuilder()
+    var idx = 0
+    for (ch in mask) {
+        if (idx >= digits.length) break
+        if (ch == '#') {
+            sb.append(digits[idx++])
+        } else {
+            sb.append(ch)
+        }
+    }
+    return sb.toString()
+}
+
 val COUNTRIES = listOf(
-    Country("Россия",        "+7",    "🇷🇺"),
-    Country("Казахстан",     "+7",    "🇰🇿"),
-    Country("Украина",       "+380",  "🇺🇦"),
-    Country("Беларусь",      "+375",  "🇧🇾"),
-    Country("Узбекистан",    "+998",  "🇺🇿"),
-    Country("Грузия",        "+995",  "🇬🇪"),
-    Country("Армения",       "+374",  "🇦🇲"),
-    Country("Азербайджан",   "+994",  "🇦🇿"),
-    Country("США",           "+1",    "🇺🇸"),
-    Country("Великобритания","+44",   "🇬🇧"),
-    Country("Германия",      "+49",   "🇩🇪"),
-    Country("Франция",       "+33",   "🇫🇷"),
-    Country("Турция",        "+90",   "🇹🇷"),
-    Country("Израиль",       "+972",  "🇮🇱"),
-    Country("ОАЭ",           "+971",  "🇦🇪"),
-    Country("Индия",         "+91",   "🇮🇳"),
-    Country("Китай",         "+86",   "🇨🇳"),
-    Country("Бразилия",      "+55",   "🇧🇷"),
-    Country("Польша",        "+48",   "🇵🇱"),
-    Country("Финляндия",     "+358",  "🇫🇮"),
+    Country("Россия",        "+7",    "🇷🇺", 10, "(###) ###-##-##"),
+    Country("Казахстан",     "+7",    "🇰🇿", 10, "(###) ###-##-##"),
+    Country("Украина",       "+380",  "🇺🇦", 9,  "(##) ###-##-##"),
+    Country("Беларусь",      "+375",  "🇧🇾", 9,  "(##) ###-##-##"),
+    Country("Узбекистан",    "+998",  "🇺🇿", 9,  "(##) ###-##-##"),
+    Country("Грузия",        "+995",  "🇬🇪", 9,  "(###) ##-##-##"),
+    Country("Армения",       "+374",  "🇦🇲", 8,  "(##) ###-###"),
+    Country("Азербайджан",   "+994",  "🇦🇿", 9,  "(##) ###-##-##"),
+    Country("США",           "+1",    "🇺🇸", 10, "(###) ###-####"),
+    Country("Великобритания","+44",   "🇬🇧", 10, "#### ######"),
+    Country("Германия",      "+49",   "🇩🇪", 10, "### #######"),
+    Country("Франция",       "+33",   "🇫🇷", 9,  "# ## ## ## ##"),
+    Country("Турция",        "+90",   "🇹🇷", 10, "(###) ###-##-##"),
+    Country("Израиль",       "+972",  "🇮🇱", 9,  "##-###-####"),
+    Country("ОАЭ",           "+971",  "🇦🇪", 9,  "##-###-####"),
+    Country("Индия",         "+91",   "🇮🇳", 10, "##### #####"),
+    Country("Китай",         "+86",   "🇨🇳", 11, "### #### ####"),
+    Country("Бразилия",      "+55",   "🇧🇷", 11, "(##) #####-####"),
+    Country("Польша",        "+48",   "🇵🇱", 9,  "### ### ###"),
+    Country("Финляндия",     "+358",  "🇫🇮", 9,  "## ### ####"),
 )
 
 data class AuthUiState(
@@ -68,6 +89,14 @@ data class AuthUiState(
     val error: String? = null,
     // Обратный отсчёт до повторной отправки (секунды)
     val resendCountdown: Int = 0,
+    // Password
+    val password: String = "",
+    val passwordConfirm: String = "",
+    /** true = у пользователя уже задан пароль (ввести), false = новый пароль (задать). */
+    val hasPassword: Boolean = false,
+    // Delete key confirmation
+    val deleteKeyOtp: String = "",
+    val showDeleteKeyOtpInput: Boolean = false,
 ) {
     // Полный номер для API
     val fullPhone: String get() = country.dialCode + phoneNumber.trimStart('0')
@@ -228,35 +257,49 @@ class AuthViewModel @Inject constructor(
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isLoading = true, error = null)
 
-            val isNewUser = !localKeyStore.hasKeyPair()
-
             authRepository.verifyOtp(_uiState.value.fullPhone, _uiState.value.otp)
-                .onSuccess {
-                    // Верификация успешна — очищаем сохранённый кулдаун
+                .onSuccess { result ->
                     cooldownPrefs.edit().remove(KEY_COOLDOWN_EXPIRY).apply()
                     countdownJob?.cancel()
-                    ensureKeyPairExists()
-                    onSuccess(isNewUser)
+
+                    val userId = result.user.id
+                    val serverPublicKey = result.user.publicKey
+
+                    // Если на устройстве есть ключи ЭТОГО пользователя
+                    // И локальный публичный ключ совпадает с серверным —
+                    // ключ актуален, пароль не нужен
+                    if (localKeyStore.hasKeyPair() && localKeyStore.isOwner(userId)) {
+                        val localPublicKey = localKeyStore.getPublicKey()
+                        if (localPublicKey != null && localPublicKey == serverPublicKey) {
+                            authRepository.updateProfile(displayName = "", username = "", bio = null)
+                            onSuccess(false)
+                            return@launch
+                        }
+                        // Ключ устарел (пароль сменили на другом устройстве) — очищаем
+                        localKeyStore.clear()
+                    }
+
+                    // Ключи от другого пользователя — очищаем
+                    if (localKeyStore.hasKeyPair() && !localKeyStore.isOwner(userId)) {
+                        localKeyStore.clear()
+                    }
+
+                    // Нет ключей → нужен пароль (ввести существующий или задать новый)
+                    _uiState.value = _uiState.value.copy(
+                        step = AuthStep.PASSWORD,
+                        hasPassword = result.hasPassword,
+                        password = "",
+                        passwordConfirm = "",
+                        error = null,
+                    )
                 }
                 .onFailure { e ->
                     when {
                         e is OtpVerifyException && e.errorCode == "too_many_attempts" -> {
-                            // Лимит попыток исчерпан — очищаем поле, чтобы юзер
-                            // не пытался долбить тот же код, и сообщение явно
-                            // намекает запросить новый.
-                            _uiState.value = _uiState.value.copy(
-                                otp = "",
-                                error = e.message,
-                            )
+                            _uiState.value = _uiState.value.copy(otp = "", error = e.message)
                         }
                         e is OtpVerifyException && e.errorCode == "invalid_code" -> {
-                            // Неверный код — чистим поле, чтобы было удобно
-                            // ввести заново. Сообщение от сервера содержит
-                            // оставшееся число попыток.
-                            _uiState.value = _uiState.value.copy(
-                                otp = "",
-                                error = e.message,
-                            )
+                            _uiState.value = _uiState.value.copy(otp = "", error = e.message)
                         }
                         else -> {
                             _uiState.value = _uiState.value.copy(error = e.message)
@@ -268,21 +311,172 @@ class AuthViewModel @Inject constructor(
         }
     }
 
-    /**
-     * Генерирует пару ключей X25519 при первом входе.
-     * Публичный ключ загружается на сервер для E2E-шифрования.
-     */
-    private suspend fun ensureKeyPairExists() {
-        if (localKeyStore.hasKeyPair()) return
+    // ── Пароль шифрования ────────────────────────────────────────────────────
 
-        val (publicKey, privateKey) = cryptoManager.generateKeyPair()
+    fun onPasswordChange(value: String) {
+        _uiState.value = _uiState.value.copy(password = value, error = null)
+    }
+
+    fun onPasswordConfirmChange(value: String) {
+        _uiState.value = _uiState.value.copy(passwordConfirm = value, error = null)
+    }
+
+    /**
+     * Подтверждение пароля: если hasPassword=true → верифицируем на сервере,
+     * иначе → устанавливаем новый. Затем генерируем ключ из телефон+пароль.
+     */
+    fun submitPassword(onSuccess: (isNewUser: Boolean) -> Unit) {
+        val state = _uiState.value
+        val password = state.password
+
+        if (state.hasPassword) {
+            // Ввод существующего пароля
+            if (password.isEmpty()) {
+                _uiState.value = state.copy(error = "Введите пароль")
+                return
+            }
+        } else {
+            // Установка нового пароля
+            if (password.length < 8) {
+                _uiState.value = state.copy(error = "Минимум 8 символов")
+                return
+            }
+            if (password != state.passwordConfirm) {
+                _uiState.value = state.copy(error = "Пароли не совпадают")
+                return
+            }
+        }
+
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(isLoading = true, error = null)
+
+            val serverResult = if (state.hasPassword) {
+                authRepository.verifyPassword(password)
+            } else {
+                authRepository.setPassword(password)
+            }
+
+            serverResult
+                .onSuccess {
+                    generateKeyFromPassword(state.fullPhone, password)
+                    onSuccess(!state.hasPassword)
+                }
+                .onFailure { e ->
+                    val msg = when (e) {
+                        is PasswordException -> e.message ?: "Ошибка"
+                        else -> e.message ?: "Нет связи с сервером"
+                    }
+                    _uiState.value = _uiState.value.copy(error = msg)
+                }
+
+            _uiState.value = _uiState.value.copy(isLoading = false)
+        }
+    }
+
+    /**
+     * Пропуск пароля — генерируем случайный ключ. Старые сообщения будут скрыты.
+     * Только для новых пользователей (hasPassword=false).
+     */
+    fun skipPassword(onSuccess: (isNewUser: Boolean) -> Unit) {
+        viewModelScope.launch {
+            val (publicKey, privateKey) = cryptoManager.generateKeyPair()
+            val publicKeyBase64 = Base64.encodeToString(publicKey, Base64.NO_WRAP)
+            val privateKeyBase64 = Base64.encodeToString(privateKey, Base64.NO_WRAP)
+            localKeyStore.saveKeyPair(publicKeyBase64, privateKeyBase64)
+            saveKeyOwner()
+
+            authRepository.updateProfile(displayName = "", username = "", bio = null)
+                .onFailure { Timber.e(it, "Не удалось загрузить публичный ключ") }
+
+            onSuccess(true)
+        }
+    }
+
+    /**
+     * Шаг 1: запросить OTP для подтверждения удаления ключа.
+     */
+    fun deleteEncryptionKey() {
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(isLoading = true, error = null)
+            authRepository.requestOtp(_uiState.value.fullPhone)
+                .onSuccess {
+                    _uiState.value = _uiState.value.copy(
+                        showDeleteKeyOtpInput = true,
+                        deleteKeyOtp = "",
+                        error = null,
+                    )
+                }
+                .onFailure { e ->
+                    if (e is OtpCooldownException) {
+                        // Код уже отправлен — показываем ввод
+                        _uiState.value = _uiState.value.copy(
+                            showDeleteKeyOtpInput = true,
+                            deleteKeyOtp = "",
+                            error = null,
+                        )
+                    } else {
+                        _uiState.value = _uiState.value.copy(error = e.message)
+                    }
+                }
+            _uiState.value = _uiState.value.copy(isLoading = false)
+        }
+    }
+
+    fun onDeleteKeyOtpChange(value: String) {
+        _uiState.value = _uiState.value.copy(deleteKeyOtp = value, error = null)
+    }
+
+    /**
+     * Шаг 2: подтвердить OTP и удалить ключ.
+     */
+    fun confirmDeleteKey() {
+        val code = _uiState.value.deleteKeyOtp
+        if (code.length != 6) {
+            _uiState.value = _uiState.value.copy(error = "Введите 6-значный код")
+            return
+        }
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(isLoading = true, error = null)
+            authRepository.deletePassword(code)
+                .onSuccess {
+                    _uiState.value = _uiState.value.copy(
+                        hasPassword = false,
+                        password = "",
+                        passwordConfirm = "",
+                        showDeleteKeyOtpInput = false,
+                        error = null,
+                    )
+                }
+                .onFailure { e ->
+                    _uiState.value = _uiState.value.copy(error = e.message)
+                }
+            _uiState.value = _uiState.value.copy(isLoading = false)
+        }
+    }
+
+    fun cancelDeleteKey() {
+        _uiState.value = _uiState.value.copy(showDeleteKeyOtpInput = false, error = null)
+    }
+
+    /**
+     * Генерирует детерминированную пару ключей X25519 из телефон+пароль
+     * и загружает публичный ключ на сервер.
+     */
+    private suspend fun generateKeyFromPassword(phone: String, password: String) {
+        val (publicKey, privateKey) = cryptoManager.deriveKeyPairFromPassword(phone, password)
         val publicKeyBase64 = Base64.encodeToString(publicKey, Base64.NO_WRAP)
         val privateKeyBase64 = Base64.encodeToString(privateKey, Base64.NO_WRAP)
-        localKeyStore.saveKeyPair(publicKeyBase64, privateKeyBase64)
+        localKeyStore.saveKeyPair(publicKeyBase64, privateKeyBase64, fromPassword = true)
+        saveKeyOwner()
 
-        // Загружаем публичный ключ, чтобы другие могли нам писать
         authRepository.updateProfile(displayName = "", username = "", bio = null)
             .onFailure { Timber.e(it, "Не удалось загрузить публичный ключ") }
+    }
+
+    /** Привязывает ключ к текущему пользователю. */
+    private suspend fun saveKeyOwner() {
+        val user = authRepository.currentUser.first()
+        user?.id?.let { localKeyStore.setOwner(it) }
     }
 
     override fun onCleared() {
