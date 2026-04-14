@@ -133,6 +133,7 @@ fun ChatScreen(
     val currentUserId by viewModel.currentUserId.collectAsStateWithLifecycle()
     val isOtherOnline by viewModel.isOtherUserOnline.collectAsStateWithLifecycle()
     val otherUser by viewModel.otherUser.collectAsStateWithLifecycle()
+    val isBotChat = chatInfo?.otherUserId == "00000000-0000-0000-0000-000000000001"
     val isTyping by viewModel.isTyping.collectAsStateWithLifecycle()
     val isRecording by viewModel.isRecording.collectAsStateWithLifecycle()
     val recordingSeconds by viewModel.recordingSeconds.collectAsStateWithLifecycle()
@@ -318,8 +319,8 @@ fun ChatScreen(
                 }
             }
 
-            // ── Поле ввода ─────────────────────────────────────────────────
-            MessageInputBar(
+            // ── Поле ввода (скрыто для бот-чата) ─────────────────────────
+            if (!isBotChat) MessageInputBar(
                 text = inputText,
                 editingMessage = uiState.editingMessage,
                 replyingTo = uiState.replyingTo,
@@ -465,8 +466,9 @@ private fun ChatTopBar(
                 }
             }
 
-            // Кнопка меню действий (3 точки) — звонки и др. вынесены сюда
-            if (isDirectChat) {
+            // Кнопка меню действий (3 точки) — звонки и др. (скрыто для бота)
+            val isBotPeer = peerId == "00000000-0000-0000-0000-000000000001"
+            if (isDirectChat && !isBotPeer) {
                 Box {
                     IconButton(
                         onClick = { menuVisible = true },

@@ -873,7 +873,7 @@ private fun ChangePasswordDialog(
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Смена пароля") },
+        title = { Text(if (hasPassword) "Смена пароля" else "Установка пароля") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (hasPassword) {
@@ -889,7 +889,7 @@ private fun ChangePasswordDialog(
                 OutlinedTextField(
                     value = newPassword,
                     onValueChange = onNewPasswordChange,
-                    label = { Text("Новый пароль") },
+                    label = { Text(if (hasPassword) "Новый пароль" else "Пароль") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                     modifier = Modifier.fillMaxWidth(),
@@ -909,18 +909,20 @@ private fun ChangePasswordDialog(
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
-                Surface(
-                    shape = RoundedCornerShape(8.dp),
-                    color = MaterialTheme.colorScheme.errorContainer,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text(
-                        text = "Все другие устройства будут разлогинены. " +
-                               "Ранее зашифрованные сообщения станут недоступны без нового пароля.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onErrorContainer,
-                        modifier = Modifier.padding(8.dp),
-                    )
+                if (hasPassword) {
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = "Все другие устройства будут разлогинены. " +
+                                   "Ранее зашифрованные сообщения станут недоступны без нового пароля.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            modifier = Modifier.padding(8.dp),
+                        )
+                    }
                 }
             }
         },
@@ -929,7 +931,10 @@ private fun ChangePasswordDialog(
                 if (isLoading) {
                     CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
                 } else {
-                    Text("Сменить пароль", color = MaterialTheme.colorScheme.error)
+                    Text(
+                        if (hasPassword) "Сменить пароль" else "Установить",
+                        color = if (hasPassword) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                    )
                 }
             }
         },
