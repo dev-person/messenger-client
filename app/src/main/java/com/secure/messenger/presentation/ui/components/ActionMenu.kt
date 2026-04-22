@@ -86,15 +86,15 @@ fun ActionMenu(
         ),
     ) {
         Surface(
-            shape = RoundedCornerShape(18.dp),
+            shape = RoundedCornerShape(14.dp),
             color = MaterialTheme.colorScheme.surfaceContainerHigh,
             tonalElevation = 8.dp,
             shadowElevation = 16.dp,
         ) {
             Column(
                 modifier = Modifier
-                    .widthIn(min = 220.dp, max = 300.dp)
-                    .padding(vertical = 6.dp),
+                    .widthIn(min = 180.dp, max = 260.dp)
+                    .padding(vertical = 4.dp),
             ) {
                 actions.forEach { action ->
                     val itemColor = if (action.danger) {
@@ -109,7 +109,7 @@ fun ActionMenu(
                                 onDismiss()
                                 action.onClick()
                             }
-                            .padding(horizontal = 20.dp, vertical = 14.dp),
+                            .padding(horizontal = 14.dp, vertical = 9.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         if (action.icon != null) {
@@ -117,15 +117,15 @@ fun ActionMenu(
                                 imageVector = action.icon,
                                 contentDescription = null,
                                 tint = itemColor,
-                                modifier = Modifier.size(22.dp),
+                                modifier = Modifier.size(18.dp),
                             )
-                            Spacer(modifier = Modifier.width(16.dp))
+                            Spacer(modifier = Modifier.width(12.dp))
                         }
                         Text(
                             text = action.label,
                             color = itemColor,
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.Medium,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Normal,
                         )
                     }
                 }

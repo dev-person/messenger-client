@@ -134,15 +134,26 @@ class IncomingMessageHandler @Inject constructor(
                 chatDao.incrementUnread(chatId, System.currentTimeMillis())
             }
 
-            // Расшифровываем
+            // Расшифровываем — пробуем текущий приватный ключ + все legacy
             val myPrivateKeyBase64 = localKeyStore.getPrivateKey() ?: run {
                 Timber.w("IncomingMessageHandler: no local private key")
                 return null
             }
             val myPrivateKeyBytes = Base64.decode(myPrivateKeyBase64, Base64.NO_WRAP)
-            var senderPublicKeyBytes = Base64.decode(sender.publicKey, Base64.NO_WRAP)
-            var sharedSecret = cryptoManager.computeSharedSecret(myPrivateKeyBytes, senderPublicKeyBytes)
-            var decryptedContent = cryptoManager.decryptMessage(encryptedContent, sharedSecret, messageId)
+            val senderPublicKeyBytes = Base64.decode(sender.publicKey, Base64.NO_WRAP)
+            val secrets = mutableListOf(
+                cryptoManager.computeSharedSecret(myPrivateKeyBytes, senderPublicKeyBytes)
+            )
+            for (legacy in localKeyStore.getLegacyPrivateKeys()) {
+                if (legacy == myPrivateKeyBase64) continue
+                runCatching {
+                    val bytes = Base64.decode(legacy, Base64.NO_WRAP)
+                    secrets.add(cryptoManager.computeSharedSecret(bytes, senderPublicKeyBytes))
+                }
+            }
+            var decryptedContent = cryptoManager.decryptMessageWithAnyKey(
+                encryptedContent, secrets, messageId,
+            )
 
             if (decryptedContent == null) {
                 // Расшифровка не удалась — отправитель мог обновить ключевую пару (перелогин).
@@ -151,8 +162,19 @@ class IncomingMessageHandler @Inject constructor(
                 if (freshDto != null && freshDto.publicKey != sender.publicKey) {
                     Timber.d("IncomingMessageHandler: retrying decrypt with fresh public key for $senderId")
                     val freshPubBytes = Base64.decode(freshDto.publicKey, Base64.NO_WRAP)
-                    val freshSecret = cryptoManager.computeSharedSecret(myPrivateKeyBytes, freshPubBytes)
-                    decryptedContent = cryptoManager.decryptMessage(encryptedContent, freshSecret, messageId)
+                    val freshSecrets = mutableListOf(
+                        cryptoManager.computeSharedSecret(myPrivateKeyBytes, freshPubBytes)
+                    )
+                    for (legacy in localKeyStore.getLegacyPrivateKeys()) {
+                        if (legacy == myPrivateKeyBase64) continue
+                        runCatching {
+                            val bytes = Base64.decode(legacy, Base64.NO_WRAP)
+                            freshSecrets.add(cryptoManager.computeSharedSecret(bytes, freshPubBytes))
+                        }
+                    }
+                    decryptedContent = cryptoManager.decryptMessageWithAnyKey(
+                        encryptedContent, freshSecrets, messageId,
+                    )
                     if (decryptedContent != null) {
                         // Сохраняем обновлённый ключ чтобы следующие сообщения расшифровывались сразу
                         userDao.upsert(sender.copy(publicKey = freshDto.publicKey))
@@ -169,9 +191,16 @@ class IncomingMessageHandler @Inject constructor(
             val safeType = runCatching { MessageType.valueOf(msgType) }.getOrDefault(MessageType.TEXT).name
             // Извлекаем replyToId из payload (для цитат)
             val replyToId = payload["replyToId"] as? String
+            // Для медиа-типов не кладём encryptedContent локально — он дублирует
+            // тяжёлый base64-блоб в decryptedContent и раздувает строку Room
+            // свыше лимита CursorWindow (2МБ).
+            val isHeavy = safeType in setOf(
+                MessageType.IMAGE.name, MessageType.AUDIO.name, MessageType.VIDEO.name,
+            )
             messageDao.upsert(MessageEntity(
                 id = messageId, chatId = chatId, senderId = senderId,
-                encryptedContent = encryptedContent, decryptedContent = decryptedContent,
+                encryptedContent = if (isHeavy) "" else encryptedContent,
+                decryptedContent = decryptedContent,
                 type = safeType, status = MessageStatus.DELIVERED.name,
                 timestamp = timestamp,
                 replyToId = replyToId, mediaUrl = null, isEdited = false,

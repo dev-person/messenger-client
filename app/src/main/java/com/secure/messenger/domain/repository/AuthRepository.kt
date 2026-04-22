@@ -18,4 +18,14 @@ interface AuthRepository {
     suspend fun uploadAvatar(imageBytes: ByteArray, extension: String): Result<User>
     suspend fun logout()
     fun isLoggedIn(): Boolean
+
+    /**
+     * Загружает с сервера зашифрованный blob с legacy-ключами (старые
+     * приватные X25519). Сервер для клиента — чёрный ящик, видит только blob,
+     * пароль у него отсутствует. Возвращает пустую строку если blob пустой.
+     */
+    suspend fun getLegacyKeys(): Result<String>
+
+    /** Заливает blob с legacy-ключами на сервер целиком (перезаписывая старый). */
+    suspend fun putLegacyKeys(blob: String): Result<Unit>
 }

@@ -29,6 +29,13 @@ class LocalKeyStore @Inject constructor(
         private const val KEY_PUBLIC = "identity_public_key"
         private const val KEY_FROM_PASSWORD = "key_from_password"
         private const val KEY_OWNER_ID = "key_owner_user_id"
+        /**
+         * Список legacy приватных ключей X25519 в base64, разделённых `;`.
+         * Каждый ключ тут был когда-то «текущим» у этого пользователя —
+         * сохраняется для расшифровки старых сообщений после смены ключа
+         * (установка/смена пароля шифрования).
+         */
+        private const val KEY_LEGACY_PRIVATE_KEYS = "legacy_private_keys"
     }
 
     private val prefs: SharedPreferences by lazy {
@@ -110,5 +117,36 @@ class LocalKeyStore @Inject constructor(
 
     fun clear() {
         prefs.edit().clear().apply()
+    }
+
+    // ── Legacy keys ──────────────────────────────────────────────────────────
+
+    /**
+     * Возвращает список legacy приватных ключей (base64, без padding).
+     * Дубликаты отфильтрованы. Используется для попыток расшифровки старых
+     * сообщений после смены ключа.
+     */
+    fun getLegacyPrivateKeys(): List<String> {
+        val raw = prefs.getString(KEY_LEGACY_PRIVATE_KEYS, null) ?: return emptyList()
+        return raw.split(';').filter { it.isNotEmpty() }.distinct()
+    }
+
+    /** Перезаписывает список legacy ключей целиком. */
+    fun setLegacyPrivateKeys(keys: List<String>) {
+        val normalized = keys.distinct().filter { it.isNotEmpty() }
+        prefs.edit()
+            .putString(KEY_LEGACY_PRIVATE_KEYS, normalized.joinToString(";"))
+            .apply()
+    }
+
+    /**
+     * Добавляет новый legacy-ключ к существующему списку. Идемпотентно —
+     * повторное добавление того же ключа не дублирует запись.
+     */
+    fun addLegacyPrivateKey(privateKeyBase64: String) {
+        if (privateKeyBase64.isEmpty()) return
+        val current = getLegacyPrivateKeys().toMutableSet()
+        current.add(privateKeyBase64)
+        setLegacyPrivateKeys(current.toList())
     }
 }

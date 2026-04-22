@@ -54,13 +54,40 @@ object ImageCodec {
         val width: Int,
         val height: Int,
         val isSticker: Boolean = false,
+        /**
+         * Идентификатор группы — одинаковый для всех картинок, отправленных
+         * одним вызовом (например, пользователь выбрал 5 фото из галереи).
+         * Клиент рендерит сообщения с одинаковым groupId одного отправителя
+         * подряд как плитку (как в Telegram). Сервер про groupId не знает —
+         * он зашифрован внутри encryptedContent вместе с картинкой.
+         */
+        val groupId: String? = null,
+        /**
+         * Номер картинки в группе (0-based). Нужен для стабильной сортировки
+         * внутри плитки — иначе порядок зависит от order-of-arrival по WS.
+         */
+        val groupIndex: Int = 0,
+        /**
+         * Размер группы (сколько всего картинок отправлено вместе). Нужен UI
+         * для правильного расчёта layout-а плитки и чтобы понять — пришла ли
+         * вся группа целиком или нужно ждать остальных.
+         */
+        val groupSize: Int = 1,
     )
 
     /**
      * Загружает медиа-контент из URI и решает что с ним делать.
      * Анимированные/стикерные форматы передаются как есть; обычные фото — ужимаются.
+     *
+     * @param maxDim    максимальная сторона после ужатия (по умолчанию 1280)
+     * @param quality   качество JPEG при перекодировке (по умолчанию 80)
      */
-    fun loadAndCompress(context: Context, uri: Uri): ImageData? {
+    fun loadAndCompress(
+        context: Context,
+        uri: Uri,
+        maxDim: Int = MAX_DIMENSION,
+        quality: Int = JPEG_QUALITY,
+    ): ImageData? {
         return runCatching {
             // 1. Читаем размеры и реальный MIME без полной декодировки
             val resolver = context.contentResolver
@@ -140,7 +167,7 @@ object ImageCodec {
             // ── Большая картинка — декодируем и ужимаем в JPEG (или PNG если прозрачная)
             val maxOrig = maxOf(origWidth, origHeight)
             var sampleSize = 1
-            while (maxOrig / sampleSize > MAX_DIMENSION * 2) sampleSize *= 2
+            while (maxOrig / sampleSize > maxDim * 2) sampleSize *= 2
 
             val decodeOptions = BitmapFactory.Options().apply {
                 inSampleSize = sampleSize
@@ -149,8 +176,8 @@ object ImageCodec {
             val bitmap = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, decodeOptions)
                 ?: return null
 
-            // Финальное масштабирование до MAX_DIMENSION
-            val scale = MAX_DIMENSION.toFloat() / maxOf(bitmap.width, bitmap.height)
+            // Финальное масштабирование до maxDim
+            val scale = maxDim.toFloat() / maxOf(bitmap.width, bitmap.height)
             val scaled = if (scale < 1f) {
                 val w = (bitmap.width * scale).toInt()
                 val h = (bitmap.height * scale).toInt()
@@ -166,7 +193,7 @@ object ImageCodec {
             val format = if (hasAlpha) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
             val mime = if (hasAlpha) "image/png" else "image/jpeg"
             val out = ByteArrayOutputStream()
-            scaled.compress(format, JPEG_QUALITY, out)
+            scaled.compress(format, quality, out)
             val result = ImageData(
                 bytes = out.toByteArray(),
                 mime = mime,
@@ -188,7 +215,38 @@ object ImageCodec {
             put("w", data.width)
             put("h", data.height)
             if (data.isSticker) put("s", true)
+            // Группа — пишем только когда сообщение входит в альбом (groupSize > 1)
+            if (data.groupId != null && data.groupSize > 1) {
+                put("g", data.groupId)
+                put("gi", data.groupIndex)
+                put("gn", data.groupSize)
+            }
         }.toString()
+    }
+
+    /**
+     * Лёгкая выжимка groupId / groupIndex / groupSize без декодирования
+     * base64-байтов картинки — для группировки сообщений в альбомы в UI.
+     * Не аллоцирует большой ByteArray, читает только несколько полей.
+     */
+    data class GroupInfo(val groupId: String, val index: Int, val size: Int)
+
+    fun extractGroupInfo(payload: String): GroupInfo? {
+        if (payload.isBlank()) return null
+        // Fast-path: если в payload нет маркера группы — сразу null, без
+        // парсинга JSON. Без него каждое IMAGE-сообщение грузило бы
+        // JSONObject(500KB+ base64) только чтобы вернуть null.
+        if (!payload.contains("\"g\":\"")) return null
+        return runCatching {
+            val obj = JSONObject(payload)
+            val gId = obj.optString("g", "")
+            if (gId.isEmpty()) return@runCatching null
+            GroupInfo(
+                groupId = gId,
+                index = obj.optInt("gi", 0),
+                size = obj.optInt("gn", 1),
+            )
+        }.getOrNull()
     }
 
     /** Десериализует payload — null если строка не парсится. */
@@ -198,12 +256,16 @@ object ImageCodec {
             val obj = JSONObject(payload)
             val base64 = obj.optString("i", "")
             if (base64.isEmpty()) return null
+            val gId = obj.optString("g", "")
             ImageData(
                 bytes = Base64.decode(base64, Base64.NO_WRAP),
                 mime = obj.optString("m", "image/jpeg"),
                 width = obj.optInt("w", 0),
                 height = obj.optInt("h", 0),
                 isSticker = obj.optBoolean("s", false),
+                groupId = gId.ifEmpty { null },
+                groupIndex = obj.optInt("gi", 0),
+                groupSize = obj.optInt("gn", 1),
             )
         }.onFailure { Timber.w(it, "ImageCodec.decode failed") }.getOrNull()
     }

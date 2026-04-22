@@ -28,6 +28,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -100,7 +101,23 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        // transparent навбар обоими способами: SystemBarStyle(transparent, transparent)
+        // перекрывает автоматический scrim enableEdgeToEdge(), а
+        // isNavigationBarContrastEnforced=false выключает контраст-оверлей
+        // на Android 10+. Без этого свой кастомный градиент не виден.
+        enableEdgeToEdge(
+            statusBarStyle = androidx.activity.SystemBarStyle.auto(
+                android.graphics.Color.TRANSPARENT,
+                android.graphics.Color.TRANSPARENT,
+            ),
+            navigationBarStyle = androidx.activity.SystemBarStyle.auto(
+                android.graphics.Color.TRANSPARENT,
+                android.graphics.Color.TRANSPARENT,
+            ),
+        )
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            window.isNavigationBarContrastEnforced = false
+        }
 
         // Allow this activity to show over the lock screen — needed for incoming call UI
         setShowWhenLocked(true)
@@ -126,6 +143,22 @@ class MainActivity : ComponentActivity() {
         setContent {
             val selectedScheme by ThemePreferences.colorScheme.collectAsState()
             SecureMessengerTheme(colorScheme = selectedScheme) {
+                // Цвет иконок статус-бара / нав-бара подстраиваем под ФОН
+                // приложения (а не под системную тему). Иначе при Material Dark
+                // в приложении и светлой теме в системе иконки заряда/времени
+                // рисуются тёмными и плохо видны на тёмном фоне.
+                val colorScheme = androidx.compose.material3.MaterialTheme.colorScheme
+                val isAppDark = colorScheme.background.luminance() < 0.5f
+                val view = androidx.compose.ui.platform.LocalView.current
+                if (!view.isInEditMode) {
+                    androidx.compose.runtime.SideEffect {
+                        val controller = androidx.core.view.WindowCompat
+                            .getInsetsController(window, view)
+                        // true = тёмные иконки (для светлого фона), false = светлые
+                        controller.isAppearanceLightStatusBars = !isAppDark
+                        controller.isAppearanceLightNavigationBars = !isAppDark
+                    }
+                }
                 Surface(modifier = Modifier.fillMaxSize()) {
                     val navController = rememberNavController()
 

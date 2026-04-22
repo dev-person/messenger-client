@@ -43,7 +43,9 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Call
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.AlternateEmail
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Done
 import androidx.compose.material.icons.filled.DoneAll
@@ -99,6 +101,14 @@ import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.graphics.layer.drawLayer
 import coil.compose.AsyncImage
 import coil.request.repeatCount
 import com.secure.messenger.BuildConfig
@@ -117,6 +127,76 @@ import com.secure.messenger.presentation.viewmodel.ChatViewModel
 import com.secure.messenger.utils.formatDateSeparator
 import com.secure.messenger.utils.formatMessageTime
 import com.secure.messenger.utils.isSameDay
+
+// ── Типы элементов в чате (сообщение или альбом картинок) ────────────────────
+
+/**
+ * Плоский элемент списка чата. Альбом из нескольких картинок одного
+ * отправителя рендерится как ОДИН элемент-плитка (а не N отдельных bubble).
+ */
+private sealed interface ChatItem {
+    val key: String
+    val timestamp: Long
+
+    data class Single(val message: Message) : ChatItem {
+        override val key get() = message.id
+        override val timestamp get() = message.timestamp
+    }
+
+    data class Album(
+        val groupId: String,
+        val senderId: String,
+        val messages: List<Message>,
+    ) : ChatItem {
+        // key привязан к groupId + последнему id — обновится если группа растёт
+        override val key get() = "album-$groupId-${messages.size}"
+        override val timestamp get() = messages.first().timestamp
+    }
+}
+
+/**
+ * Группирует подряд идущие IMAGE-сообщения одного отправителя с одинаковым
+ * groupId в альбом. Остальные сообщения остаются Single. Сортирует картинки
+ * внутри альбома по groupIndex для стабильного порядка.
+ */
+private fun groupChatItems(messages: List<Message>): List<ChatItem> {
+    if (messages.isEmpty()) return emptyList()
+    val result = mutableListOf<ChatItem>()
+    var i = 0
+    while (i < messages.size) {
+        val m = messages[i]
+        val gi = if (m.type == MessageType.IMAGE) {
+            com.secure.messenger.utils.ImageCodec.extractGroupInfo(m.content)
+        } else null
+
+        if (gi != null && gi.size > 1) {
+            val album = mutableListOf(m)
+            var j = i + 1
+            while (j < messages.size) {
+                val next = messages[j]
+                if (next.senderId != m.senderId || next.type != MessageType.IMAGE) break
+                val ni = com.secure.messenger.utils.ImageCodec.extractGroupInfo(next.content)
+                if (ni == null || ni.groupId != gi.groupId) break
+                album.add(next)
+                j++
+            }
+            result.add(
+                ChatItem.Album(
+                    groupId = gi.groupId,
+                    senderId = m.senderId,
+                    messages = album.sortedBy { msg ->
+                        com.secure.messenger.utils.ImageCodec.extractGroupInfo(msg.content)?.index ?: 0
+                    },
+                )
+            )
+            i = j
+        } else {
+            result.add(ChatItem.Single(m))
+            i++
+        }
+    }
+    return result
+}
 
 // ── Экран чата ────────────────────────────────────────────────────────────────
 
@@ -139,6 +219,7 @@ fun ChatScreen(
     val recordingSeconds by viewModel.recordingSeconds.collectAsStateWithLifecycle()
     val recordingWaveform by viewModel.recordingWaveform.collectAsStateWithLifecycle()
     val pendingVoice by viewModel.pendingVoice.collectAsStateWithLifecycle()
+    val albumProgress by viewModel.albumSendProgress.collectAsStateWithLifecycle()
     val highlightedMessageId by viewModel.highlightedMessageId.collectAsStateWithLifecycle()
     val coroutineScope = androidx.compose.runtime.rememberCoroutineScope()
     val keyboardController = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
@@ -155,16 +236,37 @@ fun ChatScreen(
         if (granted) viewModel.startVoiceRecording()
     }
 
-    // Image picker — современный системный медиа-пикер (Android 13+ без permissions)
+    // Image picker — современный системный медиа-пикер для ОДНОЙ картинки
+    // (используется для стикеров из клавиатуры, он работает по одному URI)
     val imagePickerLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia()
     ) { uri ->
         if (uri != null) {
-            // Декодируем + сжимаем в фоне (через корутину ViewModel-а внутри sendImage было бы лучше,
-            // но для простоты сжимаем тут на main и сразу отправляем — картинка ужимается до 1280px)
             val data = com.secure.messenger.utils.ImageCodec.loadAndCompress(context, uri)
             if (data != null) viewModel.sendImage(data)
         }
+    }
+
+    // Множественный пикер — до 15 картинок за раз. При выборе одной автоматически
+    // посылается как обычное одиночное сообщение, при выборе нескольких —
+    // группируются по groupId и рендерятся в UI как плитка.
+    val multiImagePickerLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.PickMultipleVisualMedia(maxItems = 15)
+    ) { uris ->
+        if (uris.isNullOrEmpty()) return@rememberLauncherForActivityResult
+        // Для альбома ужимаем АГРЕССИВНО (720px / quality 68) — 15 крупных
+        // картинок иначе разгоняют Room до десятков МБ и приложение падает
+        // по OOM при эмиссиях Flow-ов.
+        val isAlbum = uris.size > 1
+        val decoded = uris.mapNotNull { uri ->
+            com.secure.messenger.utils.ImageCodec.loadAndCompress(
+                context = context,
+                uri = uri,
+                maxDim = if (isAlbum) 720 else 1280,
+                quality = if (isAlbum) 68 else 80,
+            )
+        }
+        if (decoded.isNotEmpty()) viewModel.sendImages(decoded)
     }
 
     // Закрытие emoji-панели по системной кнопке «Назад»
@@ -190,20 +292,31 @@ fun ChatScreen(
         )
     }
 
-    // Прокрутка к последнему сообщению при первом открытии чата
+    // Группируем сообщения в chatItems заранее — индекс в listState теперь
+    // ссылается на chatItems (альбом = один элемент), а не на messages.
+    val chatItems = remember(messages) { groupChatItems(messages) }
+
+    // Прокрутка к последнему сообщению при первом открытии чата.
+    // В диалоге с кучей картинок размеры айтемов меняются пока Coil
+    // декодирует — один scrollToItem становится неверным. Поэтому держим
+    // последний айтем в конце, пока layout не стабилизируется (~1.5с).
     LaunchedEffect(Unit) {
-        snapshotFlow { messages.size }
+        snapshotFlow { chatItems.size }
             .filter { it > 0 }
             .first()
-        listState.scrollToItem(messages.size - 1)
+        repeat(10) {
+            val target = (chatItems.size - 1).coerceAtLeast(0)
+            listState.scrollToItem(target)
+            kotlinx.coroutines.delay(150)
+        }
     }
 
     // Авто-скролл при новом сообщении — только если уже у конца списка
-    LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) {
+    LaunchedEffect(chatItems.size) {
+        if (chatItems.isNotEmpty()) {
             val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1
-            if (lastVisible >= messages.size - 3) {
-                listState.animateScrollToItem(messages.size - 1)
+            if (lastVisible >= chatItems.size - 3) {
+                listState.animateScrollToItem(chatItems.size - 1)
             }
         }
     }
@@ -222,27 +335,59 @@ fun ChatScreen(
         }
     }
 
+    // Высоты инпут-панели и top-bar — нужны чтобы LazyColumn скроллился
+    // ПОД обоими через contentPadding: сверху под шапку, снизу под инпут.
+    // Тогда сквозь их полупрозрачные подложки видно текущее содержимое.
+    var inputBarHeightPx by remember { mutableStateOf(0) }
+    var topBarHeightPx by remember { mutableStateOf(0) }
+    val density = androidx.compose.ui.platform.LocalDensity.current
+    val inputBarHeightDp = with(density) { inputBarHeightPx.toDp() }
+    val topBarHeightDp = with(density) { topBarHeightPx.toDp() }
+
+    // GraphicsLayer для захвата контента ПОД шапкой и отрисовки его
+    // с blur-эффектом. На Android 12+ (API 31) renderEffect работает как
+    // настоящее помутнение/frosted glass. На более старых версиях — просто
+    // полупрозрачная подложка без блюра.
+    val backdropLayer = androidx.compose.ui.graphics.rememberGraphicsLayer()
+    val blurSupported = android.os.Build.VERSION.SDK_INT >= 31
+    androidx.compose.runtime.DisposableEffect(blurSupported) {
+        if (blurSupported) {
+            backdropLayer.renderEffect = androidx.compose.ui.graphics.BlurEffect(
+                radiusX = 30f,
+                radiusY = 30f,
+                edgeTreatment = androidx.compose.ui.graphics.TileMode.Clamp,
+            )
+        }
+        onDispose { }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.surfaceContainerLow),
     ) {
+        // Обои располагаем САМЫМ НИЖНИМ слоем — поверх них (полупрозрачно)
+        // рендерится инпут и эмоджи-панель. Иначе за ними видно только
+        // сплошной surfaceContainerLow и прозрачность не даёт эффекта.
+        ChatWallpaper()
+
         Column(modifier = Modifier.fillMaxSize()) {
-            // ── OneUI-стиль: шапка чата ────────────────────────────────────
-            ChatTopBar(
-                chatInfo = chatInfo,
-                currentUserId = currentUserId,
-                isOtherOnline = isOtherOnline,
-                isTyping = isTyping,
-                onBack = onBack,
-                onCallClick = onCallClick,
-                onAvatarClick = { otherUser?.let { showProfileUser = it } },
-            )
-
-            // ── Список сообщений с обоями ────────────────────────────────
-            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                ChatWallpaper()
-
+            // ── Список сообщений: занимает ВСЮ высоту экрана. Шапка и инпут
+            //    рендерятся оверлеями сверху/снизу — сообщения просвечивают
+            //    через их полупрозрачные подложки при скролле. ──────────────
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    // Захватываем всё что рисуется в этом Box (обои + сообщения)
+                    // в graphicsLayer, затем отрисовываем дополнительно без
+                    // эффекта (так как у layer установлен blur) — layer потом
+                    // нарисуется за шапкой с блюром.
+                    .drawWithContent {
+                        backdropLayer.record { this@drawWithContent.drawContent() }
+                        drawContent()
+                    },
+            ) {
                 // Плашка-подсказка когда чат пустой
                 if (messages.isEmpty() && !uiState.isLoadingOlder) {
                     EmptyChatHint()
@@ -251,7 +396,12 @@ fun ChatScreen(
                 LazyColumn(
                     state = listState,
                     modifier = Modifier.fillMaxSize(),
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 8.dp),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                        top = topBarHeightDp + 8.dp,
+                        // bottom = высота инпута + небольшой запас, чтобы последнее
+                        // сообщение при прокрутке в конец лежало ровно над инпутом.
+                        bottom = inputBarHeightDp + 8.dp,
+                    ),
                 ) {
                     // Индикатор загрузки старых сообщений
                     if (uiState.isLoadingOlder) {
@@ -269,111 +419,193 @@ fun ChatScreen(
                             }
                         }
                     }
-                    itemsIndexed(messages, key = { _, msg -> msg.id }) { index, message ->
-                        val prevMessage = messages.getOrNull(index - 1)
+                    itemsIndexed(chatItems, key = { _, it -> it.key }) { index, item ->
+                        val prevItem = chatItems.getOrNull(index - 1)
 
-                        if (prevMessage == null || !isSameDay(prevMessage.timestamp, message.timestamp)) {
-                            DateSeparator(timestamp = message.timestamp)
+                        if (prevItem == null || !isSameDay(prevItem.timestamp, item.timestamp)) {
+                            DateSeparator(timestamp = item.timestamp)
                         }
 
-                        val isBotMessage = message.senderId == "00000000-0000-0000-0000-000000000001"
-                        if (message.type == MessageType.SYSTEM && !isBotMessage) {
-                            // Системные сообщения о звонках одинаковые на сервере для
-                            // обоих участников: "Пропущенный звонок" / "Пропущенный
-                            // видеозвонок". У звонящего это нелогично — он же сам
-                            // звонил, не пропускал. Переписываем текст с его перспективы.
-                            val displayText = displaySystemMessageText(
-                                rawText = message.content,
-                                isOwnMessage = message.senderId == currentUserId,
-                            )
-                            SystemMessage(text = displayText, timestamp = message.timestamp)
-                        } else {
-                            val isOutgoing = message.senderId == currentUserId
-                            // Найти цитируемое сообщение в текущем списке (если оно ещё на странице)
-                            val replyTo = message.replyToId?.let { id ->
-                                messages.firstOrNull { it.id == id }
-                            }
-                            MessageBubble(
-                                message = message,
-                                replyTo = replyTo,
-                                isOutgoing = isOutgoing,
-                                isHighlighted = highlightedMessageId == message.id,
-                                onReply  = { viewModel.startReplying(message) },
-                                onQuoteClick = { quotedId ->
-                                    // Скроллим к оригинальному сообщению + подсвечиваем
-                                    val targetIndex = messages.indexOfFirst { it.id == quotedId }
-                                    if (targetIndex >= 0) {
-                                        coroutineScope.launch {
-                                            listState.animateScrollToItem(targetIndex)
-                                        }
-                                        viewModel.highlightMessage(quotedId)
+                        when (item) {
+                            is ChatItem.Single -> {
+                                val message = item.message
+                                val isBotMessage = message.senderId == "00000000-0000-0000-0000-000000000001"
+                                if (message.type == MessageType.SYSTEM && !isBotMessage) {
+                                    val displayText = displaySystemMessageText(
+                                        rawText = message.content,
+                                        isOwnMessage = message.senderId == currentUserId,
+                                    )
+                                    SystemMessage(text = displayText, timestamp = message.timestamp)
+                                } else {
+                                    val isOutgoing = message.senderId == currentUserId
+                                    val replyTo = message.replyToId?.let { id ->
+                                        messages.firstOrNull { it.id == id }
                                     }
-                                },
-                                onDelete = if (isOutgoing) { { viewModel.deleteMessage(message) } } else null,
-                                onEdit   = if (isOutgoing && message.type == MessageType.TEXT) {
-                                    { viewModel.startEditing(message) }
-                                } else null,
-                            )
+                                    MessageBubble(
+                                        message = message,
+                                        replyTo = replyTo,
+                                        isOutgoing = isOutgoing,
+                                        isHighlighted = highlightedMessageId == message.id,
+                                        onReply  = { viewModel.startReplying(message) },
+                                        onQuoteClick = { quotedId ->
+                                            val targetIndex = messages.indexOfFirst { it.id == quotedId }
+                                            if (targetIndex >= 0) {
+                                                coroutineScope.launch {
+                                                    // listState индексирует chatItems, а не messages.
+                                                    // Находим позицию в chatItems где лежит quoted сообщение.
+                                                    val targetItemIndex = chatItems.indexOfFirst {
+                                                        when (it) {
+                                                            is ChatItem.Single -> it.message.id == quotedId
+                                                            is ChatItem.Album -> it.messages.any { m -> m.id == quotedId }
+                                                        }
+                                                    }
+                                                    if (targetItemIndex >= 0) {
+                                                        listState.animateScrollToItem(targetItemIndex)
+                                                    }
+                                                }
+                                                viewModel.highlightMessage(quotedId)
+                                            }
+                                        },
+                                        onDelete = if (isOutgoing) { { viewModel.deleteMessage(message) } } else null,
+                                        onEdit   = if (isOutgoing && message.type == MessageType.TEXT) {
+                                            { viewModel.startEditing(message) }
+                                        } else null,
+                                    )
+                                }
+                            }
+                            is ChatItem.Album -> {
+                                val isOutgoing = item.senderId == currentUserId
+                                AlbumBubble(
+                                    messages = item.messages,
+                                    isOutgoing = isOutgoing,
+                                    onDelete = if (isOutgoing) {
+                                        { msg -> viewModel.deleteMessage(msg) }
+                                    } else null,
+                                )
+                            }
                         }
                     }
                 }
             }
+        }
 
-            // ── Поле ввода (скрыто для бот-чата) ─────────────────────────
-            if (!isBotChat) MessageInputBar(
-                text = inputText,
-                editingMessage = uiState.editingMessage,
-                replyingTo = uiState.replyingTo,
-                showEmojiPicker = uiState.showEmojiPicker,
-                isRecording = isRecording,
-                recordingSeconds = recordingSeconds,
-                recordingWaveform = recordingWaveform,
-                onTextChange = viewModel::onInputChange,
-                onSend = viewModel::sendMessage,
-                onCancelEdit = viewModel::cancelEditing,
-                onCancelReply = viewModel::cancelReplying,
-                onToggleEmoji = {
-                    // При открытии панели эмоджи закрываем системную клавиатуру —
-                    // иначе она перекрывает панель и пользователь видит только дёрганье
-                    if (!uiState.showEmojiPicker) {
-                        keyboardController?.hide()
-                        focusManager.clearFocus()
-                    }
-                    viewModel.toggleEmojiPicker()
-                },
-                onEmojiPick = viewModel::appendEmoji,
-                onAttachImage = {
-                    imagePickerLauncher.launch(
-                        androidx.activity.result.PickVisualMediaRequest(
-                            androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia.ImageOnly
-                        )
-                    )
-                },
-                onContentReceived = { uri ->
-                    // Картинка/стикер из системной клавиатуры — обрабатываем как обычное вложение
-                    val data = com.secure.messenger.utils.ImageCodec.loadAndCompress(context, uri)
-                    if (data != null) viewModel.sendImage(data)
-                },
-                onStartRecording = {
-                    if (androidx.core.content.ContextCompat.checkSelfPermission(
-                            context,
-                            android.Manifest.permission.RECORD_AUDIO,
-                        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-                    ) {
-                        viewModel.startVoiceRecording()
-                    } else {
-                        micPermissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+        // ── Шапка чата — оверлей сверху, под ней скроллятся сообщения
+        //    через blur-лэйер (на Android 12+) — эффект frosted glass. ──────
+        Box(
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .fillMaxWidth()
+                .onSizeChanged { topBarHeightPx = it.height }
+                // Рисуем захваченный layer с blur-эффектом ДО контента шапки —
+                // так он становится подложкой, поверх которой уже лежит
+                // полупрозрачный surface с иконками/текстом.
+                .drawBehind {
+                    clipRect(right = size.width, bottom = size.height) {
+                        drawLayer(backdropLayer)
                     }
                 },
-                onStopRecording = viewModel::stopVoiceRecording,
+        ) {
+            ChatTopBar(
+                chatInfo = chatInfo,
+                currentUserId = currentUserId,
+                isOtherOnline = isOtherOnline,
+                isTyping = isTyping,
+                onBack = onBack,
+                onCallClick = onCallClick,
+                onAvatarClick = { otherUser?.let { showProfileUser = it } },
             )
         }
 
-        // Snackbar
+        // ── Поле ввода рендерится ОВЕРЛЕЕМ в outer Box, а не в Column —
+        //    тогда LazyColumn тянется на всю высоту до низа экрана, и при
+        //    скролле сообщения просвечивают через полупрозрачный инпут. ──
+        if (!isBotChat) MessageInputBar(
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .fillMaxWidth()
+                .onSizeChanged { inputBarHeightPx = it.height },
+            text = inputText,
+            editingMessage = uiState.editingMessage,
+            replyingTo = uiState.replyingTo,
+            showEmojiPicker = uiState.showEmojiPicker,
+            isRecording = isRecording,
+            recordingSeconds = recordingSeconds,
+            recordingWaveform = recordingWaveform,
+            onTextChange = viewModel::onInputChange,
+            onSend = viewModel::sendMessage,
+            onCancelEdit = viewModel::cancelEditing,
+            onCancelReply = viewModel::cancelReplying,
+            onToggleEmoji = {
+                if (!uiState.showEmojiPicker) {
+                    keyboardController?.hide()
+                    focusManager.clearFocus()
+                }
+                viewModel.toggleEmojiPicker()
+            },
+            onEmojiPick = viewModel::appendEmoji,
+            onBackspace = viewModel::backspaceInput,
+            onAttachImage = {
+                multiImagePickerLauncher.launch(
+                    androidx.activity.result.PickVisualMediaRequest(
+                        androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia.ImageOnly
+                    )
+                )
+            },
+            onContentReceived = { uri ->
+                val data = com.secure.messenger.utils.ImageCodec.loadAndCompress(context, uri)
+                if (data != null) viewModel.sendImage(data)
+            },
+            onStartRecording = {
+                if (androidx.core.content.ContextCompat.checkSelfPermission(
+                        context,
+                        android.Manifest.permission.RECORD_AUDIO,
+                    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                ) {
+                    viewModel.startVoiceRecording()
+                } else {
+                    micPermissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+                }
+            },
+            onStopRecording = viewModel::stopVoiceRecording,
+        )
+
+        // Fade-полоса у самого низа экрана: прозрачный сверху → тёмный внизу.
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .height(13.dp)
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(
+                            Color.Transparent,
+                            Color.Black.copy(alpha = 0.9f),
+                        ),
+                    ),
+                ),
+        )
+
+        // Плашка прогресса отправки альбома — над инпутом, пока идёт отправка
+        albumProgress?.let { progress ->
+            AlbumProgressBanner(
+                sent = progress.sent,
+                total = progress.total,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = inputBarHeightDp + 12.dp, start = 16.dp, end = 16.dp),
+            )
+        }
+
+        // Snackbar — поднимаем над инпутом (иначе сообщение «Запись пуста»
+        // и прочие ошибки отрисовывались поверх/за инпутом снизу).
         SnackbarHost(
             hostState = snackbarHostState,
-            modifier = Modifier.align(Alignment.BottomCenter),
-        )
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = inputBarHeightDp + 12.dp, start = 16.dp, end = 16.dp),
+        ) { data ->
+            ChatSnackbar(message = data.visuals.message)
+        }
     }
 }
 
@@ -395,7 +627,10 @@ private fun ChatTopBar(
     var menuVisible by remember { mutableStateOf(false) }
 
     Surface(
-        color = MaterialTheme.colorScheme.surface,
+        // Полупрозрачная «матовая» шапка — как у инпута внизу. На Android 12+
+        // ниже применяется real-blur к контенту ПОД шапкой через
+        // BackdropBlurEffect, здесь просто подложка с альфой.
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.72f),
         shadowElevation = 2.dp,
     ) {
         Row(
@@ -807,6 +1042,32 @@ private fun MessageBubble(
                             onClick = onReply,
                         )
                     )
+                    // Копирование текста (только для TEXT-сообщений)
+                    if (message.type == MessageType.TEXT && message.content.isNotEmpty()) {
+                        add(
+                            ActionMenuItem(
+                                label = "Скопировать",
+                                icon = Icons.Default.ContentCopy,
+                                onClick = {
+                                    val cm = context.getSystemService(
+                                        android.content.Context.CLIPBOARD_SERVICE
+                                    ) as? android.content.ClipboardManager
+                                    cm?.setPrimaryClip(
+                                        android.content.ClipData.newPlainText(
+                                            "message", message.content,
+                                        )
+                                    )
+                                    // На Android 13+ система сама показывает визуальный feedback
+                                    // о копировании, на более старых показываем Toast сами.
+                                    if (android.os.Build.VERSION.SDK_INT < 33) {
+                                        android.widget.Toast.makeText(
+                                            context, "Скопировано", android.widget.Toast.LENGTH_SHORT,
+                                        ).show()
+                                    }
+                                },
+                            )
+                        )
+                    }
                     // Скачать — только для обычных картинок (не стикеров)
                     if (message.type == MessageType.IMAGE && !isSticker) {
                         add(
@@ -1215,6 +1476,22 @@ private fun ImageMessageContent(
                 .build()
         } else null
     }
+    // Для обычных картинок строим ImageRequest с .size() — Coil самплит
+    // bitmap при декодировании до нужного размера, а не держит в памяти
+    // оригинал 1280px. Без этого в чате с десятками фото приложение падало
+    // по OOM при одновременном декодировании (см. FIX#2).
+    val density = androidx.compose.ui.platform.LocalDensity.current
+    val photoModel = remember(payload, imageData.bytes, maxWidth, maxHeight) {
+        if (!isAnimation && !imageData.isSticker) {
+            val widthPx = with(density) { maxWidth.toPx() }.toInt().coerceAtLeast(1)
+            val heightPx = with(density) { maxHeight.toPx() }.toInt().coerceAtLeast(1)
+            coil.request.ImageRequest.Builder(context)
+                .data(imageData.bytes)
+                .size(widthPx, heightPx)
+                .memoryCacheKey("photo-${payload.hashCode()}-${widthPx}x${heightPx}")
+                .build()
+        } else null
+    }
     // Если Coil не смог декодировать байты (битый формат / неподдерживаемый
     // кодек) — показываем плашку-заглушку вместо «битой иконки» по умолчанию.
     var loadFailed by remember(payload) { mutableStateOf(false) }
@@ -1230,7 +1507,7 @@ private fun ImageMessageContent(
         )
     } else {
         coil.compose.AsyncImage(
-            model = animationModel ?: imageData.bytes,
+            model = animationModel ?: photoModel ?: imageData.bytes,
             contentDescription = if (imageData.isSticker) "Стикер" else "Картинка",
             contentScale = if (isAnimation) ContentScale.Crop else ContentScale.Fit,
             onError = { loadFailed = true },
@@ -1265,6 +1542,425 @@ private fun ImageMessageContent(
             imageBytes = imageData.bytes,
             onDismiss = { fullscreenOpen = false },
         )
+    }
+}
+
+// ── Альбом из нескольких картинок (плитка как в Telegram) ────────────────────
+
+/**
+ * Рендерит N картинок одного отправителя, отправленных одним альбомом, как
+ * плитку с фиксированной шириной 260dp. Layout:
+ *  - 2 шт — 2 колонки в один ряд
+ *  - 3 шт — 3 колонки в один ряд
+ *  - 4 шт — 2x2
+ *  - 5–9 шт — 3 колонки, N/3 рядов (последний неполный ряд из 1–2 тайлов)
+ *  - 10–15 шт — 3 колонки, 4–5 рядов
+ *
+ * Каждая ячейка — квадрат с ContentScale.Crop. Плитка статична (нет zoom),
+ * тап по ячейке — открывает fullscreen просмотр ИМЕННО этой картинки.
+ *
+ * Метадата (время + статус) рисуется оверлеем в правом нижнем углу последней
+ * картинки, аналогично одиночному IMAGE.
+ */
+@Composable
+private fun AlbumBubble(
+    messages: List<Message>,
+    isOutgoing: Boolean,
+    onDelete: ((Message) -> Unit)? = null,
+) {
+    if (messages.isEmpty()) return
+    val count = messages.size
+    val columns = when {
+        count <= 2 -> count
+        count == 4 -> 2
+        count == 3 -> 3
+        else -> 3
+    }
+    val albumWidth = 260.dp
+    val gap = 2.dp
+    val tileSize = (albumWidth - gap * (columns - 1)) / columns
+
+    val last = messages.last()
+    val context = androidx.compose.ui.platform.LocalContext.current
+
+    var fullscreenIndex by remember { mutableStateOf<Int?>(null) }
+    var menuVisible by remember { mutableStateOf(false) }
+    var menuOffset by remember { mutableStateOf(IntOffset.Zero) }
+    // Режим множественного выбора — включается долгим нажатием на плитку
+    var selectionMode by remember { mutableStateOf(false) }
+    val selectedIds = remember { androidx.compose.runtime.mutableStateListOf<String>() }
+    val exitSelection: () -> Unit = {
+        selectionMode = false
+        selectedIds.clear()
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 2.dp),
+        horizontalArrangement = if (isOutgoing) Arrangement.End else Arrangement.Start,
+    ) {
+        Box {
+            Column(
+                modifier = Modifier
+                    .width(albumWidth)
+                    .clip(RoundedCornerShape(14.dp))
+                    .longPressActionable(
+                        onLongPress = { offset ->
+                            // Если в selection-режиме — пустое долгое нажатие не открывает меню
+                            if (!selectionMode) {
+                                menuOffset = offset.toIntOffset()
+                                menuVisible = true
+                            }
+                        },
+                    ),
+            ) {
+                // Панель действий в selection-режиме: крестик + счётчик + «Удалить»
+                if (selectionMode) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.9f))
+                            .padding(horizontal = 6.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        IconButton(
+                            onClick = exitSelection,
+                            modifier = Modifier.size(32.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Отмена",
+                                tint = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "Выбрано: ${selectedIds.size}",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        Spacer(modifier = Modifier.weight(1f))
+                        if (onDelete != null && selectedIds.isNotEmpty()) {
+                            androidx.compose.material3.TextButton(
+                                onClick = {
+                                    val toDelete = selectedIds.toList()
+                                    exitSelection()
+                                    messages.filter { it.id in toDelete }.forEach { onDelete(it) }
+                                },
+                                contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                                    horizontal = 10.dp, vertical = 4.dp,
+                                ),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Delete,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.size(16.dp),
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = "Удалить",
+                                    color = MaterialTheme.colorScheme.error,
+                                    style = MaterialTheme.typography.labelMedium,
+                                )
+                            }
+                        }
+                    }
+                }
+                // Разбиваем на ряды
+                messages.chunked(columns).forEachIndexed { rowIndex, rowMessages ->
+                    Row(modifier = Modifier.fillMaxWidth()) {
+                        rowMessages.forEachIndexed { colIndex, msg ->
+                            val globalIndex = rowIndex * columns + colIndex
+                            val isTileSelected = msg.id in selectedIds
+                            val data = remember(msg.id) {
+                                com.secure.messenger.utils.ImageCodec.decode(msg.content)
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .size(tileSize)
+                                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                                    .pointerInput(msg.id, selectionMode) {
+                                        detectTapGestures(
+                                            onTap = {
+                                                if (selectionMode) {
+                                                    if (isTileSelected) selectedIds.remove(msg.id)
+                                                    else selectedIds.add(msg.id)
+                                                } else {
+                                                    fullscreenIndex = globalIndex
+                                                }
+                                            },
+                                            onLongPress = { _ ->
+                                                // Вход в режим выбора только если есть право удаления
+                                                if (onDelete != null) {
+                                                    selectionMode = true
+                                                    if (msg.id !in selectedIds) selectedIds.add(msg.id)
+                                                }
+                                            },
+                                        )
+                                    },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                if (data != null) {
+                                    val tilePx = with(androidx.compose.ui.platform.LocalDensity.current) {
+                                        tileSize.toPx().toInt().coerceAtLeast(1)
+                                    }
+                                    val tileRequest = remember(msg.id, tilePx) {
+                                        coil.request.ImageRequest.Builder(context)
+                                            .data(data.bytes)
+                                            .size(tilePx, tilePx)
+                                            .memoryCacheKey("album-${msg.id}-$tilePx")
+                                            .build()
+                                    }
+                                    coil.compose.AsyncImage(
+                                        model = tileRequest,
+                                        contentDescription = "Картинка альбома",
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize(),
+                                    )
+                                } else {
+                                    Icon(
+                                        imageVector = Icons.Default.Image,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                                        modifier = Modifier.size(32.dp),
+                                    )
+                                }
+
+                                // Мета-оверлей только на последнем тайле (когда не в режиме выбора)
+                                if (globalIndex == count - 1 && !selectionMode) {
+                                    Row(
+                                        modifier = Modifier
+                                            .align(Alignment.BottomEnd)
+                                            .padding(6.dp)
+                                            .clip(RoundedCornerShape(10.dp))
+                                            .background(Color.Black.copy(alpha = 0.45f))
+                                            .padding(horizontal = 8.dp, vertical = 3.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Text(
+                                            text = formatMessageTime(last.timestamp),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = Color.White,
+                                            fontSize = 11.sp,
+                                        )
+                                        if (isOutgoing) {
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            MessageStatusIcon(
+                                                status = last.status,
+                                                metaColor = Color.White.copy(alpha = 0.85f),
+                                            )
+                                        }
+                                    }
+                                }
+
+                                // Чекбокс и затемнение в режиме выбора
+                                if (selectionMode) {
+                                    if (isTileSelected) {
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxSize()
+                                                .background(Color.Black.copy(alpha = 0.35f)),
+                                        )
+                                    }
+                                    Box(
+                                        modifier = Modifier
+                                            .align(Alignment.TopEnd)
+                                            .padding(6.dp)
+                                            .size(22.dp)
+                                            .clip(CircleShape)
+                                            .background(
+                                                if (isTileSelected) MaterialTheme.colorScheme.primary
+                                                else Color.Black.copy(alpha = 0.45f)
+                                            ),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        if (isTileSelected) {
+                                            Icon(
+                                                imageVector = Icons.Default.Check,
+                                                contentDescription = null,
+                                                tint = MaterialTheme.colorScheme.onPrimary,
+                                                modifier = Modifier.size(14.dp),
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            if (colIndex < rowMessages.size - 1) {
+                                Spacer(modifier = Modifier.width(gap))
+                            }
+                        }
+                    }
+                    if (rowIndex < messages.chunked(columns).size - 1) {
+                        Spacer(modifier = Modifier.height(gap))
+                    }
+                }
+            }
+
+            // Контекстное меню альбома целиком — вызов долгим нажатием на пустой
+            // области/рамке альбома (где нет конкретной плитки).
+            ActionMenu(
+                visible = menuVisible,
+                anchorOffset = menuOffset,
+                onDismiss = { menuVisible = false },
+                actions = buildList {
+                    add(
+                        ActionMenuItem(
+                            label = "Сохранить в галерею",
+                            icon = Icons.Default.Download,
+                            onClick = {
+                                var saved = 0
+                                messages.forEach { msg ->
+                                    val data = com.secure.messenger.utils.ImageCodec.decode(msg.content)
+                                    if (data != null) {
+                                        if (com.secure.messenger.utils.ImageSaver.save(
+                                                context, data.bytes, data.mime,
+                                            )) saved++
+                                    }
+                                }
+                                android.widget.Toast.makeText(
+                                    context,
+                                    "Сохранено: $saved из ${messages.size}",
+                                    android.widget.Toast.LENGTH_SHORT,
+                                ).show()
+                            },
+                        )
+                    )
+                    if (onDelete != null) {
+                        add(
+                            ActionMenuItem(
+                                label = "Удалить альбом",
+                                icon = Icons.Default.Delete,
+                                danger = true,
+                                onClick = {
+                                    messages.forEach { onDelete(it) }
+                                },
+                            )
+                        )
+                    }
+                },
+            )
+        }
+    }
+
+    fullscreenIndex?.let { idx ->
+        val msg = messages.getOrNull(idx) ?: return@let
+        val data = remember(msg.id) { com.secure.messenger.utils.ImageCodec.decode(msg.content) }
+        if (data != null) {
+            FullscreenImageViewer(
+                imageBytes = data.bytes,
+                onDismiss = { fullscreenIndex = null },
+            )
+        } else {
+            fullscreenIndex = null
+        }
+    }
+}
+
+// ── Плашка прогресса отправки альбома ───────────────────────────────────────
+
+/**
+ * Компактная плашка «Отправка 3 / 15…» с линейным прогресс-баром. Показывается
+ * над инпутом пока идёт отправка альбома из множества картинок.
+ */
+@Composable
+private fun AlbumProgressBanner(
+    sent: Int,
+    total: Int,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier.widthIn(max = 460.dp),
+        shape = RoundedCornerShape(14.dp),
+        color = MaterialTheme.colorScheme.inverseSurface,
+        shadowElevation = 6.dp,
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                androidx.compose.material3.CircularProgressIndicator(
+                    modifier = Modifier.size(16.dp),
+                    strokeWidth = 2.dp,
+                    color = MaterialTheme.colorScheme.inverseOnSurface,
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+                Text(
+                    text = "Отправка $sent / $total",
+                    color = MaterialTheme.colorScheme.inverseOnSurface,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+            androidx.compose.material3.LinearProgressIndicator(
+                progress = { if (total > 0) sent.toFloat() / total else 0f },
+                modifier = Modifier.fillMaxWidth(),
+                color = MaterialTheme.colorScheme.primary,
+                trackColor = MaterialTheme.colorScheme.inverseOnSurface.copy(alpha = 0.2f),
+            )
+        }
+    }
+}
+
+// ── Красивый Snackbar для чата (ошибки записи, отправки, и т.п.) ─────────────
+
+/**
+ * Компактная плашка-уведомление. Иконка подбирается автоматически по
+ * префиксу сообщения: «Ошибка…» / «Не удалось…» — красный, всё остальное —
+ * нейтральный info-стиль. Показывается над инпут-баром.
+ */
+@Composable
+private fun ChatSnackbar(message: String) {
+    val isError = message.startsWith("Ошибка", ignoreCase = true) ||
+            message.startsWith("Не удалось", ignoreCase = true) ||
+            message.contains("пуста", ignoreCase = true)
+
+    val bg = if (isError) MaterialTheme.colorScheme.errorContainer
+    else MaterialTheme.colorScheme.inverseSurface
+    val fg = if (isError) MaterialTheme.colorScheme.onErrorContainer
+    else MaterialTheme.colorScheme.inverseOnSurface
+    val iconColor = if (isError) MaterialTheme.colorScheme.error
+    else MaterialTheme.colorScheme.primary
+    val icon = if (isError) Icons.Default.Close else Icons.Default.Info
+
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = bg,
+        shadowElevation = 6.dp,
+        modifier = Modifier.widthIn(max = 460.dp),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(26.dp)
+                    .clip(CircleShape)
+                    .background(iconColor.copy(alpha = 0.18f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    tint = iconColor,
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+            Spacer(modifier = Modifier.width(10.dp))
+            Text(
+                text = message,
+                color = fg,
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
     }
 }
 
@@ -1410,6 +2106,7 @@ private fun MessageStatusIcon(status: MessageStatus, metaColor: Color) {
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 private fun MessageInputBar(
+    modifier: Modifier = Modifier,
     text: String,
     editingMessage: Message?,
     replyingTo: Message?,
@@ -1423,14 +2120,18 @@ private fun MessageInputBar(
     onCancelReply: () -> Unit,
     onToggleEmoji: () -> Unit = {},
     onEmojiPick: (String) -> Unit = {},
+    onBackspace: () -> Unit = {},
     onAttachImage: () -> Unit = {},
     onContentReceived: (android.net.Uri) -> Unit = {},
     onStartRecording: () -> Unit = {},
     onStopRecording: (cancel: Boolean) -> Unit = {},
 ) {
     Surface(
+        modifier = modifier,
         shadowElevation = 8.dp,
-        color = MaterialTheme.colorScheme.surface,
+        // Полупрозрачная подложка — сквозь инпут просвечивают обои чата,
+        // как у плашки «Здесь пока нет сообщений».
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
     ) {
         Column {
             // Полоска редактирования
@@ -1470,9 +2171,11 @@ private fun MessageInputBar(
                         bottom = if (showEmojiPicker) 0.dp else 8.dp,
                     )
                     .then(
-                        // Когда панель эмоджи открыта — её padding обрабатывает
-                        // системную навигацию, не дублируем здесь
-                        if (showEmojiPicker) Modifier.imePadding()
+                        // Когда панель эмоджи открыта — нельзя применять imePadding
+                        // (keyboard всё ещё мог быть в процессе закрытия и даёт
+                        // большой отступ между Row и эмоджи-гридом). Паддинги
+                        // обрабатывает сама панель через navigationBarsPadding().
+                        if (showEmojiPicker) Modifier
                         else Modifier.navigationBarsPadding().imePadding()
                     ),
                 verticalAlignment = Alignment.CenterVertically,
@@ -1538,8 +2241,9 @@ private fun MessageInputBar(
                 }
 
                 // Кнопка отправки (если есть текст) или микрофон-удержание (если пусто).
-                // Микрофон остаётся в дереве и во время записи — иначе pointer
-                // up-event теряется и волны исчезают.
+                // Обе кнопки в покое 46dp — ряд не «прыгает» при вводе первой буквы
+                // (send ↔ mic-idle оба 46dp). Микрофон расширяется до 72dp ТОЛЬКО
+                // во время записи — чтобы дать место пульсирующим волнам.
                 if (text.isNotEmpty() && !isRecording) {
                     Box(
                         modifier = Modifier
@@ -1575,6 +2279,7 @@ private fun MessageInputBar(
             ) {
                 com.secure.messenger.presentation.ui.components.EmojiPicker(
                     onEmojiSelected = onEmojiPick,
+                    onBackspace = onBackspace,
                 )
             }
         }
@@ -1697,8 +2402,16 @@ private fun HoldToRecordMicButton(
 
     val primaryColor = MaterialTheme.colorScheme.primary
 
+    // Размер контейнера: 46dp в покое (совпадает с кнопкой send — ряд не прыгает),
+    // 72dp во время записи — чтобы поместились пульсирующие волны.
+    val containerSize by androidx.compose.animation.core.animateDpAsState(
+        targetValue = if (isRecording) 72.dp else 46.dp,
+        animationSpec = androidx.compose.animation.core.tween(200),
+        label = "mic_container_size",
+    )
+
     Box(
-        modifier = Modifier.size(72.dp),
+        modifier = Modifier.size(containerSize),
         contentAlignment = Alignment.Center,
     ) {
         // Рисуем волны только когда идёт запись — иначе кнопка спокойная
@@ -2037,29 +2750,29 @@ private fun ProfileInfoRow(
     }
 }
 
-// ── Обои чата с паттерном (как в Telegram) ──────────────────────────────────
+// ── Обои чата: либо картинка из настроек, либо ничего (NONE) ────────────────
 
 @Composable
 private fun ChatWallpaper() {
+    val selectedWp by com.secure.messenger.presentation.theme.ThemePreferences.wallpaper
+        .collectAsStateWithLifecycle()
+    val wpDrawable = selectedWp.drawableRes ?: return  // NONE → фон не рисуем
+
+    // Выбрана картинка-обои — рисуем её на весь фон и поверх слегка затемняем
+    // полупрозрачной плашкой под цвет темы, чтобы сообщения хорошо читались.
     val extra = LocalMessengerColors.current
-    val bgColor = extra.chatWallpaper
-    val patternColor = extra.chatPattern
-
-    Canvas(modifier = Modifier.fillMaxSize()) {
-        drawRect(bgColor)
-
-        val cellSize = 80f
-        val cols = (size.width / cellSize).toInt() + 2
-        val rows = (size.height / cellSize).toInt() + 2
-
-        for (row in 0..rows) {
-            for (col in 0..cols) {
-                val cx = col * cellSize + if (row % 2 == 0) 0f else cellSize / 2
-                val cy = row * cellSize
-                val shape = (row * 7 + col * 3) % 5
-                drawPatternShape(shape, cx, cy, patternColor)
-            }
-        }
+    Box(modifier = Modifier.fillMaxSize()) {
+        androidx.compose.foundation.Image(
+            painter = androidx.compose.ui.res.painterResource(wpDrawable),
+            contentDescription = null,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier.fillMaxSize(),
+        )
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(extra.chatWallpaper.copy(alpha = 0.25f)),
+        )
     }
 }
 

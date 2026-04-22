@@ -13,8 +13,10 @@ import com.secure.messenger.domain.repository.ChatRepository
 import com.secure.messenger.data.remote.api.SessionDto
 import com.secure.messenger.domain.repository.AuthRepository
 import com.secure.messenger.presentation.theme.AppColorScheme
+import com.secure.messenger.presentation.theme.ChatWallpaper
 import com.secure.messenger.presentation.theme.ThemePreferences
 import com.secure.messenger.utils.CryptoManager
+import com.secure.messenger.utils.LegacyKeyManager
 import com.secure.messenger.utils.LocalKeyStore
 import com.secure.messenger.utils.UpdateManager
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -31,6 +33,7 @@ data class SettingsUiState(
     val soundEnabled: Boolean = true,
     val vibrationEnabled: Boolean = true,
     val colorScheme: AppColorScheme = AppColorScheme.CLASSIC,
+    val wallpaper: ChatWallpaper = ChatWallpaper.NONE,
     // Password dialog
     val showPasswordDialog: Boolean = false,
     val hasExistingPassword: Boolean = false,
@@ -62,6 +65,7 @@ class SettingsViewModel @Inject constructor(
     private val authRepository: AuthRepository,
     private val cryptoManager: CryptoManager,
     private val localKeyStore: LocalKeyStore,
+    private val legacyKeyManager: LegacyKeyManager,
     private val api: MessengerApi,
     private val chatRepository: ChatRepository,
     private val messageDao: MessageDao,
@@ -92,6 +96,7 @@ class SettingsViewModel @Inject constructor(
         soundEnabled         = prefs.getBoolean(KEY_SOUND, true),
         vibrationEnabled     = prefs.getBoolean(KEY_VIBRATION, true),
         colorScheme          = ThemePreferences.colorScheme.value,
+        wallpaper            = ThemePreferences.wallpaper.value,
     )
 
     fun toggleNotifications() {
@@ -115,6 +120,11 @@ class SettingsViewModel @Inject constructor(
     fun setColorScheme(scheme: AppColorScheme) {
         ThemePreferences.setColorScheme(scheme)
         _uiState.value = _uiState.value.copy(colorScheme = scheme)
+    }
+
+    fun setWallpaper(wp: ChatWallpaper) {
+        ThemePreferences.setWallpaper(wp)
+        _uiState.value = _uiState.value.copy(wallpaper = wp)
     }
 
     /**
@@ -219,6 +229,10 @@ class SettingsViewModel @Inject constructor(
                     localKeyStore.setOwner(userId)
 
                     authRepository.updateProfile(displayName = "", username = "", bio = null)
+
+                    // Скачиваем с сервера legacy-ключи — для расшифровки сообщений,
+                    // зашифрованных более ранними (до текущего пароля) ключами
+                    legacyKeyManager.downloadAndSaveLegacyKeys(phone, password)
 
                     // Пересинхронизируем — decryptOrKeepExisting сохранит ранее
                     // расшифрованные сообщения и попробует расшифровать неудачные новым ключом
@@ -357,6 +371,11 @@ class SettingsViewModel @Inject constructor(
                     val user = authRepository.currentUser.first()
                     val phone = user?.phone ?: return@launch
 
+                    // Приватный ключ ДО смены пароля — его нужно сохранить как
+                    // legacy, чтобы старые сообщения (зашифрованные им) можно
+                    // было расшифровать после ротации ключа.
+                    val prevPrivateKey = localKeyStore.getPrivateKey()
+
                     // Генерируем новый ключ из телефон+новый_пароль
                     val (publicKey, privateKey) = cryptoManager.deriveKeyPairFromPassword(phone, state.newPassword)
                     val publicKeyBase64 = Base64.encodeToString(publicKey, Base64.NO_WRAP)
@@ -365,6 +384,29 @@ class SettingsViewModel @Inject constructor(
 
                     // Загружаем новый публичный ключ на сервер
                     authRepository.updateProfile(displayName = "", username = "", bio = null)
+
+                    // Ротация legacy-blob:
+                    //  - Если был старый пароль — существующий blob зашифрован им,
+                    //    перешифровываем его новым + добавляем prevPrivateKey.
+                    //  - Если это первая установка пароля (oldPwd=null) — prevPrivateKey
+                    //    это случайный ключ из «беспарольного» периода, его надо
+                    //    сохранить как legacy.
+                    if (prevPrivateKey != null) {
+                        if (oldPwd != null) {
+                            legacyKeyManager.rotateLegacyKeysOnPasswordChange(
+                                phone = phone,
+                                oldPassword = oldPwd,
+                                newPassword = state.newPassword,
+                                currentPrivateKeyBase64 = prevPrivateKey,
+                            )
+                        } else {
+                            legacyKeyManager.uploadCurrentKeyAsLegacy(
+                                currentRandomPrivateKeyBase64 = prevPrivateKey,
+                                phone = phone,
+                                password = state.newPassword,
+                            )
+                        }
+                    }
 
                     _uiState.value = _uiState.value.copy(
                         showPasswordDialog = false,

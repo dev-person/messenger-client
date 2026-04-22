@@ -51,6 +51,14 @@ class MessengerApp : Application(), ImageLoaderFactory {
                 add(GifDecoder.Factory())
             }
         }
+        // Ограничиваем кеш декодированных bitmap-ов 20% свободной памяти.
+        // При дефолтных 40% в чате с большим числом картинок Coil держал
+        // одновременно десятки полноразмерных bitmap-ов и приложение падало по OOM.
+        .memoryCache {
+            coil.memory.MemoryCache.Builder(this)
+                .maxSizePercent(0.20)
+                .build()
+        }
         .build()
 
     /**

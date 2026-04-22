@@ -74,6 +74,53 @@ class CryptoManager @Inject constructor(
         return Pair(publicKey.encoded, privateKey.encoded)
     }
 
+    /**
+     * Выводит отдельный симметричный ключ AES-256 из телефон+пароль для шифрования
+     * legacy-blob (старые X25519 приватные ключи) перед загрузкой на сервер.
+     * Соль отличается от соли для пары ключей, чтобы не было пересечений
+     * (разный KDF output для разных целей, даже при одинаковых входных данных).
+     */
+    fun derivePasswordSymmetricKey(phone: String, password: String): ByteArray {
+        val salt = "secure-messenger-legacy-v1:$phone".toByteArray(Charsets.UTF_8)
+        val spec = PBEKeySpec(password.toCharArray(), salt, PBKDF2_ITERATIONS, KEY_LENGTH_BYTES * 8)
+        val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+        return factory.generateSecret(spec).encoded
+    }
+
+    /**
+     * Шифрует произвольные байты AES-256-GCM ключом [key]. Возвращает строку
+     * base64( iv || ciphertext || tag ). Используется для упаковки
+     * legacy X25519 приватных ключей перед отправкой на сервер.
+     */
+    fun encryptBytes(data: ByteArray, key: ByteArray): String {
+        val iv = ByteArray(IV_LENGTH_BYTES).also { secureRandom.nextBytes(it) }
+        val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
+        cipher.init(
+            Cipher.ENCRYPT_MODE,
+            SecretKeySpec(key, "AES"),
+            GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv),
+        )
+        val ct = cipher.doFinal(data)
+        val out = ByteArray(iv.size + ct.size)
+        System.arraycopy(iv, 0, out, 0, iv.size)
+        System.arraycopy(ct, 0, out, iv.size, ct.size)
+        return android.util.Base64.encodeToString(out, android.util.Base64.NO_WRAP)
+    }
+
+    /** Расшифровка [encryptedBytes] (base64 iv||ct||tag) ключом [key]. null если неудача. */
+    fun decryptBytes(encryptedBase64: String, key: ByteArray): ByteArray? = runCatching {
+        val data = android.util.Base64.decode(encryptedBase64, android.util.Base64.NO_WRAP)
+        val iv = data.copyOfRange(0, IV_LENGTH_BYTES)
+        val ct = data.copyOfRange(IV_LENGTH_BYTES, data.size)
+        val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
+        cipher.init(
+            Cipher.DECRYPT_MODE,
+            SecretKeySpec(key, "AES"),
+            GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv),
+        )
+        cipher.doFinal(ct)
+    }.getOrNull()
+
     // ── Shared Secret ─────────────────────────────────────────────────────────
 
     /**
@@ -139,6 +186,24 @@ class CryptoManager @Inject constructor(
         System.arraycopy(ciphertext, 0, result, iv.size, ciphertext.size)
 
         return android.util.Base64.encodeToString(result, android.util.Base64.NO_WRAP)
+    }
+
+    /**
+     * Пытается расшифровать сообщение используя каждый shared-secret
+     * по очереди. Возвращает первый успешный результат. Используется когда
+     * у пользователя есть несколько приватных ключей (current + legacy), и
+     * сообщение могло быть отправлено против любого из них.
+     */
+    fun decryptMessageWithAnyKey(
+        encryptedBase64: String,
+        sharedSecrets: List<ByteArray>,
+        messageId: String,
+    ): String? {
+        for (secret in sharedSecrets) {
+            val decrypted = decryptMessage(encryptedBase64, secret, messageId)
+            if (decrypted != null) return decrypted
+        }
+        return null
     }
 
     /**

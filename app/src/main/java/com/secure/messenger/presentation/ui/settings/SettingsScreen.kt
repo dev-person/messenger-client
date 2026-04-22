@@ -17,6 +17,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -36,6 +38,7 @@ import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.Palette
+import androidx.compose.material.icons.filled.Wallpaper
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.Vibration
@@ -76,6 +79,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.secure.messenger.BuildConfig
 import com.secure.messenger.presentation.theme.AppColorScheme
+import com.secure.messenger.presentation.theme.ChatWallpaper
 import com.secure.messenger.presentation.theme.previewColor
 import kotlinx.coroutines.launch
 
@@ -187,17 +191,22 @@ fun SettingsScreen(
                     )
                 }
 
+                // Горизонтально-скроллируемая лента схем — их стало 10, в один
+                // ряд равномерно уже не влезают.
+                val schemeScroll = rememberScrollState()
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(start = 16.dp, end = 16.dp, bottom = 14.dp),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
+                        .horizontalScroll(schemeScroll)
+                        .padding(start = 12.dp, end = 12.dp, bottom = 14.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     AppColorScheme.entries.forEach { scheme ->
                         val isSelected = scheme == state.colorScheme
                         Column(
                             horizontalAlignment = Alignment.CenterHorizontally,
                             modifier = Modifier
+                                .widthIn(min = 60.dp)
                                 .clip(RoundedCornerShape(12.dp))
                                 .clickable { viewModel.setColorScheme(scheme) }
                                 .padding(horizontal = 4.dp, vertical = 4.dp),
@@ -236,6 +245,47 @@ fun SettingsScreen(
                                 maxLines = 1,
                             )
                         }
+                    }
+                }
+
+                OneUiDivider()
+
+                // Заголовок секции обоев внутри той же карточки
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Wallpaper,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(24.dp),
+                    )
+                    Spacer(modifier = Modifier.width(16.dp))
+                    Text(
+                        text = "Фон диалога",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                }
+
+                // Горизонтальный скролл превью обоев
+                val wpScrollState = rememberScrollState()
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(wpScrollState)
+                        .padding(start = 16.dp, end = 16.dp, bottom = 14.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    ChatWallpaper.entries.forEach { wp ->
+                        WallpaperPreview(
+                            wp = wp,
+                            isSelected = wp == state.wallpaper,
+                            onClick = { viewModel.setWallpaper(wp) },
+                        )
                     }
                 }
             }
@@ -942,4 +992,77 @@ private fun ChangePasswordDialog(
             TextButton(onClick = onDismiss) { Text("Отмена") }
         },
     )
+}
+
+// ── Превью обоев для селектора в настройках ────────────────────────────────
+
+@Composable
+private fun WallpaperPreview(
+    wp: ChatWallpaper,
+    isSelected: Boolean,
+    onClick: () -> Unit,
+) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 4.dp, vertical = 4.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(width = 58.dp, height = 84.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+                .then(
+                    if (isSelected) Modifier.border(
+                        2.5.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(10.dp),
+                    ) else Modifier
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (wp.drawableRes != null) {
+                androidx.compose.foundation.Image(
+                    painter = androidx.compose.ui.res.painterResource(wp.drawableRes),
+                    contentDescription = wp.label,
+                    contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            } else {
+                // NONE — рисуем иконку паттерна
+                Icon(
+                    imageVector = Icons.Default.Wallpaper,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(26.dp),
+                )
+            }
+            if (isSelected) {
+                Box(
+                    modifier = Modifier
+                        .size(22.dp)
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.primary),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Check,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onPrimary,
+                        modifier = Modifier.size(14.dp),
+                    )
+                }
+            }
+        }
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            text = wp.label,
+            style = MaterialTheme.typography.labelSmall,
+            color = if (isSelected) MaterialTheme.colorScheme.primary
+            else MaterialTheme.colorScheme.onSurfaceVariant,
+            fontSize = 10.sp,
+            textAlign = TextAlign.Center,
+            maxLines = 1,
+        )
+    }
 }

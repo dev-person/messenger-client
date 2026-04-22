@@ -19,11 +19,19 @@ interface ChatDao {
     // + онлайн-статус собеседника через LEFT JOIN на users (otherUserId).
     // Скрытые чаты (isHidden = 1) исключаем — они остаются в БД как «помнить
     // что юзер скрыл», но в UI не показываются.
+    // Для списка чатов НЕ тянем полный decryptedContent медиа-сообщений —
+    // картинка в JSON base64 может весить 500-800KB, и Flow при нескольких
+    // чатах с фото-last-message эмитит десятки мегабайт, что приводит к
+    // OOM-крашу. В UI для IMAGE/AUDIO/VIDEO/FILE мы всё равно показываем
+    // плашку «Фото»/«Голосовое сообщение» (см. messagePreviewText).
     @Query("""
         SELECT c.*,
                m.id        AS lastMsgId,
                m.senderId  AS lastMsgSenderId,
-               m.decryptedContent AS lastMsgContent,
+               CASE WHEN m.type IN ('IMAGE','AUDIO','VIDEO','FILE')
+                    THEN ''
+                    ELSE m.decryptedContent
+               END         AS lastMsgContent,
                m.type      AS lastMsgType,
                m.status    AS lastMsgStatus,
                m.timestamp AS lastMsgTimestamp,

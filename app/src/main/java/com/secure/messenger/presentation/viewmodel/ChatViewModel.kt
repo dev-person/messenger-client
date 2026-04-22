@@ -25,6 +25,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
@@ -132,7 +133,11 @@ class ChatViewModel @Inject constructor(
 
     private fun observeNewMessagesAndMarkRead() {
         viewModelScope.launch {
-            messages.collect { markAsRead() }
+            // Дебаунс 1.5с — без него при 15 upsert-ах подряд (отправка альбома)
+            // мы 15 раз дёргали /read → nginx ratelimit → 503 → лавина ошибок.
+            messages
+                .debounce(1_500)
+                .collect { markAsRead() }
         }
     }
 
@@ -231,6 +236,59 @@ class ChatViewModel @Inject constructor(
                 }
         }
     }
+
+    /**
+     * Отправляет альбом из нескольких картинок. Все получают один groupId —
+     * UI рендерит их как единую плитку (как в Telegram). Каждая картинка
+     * шифруется и шлётся отдельным сообщением (иначе не влезает в SQLite
+     * CursorWindow сервера при > 1–2 МБ).
+     *
+     * Прогресс обновляется после каждой успешной отправки — UI показывает
+     * плашку «3 / 15». После завершения всей серии прогресс сбрасывается.
+     */
+    fun sendImages(images: List<com.secure.messenger.utils.ImageCodec.ImageData>) {
+        if (images.isEmpty()) return
+        if (images.size == 1) {
+            sendImage(images.first())
+            return
+        }
+        val groupId = java.util.UUID.randomUUID().toString()
+        val total = images.size
+        viewModelScope.launch {
+            _albumSendProgress.value = AlbumProgress(0, total)
+            var failed = 0
+            images.forEachIndexed { index, img ->
+                val grouped = img.copy(
+                    groupId = groupId,
+                    groupIndex = index,
+                    groupSize = total,
+                )
+                val result = chatRepository.sendImageMessage(chatId, grouped)
+                if (result.isFailure) {
+                    failed++
+                    Timber.e(result.exceptionOrNull(), "sendImages: $index/$total failed")
+                }
+                _albumSendProgress.value = AlbumProgress(index + 1, total)
+                // Пауза между отправками + намёк GC — чтобы Flow-эмиссии успели
+                // обработаться и не копились в очереди рекомпозиции.
+                delay(250)
+            }
+            _albumSendProgress.value = null
+            if (failed > 0) {
+                _uiState.value = _uiState.value.copy(
+                    error = "Не удалось отправить $failed из $total",
+                )
+            } else {
+                soundManager.playMessageSent()
+            }
+        }
+    }
+
+    /** Прогресс отправки альбома: sent из total. null — отправки нет. */
+    data class AlbumProgress(val sent: Int, val total: Int)
+
+    private val _albumSendProgress = MutableStateFlow<AlbumProgress?>(null)
+    val albumSendProgress: StateFlow<AlbumProgress?> = _albumSendProgress.asStateFlow()
 
     /** Начинает запись голосового сообщения. Должно вызываться после выдачи RECORD_AUDIO. */
     fun startVoiceRecording() {
@@ -331,6 +389,20 @@ class ChatViewModel @Inject constructor(
         _inputText.value = _inputText.value + emoji
     }
 
+    /**
+     * Удаляет последний символ (графему) из инпута. Корректно обрабатывает
+     * многобайтовые эмоджи и ZWJ-последовательности (👨‍👩‍👧, 🏳️‍🌈) —
+     * BreakIterator находит границу графемного кластера и удаляет до неё.
+     */
+    fun backspaceInput() {
+        val current = _inputText.value
+        if (current.isEmpty()) return
+        val bi = java.text.BreakIterator.getCharacterInstance()
+        bi.setText(current)
+        val prev = bi.preceding(current.length)
+        _inputText.value = if (prev > 0) current.substring(0, prev) else ""
+    }
+
     // ── Подсветка цитируемого сообщения при клике на цитату ──────────────
 
     /** ID сообщения, которое сейчас подсвечено (после тапа на цитату). */
@@ -385,9 +457,15 @@ class ChatViewModel @Inject constructor(
     }
 
     /** Подгружает старые сообщения (вызывается при скролле вверх) */
+    private var lastLoadOlderFailedAt = 0L
+
     fun loadOlderMessages() {
         val state = _uiState.value
         if (state.isLoadingOlder || !state.hasOlderMessages) return
+        // Защита от retry-шторма: если предыдущая попытка упала меньше 3
+        // секунд назад — не пытаемся снова (иначе при 503 от nginx firstVisible=0
+        // триггерит подгрузку в цикле, и мы долбим сервер).
+        if (System.currentTimeMillis() - lastLoadOlderFailedAt < 3_000) return
 
         val oldest = messages.value.firstOrNull() ?: return
         _uiState.value = state.copy(isLoadingOlder = true)
@@ -400,6 +478,7 @@ class ChatViewModel @Inject constructor(
                 }
                 .onFailure { e ->
                     Timber.e(e, "Failed to load older messages")
+                    lastLoadOlderFailedAt = System.currentTimeMillis()
                     _uiState.value = _uiState.value.copy(isLoadingOlder = false)
                 }
         }
@@ -410,6 +489,9 @@ class ChatViewModel @Inject constructor(
     }
 
     companion object {
-        private const val PAGE_SIZE = 50
+        // 20 вместо 50 — при 50 в диалоге с большим числом картинок Coil
+        // пытался одновременно декодировать множество полноразмерных bitmap-ов
+        // и приложение падало по OOM при cold-open чата.
+        private const val PAGE_SIZE = 20
     }
 }

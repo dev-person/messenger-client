@@ -237,4 +237,13 @@ class AuthRepositoryImpl @Inject constructor(
     }
 
     override fun isLoggedIn(): Boolean = tokenProvider.hasToken()
+
+    override suspend fun getLegacyKeys(): Result<String> = runCatching {
+        api.getLegacyKeys().data?.legacyKeys ?: ""
+    }
+
+    override suspend fun putLegacyKeys(blob: String): Result<Unit> = runCatching {
+        api.setLegacyKeys(mapOf("legacyKeys" to blob))
+        Unit
+    }
 }

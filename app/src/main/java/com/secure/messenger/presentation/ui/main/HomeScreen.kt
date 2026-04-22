@@ -12,6 +12,7 @@ import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.foundation.layout.WindowInsets
@@ -94,7 +95,13 @@ fun HomeScreen(
         // Без этого CompactTopBar получает двойной отступ статусбара.
         contentWindowInsets = WindowInsets(0),
         bottomBar = {
-            NavigationBar(modifier = Modifier.navigationBarsPadding()) {
+            NavigationBar(
+                modifier = Modifier.navigationBarsPadding(),
+                // Явно задаём surface из выбранной схемы — по умолчанию Material3
+                // берёт surfaceContainer, который не определён во всех наших темах
+                // и поэтому цвет nav-бара не менялся при смене цветовой схемы.
+                containerColor = MaterialTheme.colorScheme.surface,
+            ) {
                 NavigationBarItem(
                     selected = selectedTab == 0,
                     onClick = { selectedTab = 0 },

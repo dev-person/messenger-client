@@ -52,6 +52,23 @@ object AppModule {
                 }
                 chain.proceed(request)
             }
+            // Retry на 503 с exponential backoff — сервер под nginx'ом с
+            // limit_req иногда возвращает 503 при всплесках (например при
+            // массовой отправке альбома из 15 фото). 6 повторов, суммарно
+            // до ~15 секунд ожидания.
+            .addInterceptor { chain ->
+                val req = chain.request()
+                var response = chain.proceed(req)
+                var attempt = 0
+                val delays = longArrayOf(300, 700, 1500, 3000, 4500, 6000)
+                while (response.code == 503 && attempt < delays.size) {
+                    response.close()
+                    Thread.sleep(delays[attempt])
+                    attempt++
+                    response = chain.proceed(req)
+                }
+                response
+            }
             .apply {
                 if (BuildConfig.DEBUG) {
                     addInterceptor(HttpLoggingInterceptor().apply {
@@ -92,7 +109,7 @@ object AppModule {
             // Реальные миграции — когда у юзера уже накоплена история, ронять её
             // на каждый ALTER TABLE недопустимо. Если миграции не хватит — fallback,
             // чтобы не крашиться в проде.
-            .addMigrations(AppDatabase.MIGRATION_1_2)
+            .addMigrations(AppDatabase.MIGRATION_1_2, AppDatabase.MIGRATION_2_3)
             .fallbackToDestructiveMigration()
             .addCallback(object : androidx.room.RoomDatabase.Callback() {
                 override fun onOpen(db: androidx.sqlite.db.SupportSQLiteDatabase) {

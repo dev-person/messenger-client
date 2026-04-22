@@ -28,7 +28,10 @@ data class MessageEntity(
     fun toDomain() = Message(
         id = id, chatId = chatId, senderId = senderId,
         content = decryptedContent,
-        encryptedContent = encryptedContent,
+        // encryptedContent в UI не используется (он только для сетевой отправки).
+        // Для IMAGE он весит ~800KB base64 — не тянем его через Flow эмиссии,
+        // иначе List<Message> держит двойную копию тяжёлых данных.
+        encryptedContent = "",
         type = MessageType.valueOf(type),
         status = MessageStatus.valueOf(status),
         timestamp = timestamp,

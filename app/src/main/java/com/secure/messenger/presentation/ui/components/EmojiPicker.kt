@@ -117,28 +117,34 @@ private val EMOJI_CATEGORIES = listOf(
  * Панель выбора эмоджи. Открывается под полем ввода с slide-анимацией.
  *
  * @param onEmojiSelected Колбэк при тапе на эмоджи — добавляет его в текст
+ * @param onBackspace     Колбэк кнопки «стереть» — удаляет последний символ ввода
  */
 @Composable
 fun EmojiPicker(
     onEmojiSelected: (String) -> Unit,
+    onBackspace: () -> Unit = {},
 ) {
     var selectedCategory by remember { mutableStateOf(0) }
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            // Тот же цвет что у MessageInputBar — иначе в тёмной теме видна
-            // тёмная полоса-разрыв между инпутом и эмоджи-панелью
-            .background(MaterialTheme.colorScheme.surface)
+            // Полупрозрачная подложка под цвет темы — сквозь панель просвечивают
+            // обои чата (как у плашки «Здесь пока нет сообщений»).
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.88f))
             .navigationBarsPadding(),
     ) {
-        // Категории сверху — без верхнего отступа, чтобы не было щели
+        // Категории сверху + кнопка «стереть» справа — без верхнего отступа
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(start = 8.dp, end = 8.dp, top = 0.dp, bottom = 6.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically,
         ) {
+            Row(
+                modifier = Modifier.weight(1f),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+            ) {
             EMOJI_CATEGORIES.forEachIndexed { index, category ->
                 val isSelected = selectedCategory == index
                 Box(
@@ -158,6 +164,17 @@ fun EmojiPicker(
                         fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
                     )
                 }
+            }
+            }
+            // Кнопка «стереть» (backspace) — удаляет последний введённый символ
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .clickable { onBackspace() },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(text = "⌫", fontSize = 18.sp)
             }
         }
 

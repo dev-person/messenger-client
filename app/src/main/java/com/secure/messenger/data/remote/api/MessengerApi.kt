@@ -38,6 +38,12 @@ interface MessengerApi {
     @HTTP(method = "DELETE", path = "auth/password", hasBody = true)
     suspend fun deletePassword(@Body body: Map<String, String>): ApiResponse<Unit>
 
+    @GET("auth/legacy-keys")
+    suspend fun getLegacyKeys(): ApiResponse<LegacyKeysDto>
+
+    @PUT("auth/legacy-keys")
+    suspend fun setLegacyKeys(@Body body: Map<String, String>): ApiResponse<Unit>
+
     // Sessions
     @GET("auth/sessions")
     suspend fun getSessions(): ApiResponse<List<SessionDto>>
@@ -166,6 +172,7 @@ data class SessionDto(
 )
 data class TerminateResult(val terminated: Int)
 data class PasswordStatusDto(val hasPassword: Boolean)
+data class LegacyKeysDto(val legacyKeys: String)
 data class CallDto(val id: String, val chatId: String, val type: String, val state: String, val startedAt: Long?, val durationSeconds: Int)
 
 // Конфигурация ICE-сервера (STUN/TURN) для WebRTC

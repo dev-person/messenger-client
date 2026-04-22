@@ -173,8 +173,10 @@ class ChatRepositoryImpl @Inject constructor(
 
         val optimisticEntity = MessageEntity(
             id = messageId, chatId = chatId, senderId = myUserId,
-            encryptedContent = encryptedContent,
-            decryptedContent = payload, // локально храним JSON в decryptedContent
+            // Не храним encryptedContent для аудио — raw-байты дублируются и
+            // раздувают строку Room (см. sendImageMessage).
+            encryptedContent = "",
+            decryptedContent = payload,
             type = MessageType.AUDIO.name,
             status = MessageStatus.SENDING.name,
             timestamp = System.currentTimeMillis(),
@@ -220,8 +222,11 @@ class ChatRepositoryImpl @Inject constructor(
 
         val optimisticEntity = MessageEntity(
             id = messageId, chatId = chatId, senderId = myUserId,
-            encryptedContent = encryptedContent,
-            decryptedContent = payload, // локально храним JSON
+            // encryptedContent локально НЕ храним для медиа — оно весит как и
+            // decryptedContent ~800KB base64. Вдвоём они раздувают строку
+            // Room до >2МБ и вызывают SQLiteBlobTooBigException при чтении.
+            encryptedContent = "",
+            decryptedContent = payload,
             type = MessageType.IMAGE.name,
             status = MessageStatus.SENDING.name,
             timestamp = System.currentTimeMillis(),
@@ -234,29 +239,33 @@ class ChatRepositoryImpl @Inject constructor(
             encryptedContent = encryptedContent,
             type = MessageType.IMAGE.name,
         )
-        val dto = api.sendMessage(chatId, request).data ?: error("Send failed")
-
-        val confirmedEntity = optimisticEntity.copy(
-            id = dto.id,
-            senderId = dto.senderId,
-            status = MessageStatus.SENT.name,
-            timestamp = Instant.parse(dto.timestamp).toEpochMilli(),
-        )
-        messageDao.upsert(confirmedEntity)
-
-        signalingClient.sendChatMessage(chatId, encryptedContent, dto.id)
-
-        confirmedEntity.toDomain()
+        try {
+            val dto = api.sendMessage(chatId, request).data ?: error("Send failed")
+            val confirmedEntity = optimisticEntity.copy(
+                id = dto.id,
+                senderId = dto.senderId,
+                status = MessageStatus.SENT.name,
+                timestamp = Instant.parse(dto.timestamp).toEpochMilli(),
+            )
+            messageDao.upsert(confirmedEntity)
+            signalingClient.sendChatMessage(chatId, encryptedContent, dto.id)
+            confirmedEntity.toDomain()
+        } catch (e: Exception) {
+            messageDao.upsert(optimisticEntity.copy(status = MessageStatus.FAILED.name))
+            throw e
+        }
     }
 
     override suspend fun deleteMessage(messageId: String): Result<Unit> = runCatching {
-        // Удаляем на сервере; 404 = уже удалено — всё равно чистим локально
+        // Удаляем на сервере; 404 = уже удалено, 5xx = сервер перегружен — в
+        // обоих случаях чистим локально, у пользователя всё равно сообщение
+        // пропадёт, и кидать ошибку в UI нет смысла.
         val response = runCatching { api.deleteMessage(messageId) }
         messageDao.deleteById(messageId)
-        // Пробрасываем ошибку только если это не 404
         response.onFailure { e ->
-            val is404 = e is retrofit2.HttpException && e.code() == 404
-            if (!is404) throw e
+            val code = (e as? retrofit2.HttpException)?.code()
+            val ignorable = code != null && (code == 404 || code in 500..599)
+            if (!ignorable) throw e
         }
     }
 
@@ -306,9 +315,8 @@ class ChatRepositoryImpl @Inject constructor(
 
         // ── Расшифровка и upsert ────────────────────────────────────────────────
         val myPrivateKeyBase64 = localKeyStore.getPrivateKey() ?: error("No local private key")
-        val myPrivateKeyBytes = Base64.decode(myPrivateKeyBase64, Base64.NO_WRAP)
 
-        val sharedSecret: ByteArray? = if (chat.type == "DIRECT") {
+        val sharedSecrets: List<ByteArray> = if (chat.type == "DIRECT") {
             val otherUserId = chat.otherUserId ?: error("otherUserId missing for chat $chatId")
             val otherUser = run {
                 val fresh = runCatching { api.getUserById(otherUserId).data }.getOrNull()
@@ -329,16 +337,20 @@ class ChatRepositoryImpl @Inject constructor(
                     userDao.getById(otherUserId) ?: error("Other user not found: $otherUserId")
                 }
             }
-            val theirPublicKeyBytes = Base64.decode(otherUser.publicKey, Base64.NO_WRAP)
-            cryptoManager.computeSharedSecret(myPrivateKeyBytes, theirPublicKeyBytes)
-        } else null
+            buildSharedSecrets(myPrivateKeyBase64, otherUser.publicKey)
+        } else emptyList()
 
         val entities = dtos.map { dto ->
             val existing = messageDao.getById(dto.id)
-            val decrypted = decryptOrKeepExisting(dto, sharedSecret, existing)
+            val decrypted = decryptOrKeepExisting(dto, sharedSecrets, existing)
+            // Для медиа-типов не кладём encryptedContent локально — это
+            // base64 сырых байт, который уже дублирован в decryptedContent.
+            // Хранить его повторно — рецепт CursorWindow-переполнения.
+            val isHeavy = dto.type in setOf("IMAGE", "AUDIO", "VIDEO")
             MessageEntity(
                 id = dto.id, chatId = chatId, senderId = dto.senderId,
-                encryptedContent = dto.encryptedContent, decryptedContent = decrypted,
+                encryptedContent = if (isHeavy) "" else dto.encryptedContent,
+                decryptedContent = decrypted,
                 type = dto.type, status = dto.status,
                 timestamp = Instant.parse(dto.timestamp).toEpochMilli(),
                 replyToId = dto.replyToId, mediaUrl = dto.mediaUrl, isEdited = dto.isEdited,
@@ -353,21 +365,24 @@ class ChatRepositoryImpl @Inject constructor(
         if (dtos.isEmpty()) return@runCatching false // нет больше сообщений
 
         val myPrivateKeyBase64 = localKeyStore.getPrivateKey() ?: error("No local private key")
-        val myPrivateKeyBytes = Base64.decode(myPrivateKeyBase64, Base64.NO_WRAP)
 
-        val sharedSecret: ByteArray? = if (chat.type == "DIRECT") {
+        val sharedSecrets: List<ByteArray> = if (chat.type == "DIRECT") {
             val otherUserId = chat.otherUserId ?: error("otherUserId missing")
             val otherUser = userDao.getById(otherUserId) ?: error("Other user not found")
-            val theirPublicKeyBytes = Base64.decode(otherUser.publicKey, Base64.NO_WRAP)
-            cryptoManager.computeSharedSecret(myPrivateKeyBytes, theirPublicKeyBytes)
-        } else null
+            buildSharedSecrets(myPrivateKeyBase64, otherUser.publicKey)
+        } else emptyList()
 
         val entities = dtos.map { dto ->
             val existing = messageDao.getById(dto.id)
-            val decrypted = decryptOrKeepExisting(dto, sharedSecret, existing)
+            val decrypted = decryptOrKeepExisting(dto, sharedSecrets, existing)
+            // Для медиа-типов не кладём encryptedContent локально — это
+            // base64 сырых байт, который уже дублирован в decryptedContent.
+            // Хранить его повторно — рецепт CursorWindow-переполнения.
+            val isHeavy = dto.type in setOf("IMAGE", "AUDIO", "VIDEO")
             MessageEntity(
                 id = dto.id, chatId = chatId, senderId = dto.senderId,
-                encryptedContent = dto.encryptedContent, decryptedContent = decrypted,
+                encryptedContent = if (isHeavy) "" else dto.encryptedContent,
+                decryptedContent = decrypted,
                 type = dto.type, status = dto.status,
                 timestamp = Instant.parse(dto.timestamp).toEpochMilli(),
                 replyToId = dto.replyToId, mediaUrl = dto.mediaUrl, isEdited = dto.isEdited,
@@ -391,12 +406,14 @@ class ChatRepositoryImpl @Inject constructor(
      */
     private fun decryptOrKeepExisting(
         dto: com.secure.messenger.data.remote.api.dto.MessageDto,
-        sharedSecret: ByteArray?,
+        sharedSecrets: List<ByteArray>,
         existing: MessageEntity?,
     ): String {
         if (dto.type == "SYSTEM") return dto.encryptedContent
-        if (sharedSecret != null) {
-            val fresh = cryptoManager.decryptMessage(dto.encryptedContent, sharedSecret, dto.id)
+        if (sharedSecrets.isNotEmpty()) {
+            val fresh = cryptoManager.decryptMessageWithAnyKey(
+                dto.encryptedContent, sharedSecrets, dto.id,
+            )
             if (fresh != null) return fresh
         }
         // Decrypt не удался — пытаемся сохранить уже существующий текст,
@@ -405,7 +422,43 @@ class ChatRepositoryImpl @Inject constructor(
         if (!prev.isNullOrEmpty() && prev != "[Не удалось расшифровать]" && prev != "[Групповые чаты не поддерживаются]") {
             return prev
         }
-        return if (sharedSecret == null) "[Групповые чаты не поддерживаются]" else "[Не удалось расшифровать]"
+        return if (sharedSecrets.isEmpty()) "[Групповые чаты не поддерживаются]" else "[Не удалось расшифровать]"
+    }
+
+    /**
+     * Строит список ECDH shared-секретов для расшифровки: сначала с текущим
+     * приватным ключом, затем с каждым legacy-ключом. Сообщение могло быть
+     * зашифровано при любой из прошлых пар ключей (до установки пароля,
+     * или с разными паролями в прошлом) — пробуем все по очереди.
+     */
+    private fun buildSharedSecrets(
+        myPrivateKeyBase64: String,
+        theirPublicKeyBase64: String,
+    ): List<ByteArray> {
+        // У бота (и некоторых служебных юзеров) publicKey пустой или битый.
+        // X25519 требует ровно 32 байта — без проверки computeSharedSecret
+        // бросает, fetchMessages обрывается, и ВСЕ SYSTEM-сообщения бота
+        // не попадают в БД. Возвращаем пустой список — SYSTEM проходит без
+        // дешифровки, а регулярные сообщения в таком чате и так невозможны.
+        val theirPublicKeyBytes = runCatching {
+            Base64.decode(theirPublicKeyBase64, Base64.NO_WRAP)
+        }.getOrNull()
+        if (theirPublicKeyBytes == null || theirPublicKeyBytes.size != 32) {
+            return emptyList()
+        }
+        val result = mutableListOf<ByteArray>()
+        runCatching {
+            val currentPriv = Base64.decode(myPrivateKeyBase64, Base64.NO_WRAP)
+            result.add(cryptoManager.computeSharedSecret(currentPriv, theirPublicKeyBytes))
+        }
+        for (legacyBase64 in localKeyStore.getLegacyPrivateKeys()) {
+            if (legacyBase64 == myPrivateKeyBase64) continue
+            runCatching {
+                val bytes = Base64.decode(legacyBase64, Base64.NO_WRAP)
+                result.add(cryptoManager.computeSharedSecret(bytes, theirPublicKeyBytes))
+            }
+        }
+        return result
     }
 
     override suspend fun syncChats(myUserId: String): Result<Unit> = runCatching {

@@ -15,8 +15,8 @@ android {
         applicationId = "com.secure.messenger"
         minSdk = 26
         targetSdk = 35
-        versionCode = 65
-        versionName = "1.0.65 alfa"
+        versionCode = 66
+        versionName = "1.0.66 alfa"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         // Room schema export for migrations

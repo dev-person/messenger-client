@@ -1,6 +1,5 @@
 package com.secure.messenger.presentation.theme
 
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
@@ -12,12 +11,17 @@ import androidx.compose.ui.graphics.Color
 
 // ── Перечисление цветовых схем ──────────────────────────────────────────────
 
-enum class AppColorScheme(val label: String) {
+enum class AppColorScheme(val label: String, val isDark: Boolean = false) {
     CLASSIC("Классическая"),
     OCEAN("Океан"),
     FOREST("Лес"),
     SUNSET("Закат"),
-    MATERIAL_DARK("Material Dark"),
+    MATERIAL_DARK("Material Dark", isDark = true),
+    MIDNIGHT("Полночь", isDark = true),
+    EMERALD_DARK("Изумруд", isDark = true),
+    ROYAL_DARK("Королевский", isDark = true),
+    CORAL_DARK("Коралл", isDark = true),
+    SLATE_DARK("Графит", isDark = true),
 }
 
 // ── Дополнительные цвета (пузырьки, обои) — зависят от выбранной схемы ──────
@@ -264,6 +268,151 @@ private val MaterialDarkExtra = MessengerExtraColors(
 )
 
 // ══════════════════════════════════════════════════════════════════════════════
+// 6. MIDNIGHT — глубокая синяя ночь
+// ══════════════════════════════════════════════════════════════════════════════
+
+private val MidnightColors = darkColorScheme(
+    primary = Color(0xFF60A5FA),
+    onPrimary = Color.White,
+    primaryContainer = Color(0xFF1E3A8A),
+    onPrimaryContainer = Color(0xFFDBEAFE),
+    secondary = Color(0xFF93C5FD),
+    background = Color(0xFF0A0E27),
+    onBackground = Color(0xFFE2E8F0),
+    surface = Color(0xFF111732),
+    onSurface = Color(0xFFE2E8F0),
+    surfaceVariant = Color(0xFF1E2544),
+    onSurfaceVariant = Color(0xFFB4BCD0),
+    surfaceContainerLow = Color(0xFF0E1431),
+    outline = Color(0xFF3B4869),
+    outlineVariant = Color(0xFF252E4F),
+    error = Color(0xFFFF6B6B),
+)
+
+private val MidnightExtra = MessengerExtraColors(
+    outgoingBubble = Color(0xFF1E3A8A),
+    incomingBubble = Color(0xFF1E2544),
+    chatWallpaper = Color(0xFF06091A),
+    chatPattern = Color(0xFF0C1128),
+)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 7. EMERALD_DARK — тёмно-зелёный, изумрудный
+// ══════════════════════════════════════════════════════════════════════════════
+
+private val EmeraldDarkColors = darkColorScheme(
+    primary = Color(0xFF34D399),
+    onPrimary = Color(0xFF052E22),
+    primaryContainer = Color(0xFF065F46),
+    onPrimaryContainer = Color(0xFFD1FAE5),
+    secondary = Color(0xFF6EE7B7),
+    background = Color(0xFF071510),
+    onBackground = Color(0xFFE0F2EC),
+    surface = Color(0xFF0F221B),
+    onSurface = Color(0xFFE0F2EC),
+    surfaceVariant = Color(0xFF1A3328),
+    onSurfaceVariant = Color(0xFFB0C8BE),
+    surfaceContainerLow = Color(0xFF0C1D17),
+    outline = Color(0xFF3B5B4D),
+    outlineVariant = Color(0xFF213C30),
+    error = Color(0xFFFF7675),
+)
+
+private val EmeraldDarkExtra = MessengerExtraColors(
+    outgoingBubble = Color(0xFF064E3B),
+    incomingBubble = Color(0xFF1A3328),
+    chatWallpaper = Color(0xFF040D09),
+    chatPattern = Color(0xFF0A1812),
+)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 8. ROYAL_DARK — королевский фиолетово-синий
+// ══════════════════════════════════════════════════════════════════════════════
+
+private val RoyalDarkColors = darkColorScheme(
+    primary = Color(0xFFA78BFA),
+    onPrimary = Color(0xFF1E1038),
+    primaryContainer = Color(0xFF4C1D95),
+    onPrimaryContainer = Color(0xFFEDE9FE),
+    secondary = Color(0xFFC4B5FD),
+    background = Color(0xFF120B24),
+    onBackground = Color(0xFFE9E4F7),
+    surface = Color(0xFF1C1235),
+    onSurface = Color(0xFFE9E4F7),
+    surfaceVariant = Color(0xFF2A1E4A),
+    onSurfaceVariant = Color(0xFFC2B7D5),
+    surfaceContainerLow = Color(0xFF170E2D),
+    outline = Color(0xFF4A3A6B),
+    outlineVariant = Color(0xFF2E224A),
+    error = Color(0xFFFF8585),
+)
+
+private val RoyalDarkExtra = MessengerExtraColors(
+    outgoingBubble = Color(0xFF4C1D95),
+    incomingBubble = Color(0xFF2A1E4A),
+    chatWallpaper = Color(0xFF09061A),
+    chatPattern = Color(0xFF120C28),
+)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 9. CORAL_DARK — коралловый на тёмно-бордовом
+// ══════════════════════════════════════════════════════════════════════════════
+
+private val CoralDarkColors = darkColorScheme(
+    primary = Color(0xFFFB7185),
+    onPrimary = Color(0xFF3D0A14),
+    primaryContainer = Color(0xFF9F1239),
+    onPrimaryContainer = Color(0xFFFFE4E6),
+    secondary = Color(0xFFFDA4AF),
+    background = Color(0xFF1C0A0E),
+    onBackground = Color(0xFFFBE8EB),
+    surface = Color(0xFF2A1015),
+    onSurface = Color(0xFFFBE8EB),
+    surfaceVariant = Color(0xFF3D1821),
+    onSurfaceVariant = Color(0xFFD9B8BE),
+    surfaceContainerLow = Color(0xFF220C10),
+    outline = Color(0xFF6B3643),
+    outlineVariant = Color(0xFF401B24),
+    error = Color(0xFFFFB4A9),
+)
+
+private val CoralDarkExtra = MessengerExtraColors(
+    outgoingBubble = Color(0xFF7E1D32),
+    incomingBubble = Color(0xFF3D1821),
+    chatWallpaper = Color(0xFF130508),
+    chatPattern = Color(0xFF1D090D),
+)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 10. SLATE_DARK — холодный графит с серо-голубым акцентом
+// ══════════════════════════════════════════════════════════════════════════════
+
+private val SlateDarkColors = darkColorScheme(
+    primary = Color(0xFF94A3B8),
+    onPrimary = Color(0xFF0F172A),
+    primaryContainer = Color(0xFF334155),
+    onPrimaryContainer = Color(0xFFE2E8F0),
+    secondary = Color(0xFFCBD5E1),
+    background = Color(0xFF0F172A),
+    onBackground = Color(0xFFE2E8F0),
+    surface = Color(0xFF1E293B),
+    onSurface = Color(0xFFE2E8F0),
+    surfaceVariant = Color(0xFF334155),
+    onSurfaceVariant = Color(0xFFCBD5E1),
+    surfaceContainerLow = Color(0xFF18223A),
+    outline = Color(0xFF475569),
+    outlineVariant = Color(0xFF2A3B54),
+    error = Color(0xFFFF8B7A),
+)
+
+private val SlateDarkExtra = MessengerExtraColors(
+    outgoingBubble = Color(0xFF334155),
+    incomingBubble = Color(0xFF1E293B),
+    chatWallpaper = Color(0xFF0A1120),
+    chatPattern = Color(0xFF121C30),
+)
+
+// ══════════════════════════════════════════════════════════════════════════════
 // Выбор палитры по схеме
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -272,7 +421,12 @@ fun resolveColorScheme(scheme: AppColorScheme, isDark: Boolean): ColorScheme = w
     AppColorScheme.OCEAN -> if (isDark) OceanDark else OceanLight
     AppColorScheme.FOREST -> if (isDark) ForestDark else ForestLight
     AppColorScheme.SUNSET -> if (isDark) SunsetDark else SunsetLight
-    AppColorScheme.MATERIAL_DARK -> MaterialDarkColors // всегда тёмная
+    AppColorScheme.MATERIAL_DARK -> MaterialDarkColors
+    AppColorScheme.MIDNIGHT -> MidnightColors
+    AppColorScheme.EMERALD_DARK -> EmeraldDarkColors
+    AppColorScheme.ROYAL_DARK -> RoyalDarkColors
+    AppColorScheme.CORAL_DARK -> CoralDarkColors
+    AppColorScheme.SLATE_DARK -> SlateDarkColors
 }
 
 fun resolveExtraColors(scheme: AppColorScheme, isDark: Boolean): MessengerExtraColors = when (scheme) {
@@ -281,6 +435,11 @@ fun resolveExtraColors(scheme: AppColorScheme, isDark: Boolean): MessengerExtraC
     AppColorScheme.FOREST -> if (isDark) ForestExtraDark else ForestExtraLight
     AppColorScheme.SUNSET -> if (isDark) SunsetExtraDark else SunsetExtraLight
     AppColorScheme.MATERIAL_DARK -> MaterialDarkExtra
+    AppColorScheme.MIDNIGHT -> MidnightExtra
+    AppColorScheme.EMERALD_DARK -> EmeraldDarkExtra
+    AppColorScheme.ROYAL_DARK -> RoyalDarkExtra
+    AppColorScheme.CORAL_DARK -> CoralDarkExtra
+    AppColorScheme.SLATE_DARK -> SlateDarkExtra
 }
 
 /** Цвет-превью для селектора в настройках */
@@ -290,6 +449,11 @@ fun AppColorScheme.previewColor(): Color = when (this) {
     AppColorScheme.FOREST -> Color(0xFF4A8B5C)
     AppColorScheme.SUNSET -> Color(0xFFD4764E)
     AppColorScheme.MATERIAL_DARK -> Color(0xFFBB86FC)
+    AppColorScheme.MIDNIGHT -> Color(0xFF60A5FA)
+    AppColorScheme.EMERALD_DARK -> Color(0xFF34D399)
+    AppColorScheme.ROYAL_DARK -> Color(0xFFA78BFA)
+    AppColorScheme.CORAL_DARK -> Color(0xFFFB7185)
+    AppColorScheme.SLATE_DARK -> Color(0xFF94A3B8)
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -298,11 +462,17 @@ fun AppColorScheme.previewColor(): Color = when (this) {
 
 @Composable
 fun SecureMessengerTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
     colorScheme: AppColorScheme = AppColorScheme.CLASSIC,
     content: @Composable () -> Unit,
 ) {
-    val isDark = colorScheme == AppColorScheme.MATERIAL_DARK || darkTheme
+    // Выбранная в приложении схема полностью управляет темой — ИГНОРИРУЕМ
+    // системное isSystemInDarkTheme(). Иначе CLASSIC/OCEAN/FOREST/SUNSET при
+    // тёмной системной теме переключались в dark-вариант, а MATERIAL_DARK
+    // при светлой системе давал непоследовательные шапки/статус-бары.
+    //
+    // Все схемы с isDark=true (Material Dark и новые тёмные) — тёмные,
+    // остальные — светлые.
+    val isDark = colorScheme.isDark
     val colors = resolveColorScheme(colorScheme, isDark)
     val extra = resolveExtraColors(colorScheme, isDark)
 

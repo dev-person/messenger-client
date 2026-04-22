@@ -11,7 +11,7 @@ import com.secure.messenger.data.local.entities.UserEntity
 
 @Database(
     entities = [UserEntity::class, ChatEntity::class, MessageEntity::class],
-    version = 2,
+    version = 3,
     exportSchema = true,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -20,13 +20,22 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun messageDao(): MessageDao
 
     companion object {
-        // v1 → v2: добавили колонку chats.isHidden для soft-delete чатов.
-        // Без миграции пользователи потеряли бы все локальные сообщения и чаты
-        // (fallbackToDestructiveMigration), а это для альфа-релиза недопустимо
-        // когда у юзеров уже накоплена история.
         val MIGRATION_1_2 = object : androidx.room.migration.Migration(1, 2) {
             override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE chats ADD COLUMN isHidden INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
+        // v2 → v3: очищаем encryptedContent для медиа-сообщений — он дублирует
+        // тяжёлый base64-блоб из decryptedContent и переполняет CursorWindow,
+        // из-за чего observeMessages падал с SQLiteBlobTooBigException на
+        // чатах с несколькими фото/голосовыми.
+        val MIGRATION_2_3 = object : androidx.room.migration.Migration(2, 3) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL(
+                    "UPDATE messages SET encryptedContent = '' " +
+                    "WHERE type IN ('IMAGE','AUDIO','VIDEO')"
+                )
             }
         }
     }

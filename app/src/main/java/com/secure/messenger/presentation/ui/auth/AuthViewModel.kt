@@ -10,6 +10,7 @@ import com.secure.messenger.data.repository.PasswordException
 import com.secure.messenger.di.AuthTokenProvider
 import com.secure.messenger.domain.repository.AuthRepository
 import com.secure.messenger.utils.CryptoManager
+import com.secure.messenger.utils.LegacyKeyManager
 import com.secure.messenger.utils.LocalKeyStore
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -108,6 +109,7 @@ class AuthViewModel @Inject constructor(
     private val authRepository: AuthRepository,
     private val cryptoManager: CryptoManager,
     private val localKeyStore: LocalKeyStore,
+    private val legacyKeyManager: LegacyKeyManager,
     private val tokenProvider: AuthTokenProvider,
 ) : ViewModel() {
 
@@ -358,6 +360,13 @@ class AuthViewModel @Inject constructor(
 
             serverResult
                 .onSuccess {
+                    if (state.hasPassword) {
+                        // Новое устройство: скачиваем legacy-ключи и сохраняем
+                        // локально — они нужны для расшифровки сообщений, которые
+                        // были отправлены ДО установки пароля (тогда ключ был
+                        // случайным и не синхронизировался).
+                        legacyKeyManager.downloadAndSaveLegacyKeys(state.fullPhone, password)
+                    }
                     generateKeyFromPassword(state.fullPhone, password)
                     onSuccess(!state.hasPassword)
                 }
