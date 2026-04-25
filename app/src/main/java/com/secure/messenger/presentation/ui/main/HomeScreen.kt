@@ -2,9 +2,18 @@ package com.secure.messenger.presentation.ui.main
 
 import android.app.Activity
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.AccountCircle
@@ -28,6 +37,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.unit.dp
 import com.secure.messenger.presentation.ui.chat.ChatListScreen
 import com.secure.messenger.presentation.ui.contacts.ContactsScreen
 import com.secure.messenger.presentation.ui.profile.ProfileEditScreen
@@ -48,6 +59,8 @@ private data class CropRequest(
 @Composable
 fun HomeScreen(
     onChatClick: (chatId: String) -> Unit,
+    onCreateGroupClick: () -> Unit = {},
+    onDiagnosticsClick: () -> Unit = {},
     onLogout: () -> Unit,
 ) {
     val activity = androidx.compose.ui.platform.LocalContext.current as? Activity
@@ -123,7 +136,12 @@ fun HomeScreen(
                 NavigationBarItem(
                     selected = selectedTab == 3,
                     onClick = { selectedTab = 3 },
-                    icon = { Icon(Icons.Default.Settings, contentDescription = "Настройки") },
+                    icon = {
+                        SettingsTabIcon(
+                            highlight = com.secure.messenger.presentation.ui.permissions
+                                .shouldHighlightSettingsTab(),
+                        )
+                    },
                     label = { Text("Настройки") },
                 )
             }
@@ -138,6 +156,7 @@ fun HomeScreen(
                 0 -> ChatListScreen(
                     onChatClick = onChatClick,
                     onNewChatClick = { selectedTab = 1 },
+                    onCreateGroupClick = onCreateGroupClick,
                     onProfileClick = { selectedTab = 2 },
                 )
                 1 -> ContactsScreen(
@@ -152,7 +171,10 @@ fun HomeScreen(
                         cropRequest = CropRequest(bmp, onResult)
                     },
                 )
-                3 -> SettingsScreen(onBack = { selectedTab = 0 })
+                3 -> SettingsScreen(
+                    onBack = { selectedTab = 0 },
+                    onOpenDiagnostics = onDiagnosticsClick,
+                )
             }
         }
     }
@@ -170,5 +192,55 @@ fun HomeScreen(
                 },
             )
         }
+
+        // Диалог-онбординг по критичным разрешениям. Показываем один раз
+        // после login, если пользователь не нажал «не напоминать». Пункты —
+        // прямые ссылки в системные настройки этих разрешений.
+        val missingPerms by com.secure.messenger.utils.rememberMissingCriticalPermissions()
+        val permsPrefs = com.secure.messenger.utils.rememberPermissionsPrefs()
+        var dialogShown by rememberSaveable { mutableStateOf(false) }
+        if (missingPerms.isNotEmpty() && !permsPrefs.warningDismissed && !dialogShown) {
+            com.secure.messenger.presentation.ui.permissions.PermissionsWarningDialog(
+                missing = missingPerms,
+                onDismiss = { dialogShown = true },
+                onDismissForever = {
+                    permsPrefs.warningDismissed = true
+                    dialogShown = true
+                },
+            )
+        }
+    }
+}
+
+/**
+ * Иконка вкладки «Настройки» с алерт-индикатором, если у пользователя
+ * не выданы критичные разрешения и он не отказался от напоминания.
+ * Индикатор — красная пульсирующая точка в правом верхнем углу.
+ */
+@Composable
+private fun SettingsTabIcon(highlight: Boolean) {
+    if (!highlight) {
+        Icon(Icons.Default.Settings, contentDescription = "Настройки")
+        return
+    }
+    val infinite = rememberInfiniteTransition(label = "perm-pulse")
+    val pulse by infinite.animateFloat(
+        initialValue = 0.45f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(700),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "alpha",
+    )
+    Box {
+        Icon(Icons.Default.Settings, contentDescription = "Настройки")
+        Box(
+            modifier = Modifier
+                .size(10.dp)
+                .offset(x = 12.dp, y = (-2).dp)
+                .clip(CircleShape)
+                .background(MaterialTheme.colorScheme.error.copy(alpha = pulse)),
+        )
     }
 }

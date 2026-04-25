@@ -29,6 +29,14 @@ interface UserDao {
     @Query("SELECT * FROM users WHERE id = :userId")
     fun observeById(userId: String): Flow<UserEntity?>
 
+    /**
+     * Реактивный список пользователей по списку id — нужен для шапки группы:
+     * считаем онлайн-участников, реагируя на WS-события user_status, которые
+     * обновляют колонку isOnline.
+     */
+    @Query("SELECT * FROM users WHERE id IN (:userIds)")
+    fun observeByIds(userIds: List<String>): Flow<List<UserEntity>>
+
     @Query("SELECT * FROM users WHERE phone = :phone")
     suspend fun getByPhone(phone: String): UserEntity?
 

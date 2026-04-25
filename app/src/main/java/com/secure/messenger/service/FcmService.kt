@@ -90,6 +90,12 @@ class FcmService : FirebaseMessagingService() {
         when (data["type"]) {
             "new_message" -> {
                 if (!com.secure.messenger.MessengerApp.isInForeground) {
+                    // Чат приглушён — пуш получили, но шторку не показываем.
+                    val chatId = data["chatId"]
+                    if (chatId != null &&
+                        com.secure.messenger.data.local.MutedChatsPrefs.isMuted(this, chatId)) {
+                        return
+                    }
                     showMessageNotification(data)
                 }
             }

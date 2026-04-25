@@ -26,10 +26,15 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChangedBy
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import timber.log.Timber
 import javax.inject.Inject
@@ -103,6 +108,73 @@ class ChatViewModel @Inject constructor(
         }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
+    /**
+     * Минимальная версия клиента, поддерживающая групповую E2E (sender-keys).
+     * 0 у пользователя = неизвестно (никогда не отчитался) — не считаем устаревшим.
+     */
+    private val MIN_GROUP_VERSION_CODE = 68
+
+    /**
+     * Список участников группового чата. Подгружается с сервера при открытии
+     * (один раз) и пересчитывается при изменении состава — через слежение за
+     * `chatInfo.currentEpoch` (epoch инкрементится сервером при add/remove
+     * /leave, так что любой такой реакт автоматически перетянет свежий состав).
+     * Для DIRECT-чата — пустой список.
+     */
+    private val _groupMembers = MutableStateFlow<List<User>>(emptyList())
+    val groupMembers: StateFlow<List<User>> = _groupMembers.asStateFlow()
+
+    init {
+        viewModelScope.launch {
+            chatInfo
+                .filterNotNull()
+                .filter { it.type == ChatType.GROUP }
+                // Пересчитываем при смене chatId или epoch'а — больше ничего
+                // не должно триггерить лишний REST-запрос.
+                .distinctUntilChangedBy { it.id to it.currentEpoch }
+                .collect { chat ->
+                    runCatching { chatRepository.getGroupMembers(chat.id) }
+                        .onSuccess { _groupMembers.value = it }
+                }
+        }
+    }
+
+    /**
+     * Есть ли в группе участники с устаревшей версией клиента (versionCode < 68),
+     * которые не смогут расшифровать sender-keys. Для DIRECT всегда false.
+     */
+    val hasOutdatedGroupMembers: StateFlow<Boolean> = _groupMembers
+        .map { members -> members.any { it.appVersionCode in 1 until MIN_GROUP_VERSION_CODE } }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
+    /**
+     * Кол-во участников группы онлайн (без меня). Реактивно отслеживает изменения
+     * `users.isOnline` (которые приходят через WS-событие `user_status` →
+     * `IncomingMessageHandler.handleUserStatus`).
+     */
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    val groupOnlineCount: StateFlow<Int> = _groupMembers
+        .flatMapLatest { members ->
+            if (members.isEmpty()) flowOf(0)
+            else {
+                val ids = members.map { it.id }
+                userDao.observeByIds(ids).map { entities ->
+                    val myId = currentUserId.value
+                    entities.count { it.isOnline && it.id != myId }
+                }
+            }
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
+
+    /**
+     * Кто сейчас печатает в группе — userId → displayName. Сбрасывается через
+     * 3 секунды после последнего события Typing от каждого юзера. UI-компонент
+     * сам решает как компактно отобразить (1 имя / «X и ещё N»).
+     */
+    private val _groupTypingNames = MutableStateFlow<Map<String, String>>(emptyMap())
+    val groupTypingNames: StateFlow<Map<String, String>> = _groupTypingNames.asStateFlow()
+    private val typingResetJobs = mutableMapOf<String, Job>()
+
     // Индикатор «печатает…»
     private val _isTyping = MutableStateFlow(false)
     val isTyping: StateFlow<Boolean> = _isTyping.asStateFlow()
@@ -129,8 +201,34 @@ class ChatViewModel @Inject constructor(
         observeTyping()
         // При каждом новом сообщении — помечаем как прочитанное (пока чат открыт)
         observeNewMessagesAndMarkRead()
+        // Страховочный рефреш профиля собеседника — нужно на случай, если WS-event
+        // user_status был пропущен (собеседник перезашёл пока мы были в офлайне).
+        refreshOtherUserProfile()
     }
 
+    /**
+     * Обновляет профиль собеседника по REST сразу после открытия чата.
+     * Работает только для DIRECT-чатов; в групповых пока пропускаем (там
+     * статусов много, их подтягивает syncChats целиком).
+     */
+    private fun refreshOtherUserProfile() {
+        viewModelScope.launch {
+            // Ждём первое непустое значение chatInfo (у которого уже определён
+            // тип и otherUserId) — иначе можем промахнуться по ещё не загруженному
+            // из Room chat-entity.
+            val chat = chatInfo
+                .filter { it != null && (it.type != ChatType.DIRECT || it.otherUserId != null) }
+                .first() ?: return@launch
+            val otherId = chat.otherUserId ?: return@launch
+            if (chat.type == ChatType.DIRECT) {
+                chatRepository.refreshUserProfile(otherId).onFailure { e ->
+                    Timber.w(e, "refreshUserProfile($otherId) failed")
+                }
+            }
+        }
+    }
+
+    @OptIn(kotlinx.coroutines.FlowPreview::class)
     private fun observeNewMessagesAndMarkRead() {
         viewModelScope.launch {
             // Дебаунс 1.5с — без него при 15 upsert-ах подряд (отправка альбома)
@@ -145,11 +243,29 @@ class ChatViewModel @Inject constructor(
         viewModelScope.launch {
             signalingClient.events.collect { event ->
                 if (event is SignalingEvent.Typing && event.chatId == chatId) {
-                    _isTyping.value = true
-                    typingResetJob?.cancel()
-                    typingResetJob = viewModelScope.launch {
-                        delay(3_000)
-                        _isTyping.value = false
+                    val chat = chatInfo.value
+                    if (chat?.type == ChatType.GROUP) {
+                        // Имя берём из локально загруженного списка участников;
+                        // если member ещё не подгружен — используем UUID как
+                        // фолбэк (UI его не покажет, переключится при следующем
+                        // обновлении groupMembers).
+                        val name = _groupMembers.value.firstOrNull { it.id == event.userId }
+                            ?.displayName?.ifBlank { null }
+                            ?: event.userId
+                        _groupTypingNames.update { it + (event.userId to name) }
+                        typingResetJobs[event.userId]?.cancel()
+                        typingResetJobs[event.userId] = viewModelScope.launch {
+                            delay(3_000)
+                            _groupTypingNames.update { it - event.userId }
+                            typingResetJobs.remove(event.userId)
+                        }
+                    } else {
+                        _isTyping.value = true
+                        typingResetJob?.cancel()
+                        typingResetJob = viewModelScope.launch {
+                            delay(3_000)
+                            _isTyping.value = false
+                        }
                     }
                 }
             }
@@ -442,6 +558,11 @@ class ChatViewModel @Inject constructor(
 
     fun clearError() {
         _uiState.value = _uiState.value.copy(error = null)
+    }
+
+    /** Выставляет сообщение об ошибке во внешнюю UI-state (снекбар подхватит). */
+    fun reportError(message: String) {
+        _uiState.value = _uiState.value.copy(error = message)
     }
 
     /** Улучшает текст в инпуте: Gemini Nano (если есть) → правила */

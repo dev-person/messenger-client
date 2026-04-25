@@ -1,26 +1,42 @@
 package com.secure.messenger.data.repository
 
+import android.content.Context
 import android.util.Base64
+import com.secure.messenger.data.local.MutedChatsPrefs
 import com.secure.messenger.data.local.dao.ChatDao
+import com.secure.messenger.data.local.dao.GroupSenderKeyDao
 import com.secure.messenger.data.local.dao.MessageDao
 import com.secure.messenger.data.local.dao.UserDao
 import com.secure.messenger.data.local.entities.ChatEntity
 import com.secure.messenger.data.local.entities.ChatWithLastMessage
+import com.secure.messenger.data.local.entities.GroupSenderKeyEntity
 import com.secure.messenger.data.local.entities.MessageEntity
 import com.secure.messenger.data.local.entities.UserEntity
 import com.secure.messenger.data.remote.api.MessengerApi
 import com.secure.messenger.data.remote.api.SendMessageRequest
+import com.secure.messenger.data.remote.api.dto.AddMemberDto
+import com.secure.messenger.data.remote.api.dto.ChangeRoleDto
+import com.secure.messenger.data.remote.api.dto.SenderKeyEntryDto
+import com.secure.messenger.data.remote.api.dto.UpdateGroupInfoDto
+import com.secure.messenger.data.remote.api.dto.UploadSenderKeysDto
 import com.secure.messenger.data.remote.websocket.SignalingClient
 import com.secure.messenger.domain.model.Chat
+import com.secure.messenger.domain.model.ChatRole
 import com.secure.messenger.domain.model.ChatType
 import com.secure.messenger.domain.model.Message
 import com.secure.messenger.domain.model.MessageStatus
 import com.secure.messenger.domain.model.MessageType
+import com.secure.messenger.domain.model.User
 import com.secure.messenger.domain.repository.AuthRepository
 import com.secure.messenger.domain.repository.ChatRepository
 import com.secure.messenger.utils.CryptoManager
+import com.secure.messenger.utils.GroupCryptoManager
 import com.secure.messenger.utils.LocalKeyStore
 import dagger.Lazy
+import dagger.hilt.android.qualifiers.ApplicationContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -30,11 +46,14 @@ import java.util.UUID
 import javax.inject.Inject
 
 class ChatRepositoryImpl @Inject constructor(
+    @ApplicationContext private val context: Context,
     private val api: MessengerApi,
     private val chatDao: ChatDao,
     private val messageDao: MessageDao,
     private val userDao: UserDao,
+    private val groupSenderKeyDao: GroupSenderKeyDao,
     private val cryptoManager: CryptoManager,
+    private val groupCryptoManager: GroupCryptoManager,
     private val localKeyStore: LocalKeyStore,
     private val signalingClient: SignalingClient,
     // Lazy чтобы избежать циклической зависимости (AuthRepositoryImpl может зависеть от ChatRepository)
@@ -88,20 +107,60 @@ class ChatRepositoryImpl @Inject constructor(
             id = dto.id, type = dto.type, title = title, avatarUrl = avatarUrl,
             unreadCount = dto.unreadCount, isPinned = dto.isPinned, isMuted = dto.isMuted,
             updatedAt = Instant.parse(dto.updatedAt).toEpochMilli(), otherUserId = userId,
+            myRole = "", currentEpoch = 0,
         )
         chatDao.upsert(entity)
         entity.toChat()
     }
 
     override suspend fun createGroupChat(title: String, memberIds: List<String>): Result<Chat> = runCatching {
-        val dto = api.createGroupChat(mapOf("title" to title, "memberIds" to memberIds)).data
-            ?: error("Server returned null chat")
+        val dto = api.createGroupChat(
+            com.secure.messenger.data.remote.api.dto.CreateGroupChatDto(
+                title = title,
+                memberIds = memberIds,
+            )
+        ).data ?: error("Server returned null chat")
+        val myUserId = currentUserIdSync()
+
+        // Members из ответа кладём в общую таблицу users (понадобятся для шифрования).
+        dto.members?.forEach { memberDto ->
+            val existing = userDao.getById(memberDto.id)
+            userDao.upsert(UserEntity(
+                id = memberDto.id, phone = memberDto.phone, username = memberDto.username,
+                displayName = memberDto.displayName, avatarUrl = memberDto.avatarUrl,
+                bio = memberDto.bio, isOnline = memberDto.isOnline,
+                lastSeen = Instant.parse(memberDto.lastSeen).toEpochMilli(),
+                publicKey = memberDto.publicKey,
+                isContact = existing?.isContact ?: false,
+            ))
+        }
+
         val entity = ChatEntity(
             id = dto.id, type = dto.type, title = dto.title, avatarUrl = dto.avatarUrl,
             unreadCount = 0, isPinned = false, isMuted = false,
             updatedAt = Instant.parse(dto.updatedAt).toEpochMilli(), otherUserId = null,
+            myRole = dto.myRole ?: ChatRole.CREATOR.name,
+            currentEpoch = dto.currentEpoch,
         )
         chatDao.upsert(entity)
+
+        // Генерируем свой sender key для группы и заливаем его на сервер
+        // в зашифрованном виде для каждого участника. Если не получилось —
+        // чат всё равно создан, пользователь сможет запустить ротацию позже
+        // (через любое add/remove-событие), а пока увидит группу в списке.
+        runCatching {
+            initializeSenderKey(
+                chatId = dto.id,
+                epoch = dto.currentEpoch,
+                myUserId = myUserId,
+                recipients = dto.members.orEmpty()
+                    .filter { it.id != myUserId }
+                    .map { it.toDomain() },
+            )
+        }.onFailure { e ->
+            Timber.w(e, "createGroupChat: не смогли разослать sender key, группа создана без ключей")
+        }
+
         entity.toChat()
     }
 
@@ -115,14 +174,14 @@ class ChatRepositoryImpl @Inject constructor(
         val myUserId = currentUserIdSync()
 
         // Шифруем сообщение публичным ключом получателя
-        val encryptedContent = encryptForChat(chatEntity, content, messageId)
+        val payload = encryptForChat(chatEntity, content, messageId)
 
         // Оптимистичная вставка в локальную БД со статусом SENDING.
         // senderId сразу ставим реальным — иначе MessageBubble нарисует сообщение
         // как входящее (слева) до ответа сервера, а потом перепрыгнет вправо.
         val optimisticEntity = MessageEntity(
             id = messageId, chatId = chatId, senderId = myUserId,
-            encryptedContent = encryptedContent, decryptedContent = content,
+            encryptedContent = payload.content, decryptedContent = content,
             type = MessageType.TEXT.name, status = MessageStatus.SENDING.name,
             timestamp = System.currentTimeMillis(),
             replyToId = replyToId, mediaUrl = null, isEdited = false,
@@ -132,8 +191,9 @@ class ChatRepositoryImpl @Inject constructor(
         // Отправляем на сервер
         val request = SendMessageRequest(
             messageId = messageId,
-            encryptedContent = encryptedContent,
+            encryptedContent = payload.content,
             replyToId = replyToId,
+            groupEpoch = payload.usedEpoch,
         )
         val dto = api.sendMessage(chatId, request).data ?: error("Send failed")
 
@@ -147,7 +207,7 @@ class ChatRepositoryImpl @Inject constructor(
         messageDao.upsert(confirmedEntity)
 
         // Дополнительно отправляем через WebSocket для доставки в реальном времени
-        signalingClient.sendChatMessage(chatId, encryptedContent, dto.id)
+        signalingClient.sendChatMessage(chatId, payload.content, dto.id)
 
         confirmedEntity.toDomain()
     }
@@ -168,15 +228,15 @@ class ChatRepositoryImpl @Inject constructor(
         val messageId = UUID.randomUUID().toString()
         val myUserId = currentUserIdSync()
 
-        val payload = com.secure.messenger.utils.VoiceCodec.encode(audioBytes, durationSeconds, waveform)
-        val encryptedContent = encryptForChat(chatEntity, payload, messageId)
+        val voicePayload = com.secure.messenger.utils.VoiceCodec.encode(audioBytes, durationSeconds, waveform)
+        val encrypted = encryptForChat(chatEntity, voicePayload, messageId)
 
         val optimisticEntity = MessageEntity(
             id = messageId, chatId = chatId, senderId = myUserId,
             // Не храним encryptedContent для аудио — raw-байты дублируются и
             // раздувают строку Room (см. sendImageMessage).
             encryptedContent = "",
-            decryptedContent = payload,
+            decryptedContent = voicePayload,
             type = MessageType.AUDIO.name,
             status = MessageStatus.SENDING.name,
             timestamp = System.currentTimeMillis(),
@@ -186,8 +246,9 @@ class ChatRepositoryImpl @Inject constructor(
 
         val request = SendMessageRequest(
             messageId = messageId,
-            encryptedContent = encryptedContent,
+            encryptedContent = encrypted.content,
             type = MessageType.AUDIO.name,
+            groupEpoch = encrypted.usedEpoch,
         )
         val dto = api.sendMessage(chatId, request).data ?: error("Send failed")
 
@@ -200,7 +261,7 @@ class ChatRepositoryImpl @Inject constructor(
         messageDao.upsert(confirmedEntity)
 
         // Доставка в реальном времени через WebSocket
-        signalingClient.sendChatMessage(chatId, encryptedContent, dto.id)
+        signalingClient.sendChatMessage(chatId, encrypted.content, dto.id)
 
         confirmedEntity.toDomain()
     }
@@ -217,8 +278,8 @@ class ChatRepositoryImpl @Inject constructor(
         val messageId = UUID.randomUUID().toString()
         val myUserId = currentUserIdSync()
 
-        val payload = com.secure.messenger.utils.ImageCodec.encode(imageData)
-        val encryptedContent = encryptForChat(chatEntity, payload, messageId)
+        val imagePayload = com.secure.messenger.utils.ImageCodec.encode(imageData)
+        val encrypted = encryptForChat(chatEntity, imagePayload, messageId)
 
         val optimisticEntity = MessageEntity(
             id = messageId, chatId = chatId, senderId = myUserId,
@@ -226,7 +287,7 @@ class ChatRepositoryImpl @Inject constructor(
             // decryptedContent ~800KB base64. Вдвоём они раздувают строку
             // Room до >2МБ и вызывают SQLiteBlobTooBigException при чтении.
             encryptedContent = "",
-            decryptedContent = payload,
+            decryptedContent = imagePayload,
             type = MessageType.IMAGE.name,
             status = MessageStatus.SENDING.name,
             timestamp = System.currentTimeMillis(),
@@ -236,8 +297,9 @@ class ChatRepositoryImpl @Inject constructor(
 
         val request = SendMessageRequest(
             messageId = messageId,
-            encryptedContent = encryptedContent,
+            encryptedContent = encrypted.content,
             type = MessageType.IMAGE.name,
+            groupEpoch = encrypted.usedEpoch,
         )
         try {
             val dto = api.sendMessage(chatId, request).data ?: error("Send failed")
@@ -248,7 +310,7 @@ class ChatRepositoryImpl @Inject constructor(
                 timestamp = Instant.parse(dto.timestamp).toEpochMilli(),
             )
             messageDao.upsert(confirmedEntity)
-            signalingClient.sendChatMessage(chatId, encryptedContent, dto.id)
+            signalingClient.sendChatMessage(chatId, encrypted.content, dto.id)
             confirmedEntity.toDomain()
         } catch (e: Exception) {
             messageDao.upsert(optimisticEntity.copy(status = MessageStatus.FAILED.name))
@@ -272,10 +334,10 @@ class ChatRepositoryImpl @Inject constructor(
     override suspend fun editMessage(messageId: String, newContent: String): Result<Message> = runCatching {
         val existing = messageDao.getById(messageId) ?: error("Message not found")
         val chatEntity = chatDao.getById(existing.chatId) ?: error("Chat not found")
-        val encryptedContent = encryptForChat(chatEntity, newContent, messageId)
+        val encrypted = encryptForChat(chatEntity, newContent, messageId)
 
-        api.editMessage(messageId, mapOf("encryptedContent" to encryptedContent))
-        val updated = existing.copy(encryptedContent = encryptedContent, decryptedContent = newContent, isEdited = true)
+        api.editMessage(messageId, mapOf("encryptedContent" to encrypted.content))
+        val updated = existing.copy(encryptedContent = encrypted.content, decryptedContent = newContent, isEdited = true)
         messageDao.update(updated)
         updated.toDomain()
     }
@@ -342,7 +404,7 @@ class ChatRepositoryImpl @Inject constructor(
 
         val entities = dtos.map { dto ->
             val existing = messageDao.getById(dto.id)
-            val decrypted = decryptOrKeepExisting(dto, sharedSecrets, existing)
+            val decrypted = decryptMessageEntry(chat, dto, sharedSecrets, existing)
             // Для медиа-типов не кладём encryptedContent локально — это
             // base64 сырых байт, который уже дублирован в decryptedContent.
             // Хранить его повторно — рецепт CursorWindow-переполнения.
@@ -374,7 +436,7 @@ class ChatRepositoryImpl @Inject constructor(
 
         val entities = dtos.map { dto ->
             val existing = messageDao.getById(dto.id)
-            val decrypted = decryptOrKeepExisting(dto, sharedSecrets, existing)
+            val decrypted = decryptMessageEntry(chat, dto, sharedSecrets, existing)
             // Для медиа-типов не кладём encryptedContent локально — это
             // base64 сырых байт, который уже дублирован в decryptedContent.
             // Хранить его повторно — рецепт CursorWindow-переполнения.
@@ -390,6 +452,37 @@ class ChatRepositoryImpl @Inject constructor(
         }
         upsertWithoutStatusDowngrade(entities)
         true // есть ещё сообщения
+    }
+
+    /**
+     * Единый entry-point расшифровки сообщения из серверного fetch'а.
+     * Для DIRECT — X25519 ECDH, для GROUP — sender key. Если decrypt не
+     * удался, возвращает предыдущий валидный текст из БД (если есть) —
+     * не затираем корректный текст плашкой при ре-фетчах.
+     */
+    private suspend fun decryptMessageEntry(
+        chat: ChatEntity,
+        dto: com.secure.messenger.data.remote.api.dto.MessageDto,
+        directSharedSecrets: List<ByteArray>,
+        existing: MessageEntity?,
+    ): String {
+        if (dto.type == "SYSTEM") return dto.encryptedContent
+        if (chat.type == "GROUP") {
+            val decrypted = tryDecryptGroupMessage(
+                chatId = chat.id,
+                senderId = dto.senderId,
+                messageId = dto.id,
+                encryptedContent = dto.encryptedContent,
+                currentEpoch = chat.currentEpoch,
+            )
+            if (decrypted != null) return decrypted
+            val prev = existing?.decryptedContent
+            if (!prev.isNullOrEmpty() && prev != "[Не удалось расшифровать]" && prev != "[Групповые чаты не поддерживаются]") {
+                return prev
+            }
+            return "[Не удалось расшифровать]"
+        }
+        return decryptOrKeepExisting(dto, directSharedSecrets, existing)
     }
 
     /**
@@ -510,7 +603,23 @@ class ChatRepositoryImpl @Inject constructor(
                 // ВАЖНО: сохраняем флаг скрытости. Без этого синхронизация с сервера
                 // «оживляла» удалённые юзером чаты при следующем запуске приложения.
                 isHidden = existingChat?.isHidden ?: false,
+                // Роль и epoch — только для групп, для DIRECT сервер даёт пустую строку / 0.
+                myRole = dto.myRole ?: "",
+                currentEpoch = dto.currentEpoch,
             ))
+        }
+
+        // После logout/login локальная таблица group_sender_keys пуста. Без
+        // префетча первое открытие группы превращается в долгий ре-fetch
+        // ключей внутри расшифровки каждого сообщения. Делаем явный proactive
+        // pull для всех групп — так история (текст, картинки, голос) сразу
+        // расшифровывается, а системные сообщения (которые не шифруются)
+        // не остаются «единственным видимым» в чате.
+        dtos.filter { it.type == "GROUP" }.forEach { groupDto ->
+            runCatching { refreshSenderKeys(groupDto.id) }
+                .onFailure { e ->
+                    Timber.w(e, "syncChats: refreshSenderKeys failed for group ${groupDto.id}")
+                }
         }
     }
 
@@ -525,7 +634,11 @@ class ChatRepositoryImpl @Inject constructor(
     }
 
     override suspend fun muteChat(chatId: String, mutedUntil: Long?): Result<Unit> = runCatching {
-        chatDao.setMuted(chatId, mutedUntil != null)
+        val muted = mutedUntil != null
+        chatDao.setMuted(chatId, muted)
+        // Дублируем флаг в SharedPreferences, чтобы FcmService мог его прочитать
+        // когда приложение убито и DI/Room ещё не подняты.
+        MutedChatsPrefs.setMuted(context, chatId, muted)
     }
 
     /**
@@ -537,6 +650,28 @@ class ChatRepositoryImpl @Inject constructor(
      */
     override suspend fun deleteChat(chatId: String): Result<Unit> = runCatching {
         chatDao.hideById(chatId)
+    }
+
+    /**
+     * Подтягивает свежий профиль пользователя с сервера и апсертит в локальную БД.
+     * Сохраняет флаг [isContact] из существующей записи (сервер о нём не знает —
+     * контакты хранятся отдельно, добавляются явно через /contacts).
+     */
+    override suspend fun refreshUserProfile(userId: String): Result<Unit> = runCatching {
+        val dto = api.getUserById(userId).data ?: return@runCatching
+        val existing = userDao.getById(dto.id)
+        userDao.upsert(UserEntity(
+            id = dto.id,
+            phone = dto.phone,
+            username = dto.username,
+            displayName = dto.displayName,
+            avatarUrl = dto.avatarUrl,
+            bio = dto.bio,
+            isOnline = dto.isOnline,
+            lastSeen = Instant.parse(dto.lastSeen).toEpochMilli(),
+            publicKey = dto.publicKey,
+            isContact = existing?.isContact ?: false,
+        ))
     }
 
     // ── Защита от понижения статуса при синхронизации ────────────────────────
@@ -569,16 +704,92 @@ class ChatRepositoryImpl @Inject constructor(
 
     // ── Шифрование ─────────────────────────────────────────────────────────
 
-    private suspend fun encryptForChat(chat: ChatEntity, content: String, messageId: String): String {
+    /**
+     * Результат шифрования сообщения. [usedEpoch] непустой только для GROUP —
+     * это epoch sender-ключа, которым реально зашифровано сообщение, и его
+     * нужно отправлять серверу в SendMessageRequest.groupEpoch. Получатель
+     * читает groupEpoch и использует его для выбора правильного ключа из БД.
+     */
+    private data class EncryptedPayload(val content: String, val usedEpoch: Int?)
+
+    private suspend fun encryptForChat(chat: ChatEntity, content: String, messageId: String): EncryptedPayload {
+        // Группы (1.0.68): шифруем через свой sender key актуального epoch'а.
+        // Если точного ключа под currentEpoch ещё нет (event group_member_added
+        // мог запоздать или клиент только что вступил в чат), берём latest —
+        // и шлём именно этот epoch в SendMessageRequest.groupEpoch.
+        if (chat.type == "GROUP") {
+            val myUserId = currentUserIdSync()
+            var myKey = groupSenderKeyDao.get(chat.id, myUserId, chat.currentEpoch)
+                ?: groupSenderKeyDao.getLatest(chat.id, myUserId)
+            if (myKey == null) {
+                // Своего sender key нет вообще — например, клиент только что
+                // обновился и пропустил событие group_member_added на старом
+                // билде. Лениво генерим свой ключ и рассылаем остальным.
+                Timber.w("encryptForChat: my sender key missing for group ${chat.id}, regenerating")
+                val others = runCatching {
+                    api.getChats().data.orEmpty()
+                        .firstOrNull { it.id == chat.id }?.members.orEmpty()
+                        .filter { it.id != myUserId }
+                        .map { it.toDomain() }
+                }.getOrDefault(emptyList())
+                runCatching {
+                    initializeSenderKey(chat.id, chat.currentEpoch, myUserId, others)
+                }.onFailure { e ->
+                    Timber.e(e, "encryptForChat: lazy senderKey generation failed")
+                }
+                myKey = groupSenderKeyDao.get(chat.id, myUserId, chat.currentEpoch)
+                    ?: groupSenderKeyDao.getLatest(chat.id, myUserId)
+                    ?: error("Не удалось сгенерировать sender key для группы ${chat.id}")
+            }
+            val senderKeyBytes = Base64.decode(myKey.senderKey, Base64.NO_WRAP)
+            val ciphertext = groupCryptoManager.encryptGroupMessage(content, senderKeyBytes, messageId)
+            return EncryptedPayload(ciphertext, myKey.epoch)
+        }
+
         val myPrivateKeyBase64 = localKeyStore.getPrivateKey() ?: error("No local private key")
         val myPrivateKeyBytes = Base64.decode(myPrivateKeyBase64, Base64.NO_WRAP)
 
-        val otherUserId = chat.otherUserId ?: error("Group chat encryption not supported yet")
+        val otherUserId = chat.otherUserId ?: error("DIRECT chat without otherUserId")
         val otherUser = userDao.getById(otherUserId) ?: error("Recipient not found: $otherUserId")
         val theirPublicKeyBytes = Base64.decode(otherUser.publicKey, Base64.NO_WRAP)
 
         val sharedSecret = cryptoManager.computeSharedSecret(myPrivateKeyBytes, theirPublicKeyBytes)
-        return cryptoManager.encryptMessage(content, sharedSecret, messageId)
+        val ciphertext = cryptoManager.encryptMessage(content, sharedSecret, messageId)
+        return EncryptedPayload(ciphertext, null)
+    }
+
+    /**
+     * Пробует расшифровать групповое сообщение, используя sender-ключ
+     * владельца из локальной БД. Если ключ отсутствует или не подошёл —
+     * тянет свежие sender keys с сервера и повторяет попытку.
+     * Возвращает null если расшифровать не удалось.
+     */
+    private suspend fun tryDecryptGroupMessage(
+        chatId: String,
+        senderId: String,
+        messageId: String,
+        encryptedContent: String,
+        currentEpoch: Int,
+    ): String? {
+        // Берём ВСЕ имеющиеся sender keys этого owner-а в чате и пробуем
+        // по очереди (новые сначала). Сообщение могло быть зашифровано
+        // под любым историческим epoch — особенно после
+        // logout/login, когда мы повторно стянули ключи свежие, а старые
+        // могли пропасть. Если все промахнулись — рефрешим с сервера и
+        // повторяем попытку.
+        suspend fun attempt(): String? {
+            for (key in groupSenderKeyDao.listByOwner(chatId, senderId)) {
+                val bytes = runCatching {
+                    Base64.decode(key.senderKey, Base64.NO_WRAP)
+                }.getOrNull() ?: continue
+                val text = groupCryptoManager.decryptGroupMessage(encryptedContent, bytes, messageId)
+                if (text != null) return text
+            }
+            return null
+        }
+        attempt()?.let { return it }
+        runCatching { refreshSenderKeys(chatId) }
+        return attempt()
     }
 
     // ── Маппинг сущностей ──────────────────────────────────────────────────
@@ -613,5 +824,290 @@ class ChatRepositoryImpl @Inject constructor(
         isMuted = isMuted,
         updatedAt = updatedAt,
         isOtherOnline = isOtherOnline,
+        myRole = ChatRole.parse(myRole),
+        currentEpoch = currentEpoch,
     )
+
+    // ── Группы (1.0.68) ──────────────────────────────────────────────────────
+
+    /**
+     * Список участников группы с ролями. Сервер не даёт endpoint'а
+     * `GET /chats/{id}` — тянем полный список чатов и находим нужный.
+     * Лишний трафик приемлем для экрана GroupInfo, который открывается
+     * нечасто; кешированные данные не отдаём, чтобы роли и состав были
+     * актуальны после ротаций.
+     */
+    override suspend fun getGroupMembers(chatId: String): List<User> {
+        val chats = api.getChats().data.orEmpty()
+        val chat = chats.firstOrNull { it.id == chatId } ?: return emptyList()
+        return chat.members.orEmpty().map { it.toDomain() }
+    }
+
+    override suspend fun updateGroupTitle(chatId: String, newTitle: String): Result<Unit> = runCatching {
+        api.updateGroupInfo(chatId, UpdateGroupInfoDto(title = newTitle))
+        chatDao.getById(chatId)?.let { existing ->
+            chatDao.update(existing.copy(title = newTitle))
+        }
+    }
+
+    override suspend fun updateGroupAvatar(
+        chatId: String,
+        imageBytes: ByteArray,
+        mime: String,
+    ): Result<String> = runCatching {
+        // Расширение по MIME — сервер всё равно перепроверит по содержимому,
+        // а нам это нужно чтобы header.Filename имел корректное расширение
+        // (сервер reject'ит, если оно подозрительно — см. UploadAvatar).
+        val ext = when (mime) {
+            "image/png"  -> "png"
+            "image/webp" -> "webp"
+            else         -> "jpg"
+        }
+        val requestBody = imageBytes.toRequestBody(
+            mime.toMediaTypeOrNull() ?: "image/jpeg".toMediaType(),
+        )
+        val part = okhttp3.MultipartBody.Part.createFormData(
+            name = "avatar",
+            filename = "avatar.$ext",
+            body = requestBody,
+        )
+        val newUrl = api.uploadGroupAvatar(chatId, part).data?.avatarUrl
+            ?: error("Server returned null avatar url")
+
+        // Сразу обновляем локальный ChatEntity, чтобы UI показал новый аватар
+        // не дожидаясь WS-события group_info_updated (оно тоже придёт, но
+        // оптимистичный апдейт убирает мерцание заглушки).
+        chatDao.getById(chatId)?.let { existing ->
+            chatDao.update(existing.copy(avatarUrl = newUrl))
+        }
+        newUrl
+    }
+
+    override suspend fun addGroupMember(chatId: String, userId: String): Result<Unit> = runCatching {
+        val resp = api.addGroupMember(chatId, AddMemberDto(userId = userId)).data
+            ?: error("addGroupMember: server returned null")
+        val newEpoch = resp.epoch
+
+        // Обновляем локально текущий epoch чата.
+        chatDao.getById(chatId)?.let { existing ->
+            chatDao.update(existing.copy(currentEpoch = newEpoch))
+        }
+
+        // Ротация: инициатор (я) должен выложить свой sender key для нового
+        // epoch'а всем участникам, включая нового. Остальные участники
+        // ротируют свои ключи на своей стороне в ответ на WS-событие
+        // group_member_added (см. IncomingMessageHandler).
+        val myUserId = currentUserIdSync()
+        val members = api.getChats().data.orEmpty()
+            .firstOrNull { it.id == chatId }?.members.orEmpty()
+            .filter { it.id != myUserId }
+            .map { it.toDomain() }
+        initializeSenderKey(chatId, newEpoch, myUserId, members)
+    }
+
+    override suspend fun removeGroupMember(chatId: String, userId: String): Result<Unit> = runCatching {
+        val resp = api.removeGroupMember(chatId, userId).data
+            ?: error("removeGroupMember: server returned null")
+        val newEpoch = resp.epoch
+
+        chatDao.getById(chatId)?.let { existing ->
+            chatDao.update(existing.copy(currentEpoch = newEpoch))
+        }
+        // Старый sender key кикнутого локально удаляем — он больше не
+        // должен расшифровывать никакие новые сообщения.
+        groupSenderKeyDao.deleteByOwner(chatId, userId)
+
+        // Ротируем свой ключ для нового epoch'а.
+        val myUserId = currentUserIdSync()
+        val members = api.getChats().data.orEmpty()
+            .firstOrNull { it.id == chatId }?.members.orEmpty()
+            .filter { it.id != myUserId }
+            .map { it.toDomain() }
+        initializeSenderKey(chatId, newEpoch, myUserId, members)
+    }
+
+    override suspend fun leaveGroup(chatId: String): Result<Unit> = runCatching {
+        api.leaveGroup(chatId)
+        // Независимо от того удалилась группа целиком или передался CREATOR —
+        // у меня её больше нет, чистим локально.
+        groupSenderKeyDao.deleteByChat(chatId)
+        chatDao.deleteById(chatId)
+    }
+
+    override suspend fun changeGroupRole(
+        chatId: String,
+        userId: String,
+        role: ChatRole,
+    ): Result<Unit> = runCatching {
+        require(role == ChatRole.ADMIN || role == ChatRole.MEMBER) {
+            "changeGroupRole: only ADMIN or MEMBER allowed"
+        }
+        api.changeGroupRole(chatId, userId, ChangeRoleDto(role = role.name))
+    }
+
+    override suspend fun transferGroupOwnership(
+        chatId: String,
+        newOwnerId: String,
+    ): Result<Unit> = runCatching {
+        api.transferGroupOwnership(
+            chatId,
+            com.secure.messenger.data.remote.api.dto.TransferOwnershipDto(userId = newOwnerId),
+        )
+    }
+
+    override suspend fun deleteGroup(chatId: String): Result<Unit> = runCatching {
+        api.deleteGroup(chatId)
+        // Сервер каскадом удалит сообщения и sender-ключи. Локально тоже чистим
+        // чтобы экран обновился сразу, не дожидаясь следующего syncChats.
+        groupSenderKeyDao.deleteByChat(chatId)
+        chatDao.deleteById(chatId)
+    }
+
+    override suspend fun uploadMySenderKey(
+        chatId: String,
+        epoch: Int,
+        recipients: List<User>,
+    ): Result<Unit> = runCatching {
+        val myUserId = currentUserIdSync()
+        initializeSenderKey(chatId, epoch, myUserId, recipients)
+    }
+
+    override suspend fun refreshSenderKeys(chatId: String, epoch: Int?): Result<Unit> = runCatching {
+        val entries = api.fetchSenderKeys(chatId, epoch).data.orEmpty()
+        if (entries.isEmpty()) return@runCatching
+
+        val myPrivateKeyBase64 = localKeyStore.getPrivateKey()
+            ?: error("No local private key")
+        val myPrivateKey = Base64.decode(myPrivateKeyBase64, Base64.NO_WRAP)
+
+        val now = System.currentTimeMillis()
+        for (entry in entries) {
+            val ownerId = entry.ownerId ?: continue
+            // publicKey владельца берём из локальной БД users (должен быть
+            // закеширован при syncChats / createGroupChat). Если нет —
+            // догружаем через REST на всякий случай.
+            val ownerUser = userDao.getById(ownerId) ?: run {
+                runCatching {
+                    api.getUserById(ownerId).data?.let { dto ->
+                        userDao.upsert(UserEntity(
+                            id = dto.id, phone = dto.phone, username = dto.username,
+                            displayName = dto.displayName, avatarUrl = dto.avatarUrl,
+                            bio = dto.bio, isOnline = dto.isOnline,
+                            lastSeen = Instant.parse(dto.lastSeen).toEpochMilli(),
+                            publicKey = dto.publicKey, isContact = false,
+                        ))
+                    }
+                }
+                userDao.getById(ownerId)
+            } ?: continue
+
+            val ownerPublicKey = runCatching {
+                Base64.decode(ownerUser.publicKey, Base64.NO_WRAP)
+            }.getOrNull() ?: continue
+            if (ownerPublicKey.size != 32) continue
+
+            val senderKeyBytes = groupCryptoManager.unwrapSenderKey(
+                encryptedBase64 = entry.encryptedKey,
+                ownerPublicKey = ownerPublicKey,
+                myPrivateKey = myPrivateKey,
+                chatId = chatId,
+            ) ?: continue
+
+            groupSenderKeyDao.upsert(GroupSenderKeyEntity(
+                chatId = chatId,
+                ownerId = ownerId,
+                epoch = entry.epoch,
+                senderKey = Base64.encodeToString(senderKeyBytes, Base64.NO_WRAP),
+                createdAt = now,
+            ))
+        }
+    }
+
+    // ── Внутренние helpers для sender keys ───────────────────────────────────
+
+    /**
+     * Генерирует (или достаёт из БД) мой sender key для [chatId]/[epoch],
+     * шифрует его для каждого [recipients] и заливает на сервер. Свой ключ
+     * сохраняется локально, чтобы использовать при отправке сообщений.
+     *
+     * Идемпотентно: если ключ уже есть в локальной БД — не перегенерируем,
+     * просто (пере-)выкладываем для recipients (на случай новых участников).
+     */
+    private suspend fun initializeSenderKey(
+        chatId: String,
+        epoch: Int,
+        myUserId: String,
+        recipients: List<User>,
+    ) {
+        val existing = groupSenderKeyDao.get(chatId, myUserId, epoch)
+        val senderKeyBytes: ByteArray = if (existing != null) {
+            Base64.decode(existing.senderKey, Base64.NO_WRAP)
+        } else {
+            groupCryptoManager.generateSenderKey().also { fresh ->
+                groupSenderKeyDao.upsert(GroupSenderKeyEntity(
+                    chatId = chatId,
+                    ownerId = myUserId,
+                    epoch = epoch,
+                    senderKey = Base64.encodeToString(fresh, Base64.NO_WRAP),
+                    createdAt = System.currentTimeMillis(),
+                ))
+            }
+        }
+
+        val myPrivateKeyBase64 = localKeyStore.getPrivateKey()
+            ?: error("No local private key")
+        val myPrivateKey = Base64.decode(myPrivateKeyBase64, Base64.NO_WRAP)
+        val myPublicKeyBase64 = localKeyStore.getPublicKey()
+        val myPublicKey = myPublicKeyBase64?.let {
+            runCatching { Base64.decode(it, Base64.NO_WRAP) }.getOrNull()
+        }
+
+        // Помимо других участников всегда добавляем wrap'нутый ключ
+        // ДЛЯ САМОГО СЕБЯ — иначе после logout/login локальная БД пуста,
+        // refreshSenderKeys получает только чужие ключи, и собственные
+        // отправленные сообщения не расшифровываются (нечем). Wrap'аем
+        // через ECDH(myPriv, myPub) — тот же канал что для других.
+        val selfEntry: SenderKeyEntryDto? = if (myPublicKey != null && myPublicKey.size == 32) {
+            val wrappedSelf = groupCryptoManager.wrapSenderKey(
+                senderKey = senderKeyBytes,
+                recipientPublicKey = myPublicKey,
+                myPrivateKey = myPrivateKey,
+                chatId = chatId,
+            )
+            SenderKeyEntryDto(
+                recipientId = myUserId,
+                epoch = epoch,
+                encryptedKey = wrappedSelf,
+            )
+        } else {
+            Timber.w("initializeSenderKey: my own public key missing — self-wrap skipped")
+            null
+        }
+
+        val recipientEntries = recipients.mapNotNull { recipient ->
+            val pubKey = runCatching {
+                Base64.decode(recipient.publicKey, Base64.NO_WRAP)
+            }.getOrNull()
+            if (pubKey == null || pubKey.size != 32) {
+                Timber.w("initializeSenderKey: invalid public key for ${recipient.id}")
+                return@mapNotNull null
+            }
+            val wrapped = groupCryptoManager.wrapSenderKey(
+                senderKey = senderKeyBytes,
+                recipientPublicKey = pubKey,
+                myPrivateKey = myPrivateKey,
+                chatId = chatId,
+            )
+            SenderKeyEntryDto(
+                recipientId = recipient.id,
+                epoch = epoch,
+                encryptedKey = wrapped,
+            )
+        }
+
+        val entries = (listOfNotNull(selfEntry) + recipientEntries)
+        if (entries.isNotEmpty()) {
+            api.uploadSenderKeys(chatId, UploadSenderKeysDto(epoch = epoch, entries = entries))
+        }
+    }
 }

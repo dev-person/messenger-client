@@ -20,4 +20,11 @@ data class ChatEntity(
     // Если придёт новое сообщение в скрытый чат — снова показываем его (см.
     // IncomingMessageHandler.handle).
     val isHidden: Boolean = false,
+    // ── Группы (1.0.68) ──────────────────────────────────────────────────
+    // Роль текущего пользователя в группе: "CREATOR" | "ADMIN" | "MEMBER".
+    // Для DIRECT-чатов не используется (пишем пустую строку).
+    val myRole: String = "",
+    // Активный epoch ротации sender-ключей группы. Инкрементируется на сервере
+    // при add/remove/leave. Для DIRECT всегда 0.
+    val currentEpoch: Int = 0,
 )

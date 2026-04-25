@@ -109,7 +109,11 @@ object AppModule {
             // Реальные миграции — когда у юзера уже накоплена история, ронять её
             // на каждый ALTER TABLE недопустимо. Если миграции не хватит — fallback,
             // чтобы не крашиться в проде.
-            .addMigrations(AppDatabase.MIGRATION_1_2, AppDatabase.MIGRATION_2_3)
+            .addMigrations(
+                AppDatabase.MIGRATION_1_2,
+                AppDatabase.MIGRATION_2_3,
+                AppDatabase.MIGRATION_3_4,
+            )
             .fallbackToDestructiveMigration()
             .addCallback(object : androidx.room.RoomDatabase.Callback() {
                 override fun onOpen(db: androidx.sqlite.db.SupportSQLiteDatabase) {
@@ -129,6 +133,7 @@ object AppModule {
     @Provides fun provideChatDao(db: AppDatabase) = db.chatDao()
     @Provides fun provideMessageDao(db: AppDatabase) = db.messageDao()
     @Provides fun provideUserDao(db: AppDatabase) = db.userDao()
+    @Provides fun provideGroupSenderKeyDao(db: AppDatabase) = db.groupSenderKeyDao()
 }
 
 /**

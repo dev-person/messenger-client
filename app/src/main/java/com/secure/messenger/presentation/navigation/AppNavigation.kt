@@ -16,7 +16,10 @@ import com.secure.messenger.domain.model.CallType
 import com.secure.messenger.presentation.ui.auth.AuthScreen
 import com.secure.messenger.presentation.ui.calls.CallScreen
 import com.secure.messenger.presentation.ui.chat.ChatScreen
+import com.secure.messenger.presentation.ui.groups.CreateGroupScreen
+import com.secure.messenger.presentation.ui.groups.GroupInfoScreen
 import com.secure.messenger.presentation.ui.main.HomeScreen
+import com.secure.messenger.presentation.ui.permissions.DiagnosticsScreen
 import com.secure.messenger.presentation.ui.profile.ProfileSetupScreen
 import com.secure.messenger.presentation.viewmodel.CallViewModel
 
@@ -31,6 +34,11 @@ sealed class Screen(val route: String) {
         fun navigate(userId: String, isVideo: Boolean, peerName: String, isIncoming: Boolean) =
             "call/$userId/$isVideo/${Uri.encode(peerName)}/$isIncoming"
     }
+    object CreateGroup  : Screen("groups/new")
+    object GroupInfo    : Screen("groups/{chatId}") {
+        fun navigate(chatId: String) = "groups/$chatId"
+    }
+    object Diagnostics  : Screen("diagnostics")
 }
 
 @Composable
@@ -84,12 +92,18 @@ fun AppNavHost(
         composable(Screen.Home.route) {
             HomeScreen(
                 onChatClick = { chatId -> navController.navigate(Screen.Chat.navigate(chatId)) },
+                onCreateGroupClick = { navController.navigate(Screen.CreateGroup.route) },
+                onDiagnosticsClick = { navController.navigate(Screen.Diagnostics.route) },
                 onLogout = {
                     navController.navigate(Screen.Auth.route) {
                         popUpTo(0) { inclusive = true }
                     }
                 },
             )
+        }
+
+        composable(Screen.Diagnostics.route) {
+            DiagnosticsScreen(onBack = { navController.popBackStack() })
         }
 
         composable(
@@ -103,6 +117,37 @@ fun AppNavHost(
                     navController.navigate(
                         Screen.Call.navigate(userId, isVideo, peerName, isIncoming = false)
                     )
+                },
+                onGroupInfoClick = { chatId ->
+                    navController.navigate(Screen.GroupInfo.navigate(chatId))
+                },
+            )
+        }
+
+        composable(Screen.CreateGroup.route) {
+            CreateGroupScreen(
+                onBack = { navController.popBackStack() },
+                onGroupCreated = { chatId ->
+                    // Сразу открываем созданную группу, подменяя CreateGroup в backstack.
+                    navController.navigate(Screen.Chat.navigate(chatId)) {
+                        popUpTo(Screen.CreateGroup.route) { inclusive = true }
+                    }
+                },
+            )
+        }
+
+        composable(
+            route = Screen.GroupInfo.route,
+            arguments = listOf(navArgument("chatId") { type = NavType.StringType }),
+        ) {
+            GroupInfoScreen(
+                onBack = { navController.popBackStack() },
+                onLeft = {
+                    // После выхода из группы возвращаемся на экран со списком чатов.
+                    navController.navigate(Screen.Home.route) {
+                        popUpTo(Screen.Home.route) { inclusive = false }
+                        launchSingleTop = true
+                    }
                 },
             )
         }

@@ -410,11 +410,31 @@ class WebRtcManager @Inject constructor(
         val videoSource = peerConnectionFactory.createVideoSource(videoCapturer!!.isScreencast)
 
         videoCapturer?.initialize(surfaceTextureHelper, context, videoSource.capturerObserver)
-        videoCapturer?.startCapture(1280, 720, 30)
+        // Адаптация под качество сети: разрешение/частота кадров — золотая
+        // середина 960x540@24. 720p@30 на нестабильном интернете заваливал
+        // encoder и аудио (он отбирал bandwidth, congestion control не
+        // успевал за ним). Полный HD большинству пользователей не нужен —
+        // на 6" экране 540p выглядит чисто, а сеть успевает.
+        videoCapturer?.startCapture(960, 540, 24)
 
         localVideoTrack = peerConnectionFactory.createVideoTrack("video_track", videoSource)
         _localVideoTrack.value = localVideoTrack
-        peerConnection?.addTrack(localVideoTrack!!)
+        val sender = peerConnection?.addTrack(localVideoTrack!!)
+
+        // Cap на bitrate видео + предпочтение по деградации:
+        //  - maxBitrate 800 kbps — потолок при отличной сети; congestion
+        //    control будет уменьшать до 100-300 kbps при плохой;
+        //  - degradationPreference=MAINTAIN_FRAMERATE — лучше резать
+        //    разрешение, чем превращать видео в слайд-шоу.
+        sender?.parameters?.let { params ->
+            params.encodings.forEach { enc ->
+                enc.maxBitrateBps = 800_000
+                enc.maxFramerate = 24
+            }
+            params.degradationPreference =
+                org.webrtc.RtpParameters.DegradationPreference.MAINTAIN_FRAMERATE
+            sender.parameters = params
+        }
     }
 
     private fun buildCameraCapturer(): VideoCapturer {
@@ -440,11 +460,19 @@ class WebRtcManager @Inject constructor(
         (videoCapturer as? org.webrtc.CameraVideoCapturer)?.switchCamera(null)
     }
 
+    // AudioManager.isSpeakerphoneOn deprecated с Android 12 (API 31) в пользу
+    // setCommunicationDevice/clearCommunicationDevice. Миграция нетривиальна
+    // (нужен fallback и тестирование на разных устройствах) — оставляем
+    // существующее поведение и явно подавляем предупреждение, чтобы не шумело
+    // в CI-логе. Зарелизим миграцию отдельной задачей вместе с правками
+    // аудиомаршрутизации в звонках.
+    @Suppress("DEPRECATION")
     fun setSpeakerOn(on: Boolean) {
         val manager = context.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
         manager.isSpeakerphoneOn = on
     }
 
+    @Suppress("DEPRECATION")
     private fun setAudioMode(active: Boolean) {
         val am = context.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
         if (active) {

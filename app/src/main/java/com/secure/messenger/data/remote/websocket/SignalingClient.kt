@@ -35,6 +35,13 @@ sealed class SignalingEvent {
     /** Профиль чат-партнёра обновился (имя, аватар и т.д.) — payload это полный UserDto. */
     data class UserUpdated(val userId: String, val payload: Map<String, Any?>) : SignalingEvent()
     data class ForceLogout(val excludeSessionId: String, val reason: String) : SignalingEvent()
+    // ── Группы (1.0.68) ──────────────────────────────────────────────────
+    data class GroupInfoUpdated(val chatId: String, val title: String?, val avatarUrl: String?) : SignalingEvent()
+    data class GroupMemberAdded(val chatId: String, val userId: String, val epoch: Int) : SignalingEvent()
+    data class GroupMemberRemoved(val chatId: String, val userId: String, val epoch: Int) : SignalingEvent()
+    data class GroupRoleChanged(val chatId: String, val userId: String, val role: String) : SignalingEvent()
+    data class GroupDeleted(val chatId: String) : SignalingEvent()
+    data class GroupSenderKeyReady(val chatId: String, val ownerId: String, val epoch: Int) : SignalingEvent()
     object Connected : SignalingEvent()
     object Disconnected : SignalingEvent()
 }
@@ -74,6 +81,20 @@ class SignalingClient @Inject constructor(
 
     private val adapter = moshi.adapter(SignalingMessage::class.java)
 
+    /**
+     * Последнее намерение клиента относительно online-статуса.
+     *
+     * Важно: если [sendPresence] вызывается до того, как WebSocket успел
+     * подключиться (а MainActivity.onStart() часто это делает при холодном
+     * старте после долгого перерыва), пакет «online=true» тихо терялся —
+     * сервер не узнавал, что пользователь в сети, и его собеседник продолжал
+     * видеть «не в сети». Теперь мы храним желаемое состояние здесь и в
+     * onOpen повторно отправляем его — это лечит тот самый баг с
+     * онлайн-статусом после долгого отсутствия.
+     */
+    @Volatile
+    private var desiredPresence: Boolean? = null
+
     // ── Жизненный цикл подключения ────────────────────────────────────────────
 
     fun connect(serverUrl: String, authToken: String) {
@@ -98,6 +119,14 @@ class SignalingClient @Inject constructor(
             _isConnected.value = true
             _events.tryEmit(SignalingEvent.Connected)
             Timber.d("Signaling WebSocket connected")
+            // Флашим отложенный presence. Типичный сценарий: юзер зашёл
+            // в приложение после долгого перерыва → MainActivity.onStart
+            // вызвал sendPresence(true) до установки WS-соединения. Без
+            // этого ре-флаша сервер никогда не узнаёт, что клиент онлайн.
+            val pending = desiredPresence
+            if (pending != null) {
+                runCatching { sendRaw("presence", mapOf("online" to pending)) }
+            }
         }
 
         override fun onMessage(ws: WebSocket, text: String) {
@@ -194,6 +223,34 @@ class SignalingClient @Inject constructor(
                 excludeSessionId = payload["excludeSessionId"] as? String ?: "",
                 reason = payload["reason"] as? String ?: "Сессия завершена",
             )
+            "group_info_updated" -> SignalingEvent.GroupInfoUpdated(
+                chatId = payload["chatId"] as? String ?: return,
+                title = payload["title"] as? String,
+                avatarUrl = payload["avatarUrl"] as? String,
+            )
+            "group_member_added" -> SignalingEvent.GroupMemberAdded(
+                chatId = payload["chatId"] as? String ?: return,
+                userId = payload["userId"] as? String ?: return,
+                epoch = (payload["epoch"] as? Double)?.toInt() ?: 0,
+            )
+            "group_member_removed" -> SignalingEvent.GroupMemberRemoved(
+                chatId = payload["chatId"] as? String ?: return,
+                userId = payload["userId"] as? String ?: return,
+                epoch = (payload["epoch"] as? Double)?.toInt() ?: 0,
+            )
+            "group_role_changed" -> SignalingEvent.GroupRoleChanged(
+                chatId = payload["chatId"] as? String ?: return,
+                userId = payload["userId"] as? String ?: return,
+                role = payload["role"] as? String ?: return,
+            )
+            "group_deleted" -> SignalingEvent.GroupDeleted(
+                chatId = payload["chatId"] as? String ?: return,
+            )
+            "group_sender_key_ready" -> SignalingEvent.GroupSenderKeyReady(
+                chatId = payload["chatId"] as? String ?: return,
+                ownerId = payload["ownerId"] as? String ?: return,
+                epoch = (payload["epoch"] as? Double)?.toInt() ?: 0,
+            )
             else -> {
                 Timber.w("Unknown signaling type: ${msg.type}")
                 return
@@ -204,10 +261,19 @@ class SignalingClient @Inject constructor(
 
     // ── Отправка ──────────────────────────────────────────────────────────────
 
-    private fun send(type: String, payload: Map<String, Any?>) {
+    /**
+     * Низкоуровневая отправка без учёта статуса подключения. Возвращает true,
+     * если удалось положить байты в исходящий буфер OkHttp. Используется
+     * из onOpen для ре-флаша отложенного presence.
+     */
+    private fun sendRaw(type: String, payload: Map<String, Any?>): Boolean {
         val msg = SignalingMessage(type = type, payload = payload)
         val json = adapter.toJson(msg)
-        webSocket?.send(json)
+        return webSocket?.send(json) ?: false
+    }
+
+    private fun send(type: String, payload: Map<String, Any?>): Boolean {
+        return sendRaw(type, payload)
     }
 
     /**
@@ -254,8 +320,13 @@ class SignalingClient @Inject constructor(
         }
     }
 
-    /** Сообщает серверу, что пользователь в сети / свернул приложение */
+    /**
+     * Сообщает серверу, что пользователь в сети / свернул приложение.
+     * Намерение сохраняется в [desiredPresence] — если WS ещё не подключён,
+     * пакет будет повторно отправлен из [onOpen] после установки соединения.
+     */
     fun sendPresence(online: Boolean) {
+        desiredPresence = online
         send("presence", mapOf("online" to online))
     }
 

@@ -43,10 +43,26 @@ object ImageCodec {
     /**
      * Жёсткий лимит на размер сырых байтов passthrough-формата (GIF/animated WebP/sticker).
      * Учитывает overhead base64 (~33%) + AES-GCM шифрование + JSON-обёртка → итоговая
-     * encryptedContent должна влезать в Android SQLite CursorWindow (~2 МБ на строку).
-     * 600 КБ raw → ~830 КБ base64 → ~870 КБ после шифрования = безопасно.
+     * encryptedContent должна влезать в Android SQLite CursorWindow (2 МБ на строку).
+     *
+     * 1200 КБ raw → ~1640 КБ base64 → ~1700 КБ после шифрования — остаётся
+     * безопасный запас под CursorWindow и retrofit body-лимит. Раньше было
+     * 600 КБ, но современные анимированные стикеры из Gboard (импорт
+     * из Telegram-паков) легко весят 800–1100 КБ — и молча не отправлялись.
      */
-    private const val MAX_RAW_BYTES = 600_000
+    private const val MAX_RAW_BYTES = 1_200_000
+
+    /**
+     * Результат декодирования медиа-URI. Ok — данные готовы к отправке;
+     * TooLarge — файл превышает лимит, можно показать пользователю,
+     * сколько именно; Failed — декодирование не удалось по другой причине
+     * (битый поток, неизвестный формат, OOM).
+     */
+    sealed class LoadResult {
+        data class Ok(val data: ImageData) : LoadResult()
+        data class TooLarge(val sizeBytes: Int, val limitBytes: Int = MAX_RAW_BYTES) : LoadResult()
+        data class Failed(val reason: String) : LoadResult()
+    }
 
     data class ImageData(
         val bytes: ByteArray,
@@ -76,19 +92,35 @@ object ImageCodec {
     )
 
     /**
-     * Загружает медиа-контент из URI и решает что с ним делать.
-     * Анимированные/стикерные форматы передаются как есть; обычные фото — ужимаются.
-     *
-     * @param maxDim    максимальная сторона после ужатия (по умолчанию 1280)
-     * @param quality   качество JPEG при перекодировке (по умолчанию 80)
+     * Совместимая обёртка: возвращает [ImageData] или null. Логику поведения
+     * при ошибках удобнее писать через [loadAndCompressDetailed] — она
+     * возвращает [LoadResult] и позволяет корректно показать пользователю,
+     * что файл слишком большой, а не «молча» проглатывать стикер.
      */
     fun loadAndCompress(
         context: Context,
         uri: Uri,
         maxDim: Int = MAX_DIMENSION,
         quality: Int = JPEG_QUALITY,
-    ): ImageData? {
-        return runCatching {
+    ): ImageData? = when (val r = loadAndCompressDetailed(context, uri, maxDim, quality)) {
+        is LoadResult.Ok -> r.data
+        else -> null
+    }
+
+    /**
+     * Загружает медиа-контент из URI и решает что с ним делать.
+     * Анимированные/стикерные форматы передаются как есть; обычные фото — ужимаются.
+     *
+     * @param maxDim    максимальная сторона после ужатия (по умолчанию 1280)
+     * @param quality   качество JPEG при перекодировке (по умолчанию 80)
+     */
+    fun loadAndCompressDetailed(
+        context: Context,
+        uri: Uri,
+        maxDim: Int = MAX_DIMENSION,
+        quality: Int = JPEG_QUALITY,
+    ): LoadResult {
+        val result: LoadResult = runCatching {
             // 1. Читаем размеры и реальный MIME без полной декодировки
             val resolver = context.contentResolver
             val detectedMime = resolver.getType(uri) ?: "image/*"
@@ -102,12 +134,13 @@ object ImageCodec {
             val sniffedMime = boundsOptions.outMimeType ?: detectedMime
             if (origWidth <= 0 || origHeight <= 0) {
                 Timber.w("ImageCodec: bounds decode failed for $uri (mime=$detectedMime)")
-                return null
+                return@runCatching LoadResult.Failed("Не удалось прочитать размеры изображения")
             }
 
             // 2. Читаем сырые байты — нужны для magic-byte детекта формата
             //    и для случая когда передаём «как есть» (стикер/гиф/анимация)
-            val rawBytes = resolver.openInputStream(uri)?.use { it.readBytes() } ?: return null
+            val rawBytes = resolver.openInputStream(uri)?.use { it.readBytes() }
+                ?: return@runCatching LoadResult.Failed("Не удалось прочитать содержимое URI")
 
             val isGif = sniffedMime == "image/gif" || isGifMagic(rawBytes)
             val isWebp = sniffedMime == "image/webp" || isWebpMagic(rawBytes)
@@ -124,12 +157,14 @@ object ImageCodec {
             val withinStickerSize = maxSide <= STICKER_MAX_DIMENSION
 
             // Для анимаций нет fallback — перекодирование убьёт анимацию.
-            // Если файл слишком большой — отказываемся, лучше чем краш CursorWindow.
+            // Если файл слишком большой — возвращаем TooLarge чтобы UI
+            // показал пользователю конкретную причину («стикер слишком большой»),
+            // а не просто «ничего не происходит».
             if ((isGif || isAnimatedWebp) && !withinRawLimit) {
                 Timber.w(
-                    "ImageCodec: animated file too large (${rawBytes.size} bytes > $MAX_RAW_BYTES), skipping"
+                    "ImageCodec: animated file too large (${rawBytes.size} bytes > $MAX_RAW_BYTES)"
                 )
-                return null
+                return@runCatching LoadResult.TooLarge(rawBytes.size)
             }
 
             // ── Анимированные GIF / WebP — passthrough всегда (любого размера до лимита)
@@ -137,13 +172,15 @@ object ImageCodec {
             if ((isGif || isAnimatedWebp) && withinRawLimit) {
                 val mime = if (isGif) "image/gif" else "image/webp"
                 Timber.d("ImageCodec: passthrough animated $mime ${origWidth}x${origHeight}")
-                return@runCatching ImageData(
-                    bytes = rawBytes,
-                    mime = mime,
-                    width = origWidth,
-                    height = origHeight,
-                    // Анимированное всегда показываем без bubble — стикер или маленький GIF
-                    isSticker = withinStickerSize,
+                return@runCatching LoadResult.Ok(
+                    ImageData(
+                        bytes = rawBytes,
+                        mime = mime,
+                        width = origWidth,
+                        height = origHeight,
+                        // Анимированное всегда показываем без bubble — стикер или маленький GIF
+                        isSticker = withinStickerSize,
+                    )
                 )
             }
 
@@ -155,38 +192,24 @@ object ImageCodec {
                     else -> "image/webp"
                 }
                 Timber.d("ImageCodec: passthrough sticker $mime ${origWidth}x${origHeight}")
-                return@runCatching ImageData(
-                    bytes = rawBytes,
-                    mime = mime,
-                    width = origWidth,
-                    height = origHeight,
-                    isSticker = true,
+                return@runCatching LoadResult.Ok(
+                    ImageData(
+                        bytes = rawBytes,
+                        mime = mime,
+                        width = origWidth,
+                        height = origHeight,
+                        isSticker = true,
+                    )
                 )
             }
 
-            // ── Большая картинка — декодируем и ужимаем в JPEG (или PNG если прозрачная)
-            val maxOrig = maxOf(origWidth, origHeight)
-            var sampleSize = 1
-            while (maxOrig / sampleSize > maxDim * 2) sampleSize *= 2
-
-            val decodeOptions = BitmapFactory.Options().apply {
-                inSampleSize = sampleSize
-                inPreferredConfig = Bitmap.Config.ARGB_8888
-            }
-            val bitmap = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, decodeOptions)
-                ?: return null
-
-            // Финальное масштабирование до maxDim
-            val scale = maxDim.toFloat() / maxOf(bitmap.width, bitmap.height)
-            val scaled = if (scale < 1f) {
-                val w = (bitmap.width * scale).toInt()
-                val h = (bitmap.height * scale).toInt()
-                Bitmap.createScaledBitmap(bitmap, w, h, true).also {
-                    if (it != bitmap) bitmap.recycle()
-                }
-            } else {
-                bitmap
-            }
+            // ── Большая картинка — декодируем и ужимаем в JPEG (или PNG если прозрачная).
+            // PNG/WebP с прозрачностью попадут сюда же и корректно сохранят альфу
+            // (compress(PNG, ...)). Принимаем, что не-стикер >768px = обычное фото:
+            // помечать такие как sticker=true нет оснований, иначе большое PNG-фото
+            // из галереи рендерилось бы без bubble и в уменьшённом размере.
+            val scaled = decodeScaled(rawBytes, maxDim)
+                ?: return@runCatching LoadResult.Failed("Не удалось декодировать картинку")
 
             // PNG если есть прозрачность (например, скриншот с alpha), иначе JPEG
             val hasAlpha = scaled.hasAlpha()
@@ -194,16 +217,55 @@ object ImageCodec {
             val mime = if (hasAlpha) "image/png" else "image/jpeg"
             val out = ByteArrayOutputStream()
             scaled.compress(format, quality, out)
-            val result = ImageData(
-                bytes = out.toByteArray(),
+            val payload = out.toByteArray()
+            val resultData = ImageData(
+                bytes = payload,
                 mime = mime,
                 width = scaled.width,
                 height = scaled.height,
                 isSticker = false,
             )
             scaled.recycle()
-            result
-        }.onFailure { Timber.e(it, "ImageCodec.loadAndCompress failed") }.getOrNull()
+            if (payload.size > MAX_RAW_BYTES) {
+                return@runCatching LoadResult.TooLarge(payload.size)
+            }
+            LoadResult.Ok(resultData)
+        }.onFailure { Timber.e(it, "ImageCodec.loadAndCompressDetailed failed") }
+            .getOrNull() ?: LoadResult.Failed("Ошибка обработки изображения")
+        return result
+    }
+
+    /**
+     * Декодирует байты в Bitmap с ужатием до [maxDim] по длинной стороне.
+     * Выделена отдельно чтобы не копировать логику sampleSize/scale в каждой
+     * ветке (стикер, общий случай).
+     */
+    private fun decodeScaled(rawBytes: ByteArray, maxDim: Int): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, bounds)
+        val origMax = maxOf(bounds.outWidth, bounds.outHeight)
+        if (origMax <= 0) return null
+
+        var sampleSize = 1
+        while (origMax / sampleSize > maxDim * 2) sampleSize *= 2
+
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = sampleSize
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        val bitmap = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, options)
+            ?: return null
+
+        val scale = maxDim.toFloat() / maxOf(bitmap.width, bitmap.height)
+        return if (scale < 1f) {
+            val w = (bitmap.width * scale).toInt().coerceAtLeast(1)
+            val h = (bitmap.height * scale).toInt().coerceAtLeast(1)
+            Bitmap.createScaledBitmap(bitmap, w, h, true).also {
+                if (it != bitmap) bitmap.recycle()
+            }
+        } else {
+            bitmap
+        }
     }
 
     /** Сериализует картинку в JSON для encryptedContent. */

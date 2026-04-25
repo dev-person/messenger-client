@@ -1,13 +1,33 @@
 package com.secure.messenger.presentation.theme
 
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animate
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathFillType
+import androidx.compose.ui.graphics.drawscope.clipPath
+import kotlin.math.hypot
 
 // ── Перечисление цветовых схем ──────────────────────────────────────────────
 
@@ -17,11 +37,10 @@ enum class AppColorScheme(val label: String, val isDark: Boolean = false) {
     FOREST("Лес"),
     SUNSET("Закат"),
     MATERIAL_DARK("Material Dark", isDark = true),
-    MIDNIGHT("Полночь", isDark = true),
-    EMERALD_DARK("Изумруд", isDark = true),
-    ROYAL_DARK("Королевский", isDark = true),
-    CORAL_DARK("Коралл", isDark = true),
-    SLATE_DARK("Графит", isDark = true),
+    MIDNIGHT("Material Night", isDark = true),
+    EMERALD_DARK("Material Emerald", isDark = true),
+    CORAL_DARK("Material Coral", isDark = true),
+    SLATE_DARK("Material Slate", isDark = true),
 }
 
 // ── Дополнительные цвета (пузырьки, обои) — зависят от выбранной схемы ──────
@@ -273,27 +292,27 @@ private val MaterialDarkExtra = MessengerExtraColors(
 
 private val MidnightColors = darkColorScheme(
     primary = Color(0xFF60A5FA),
-    onPrimary = Color.White,
-    primaryContainer = Color(0xFF1E3A8A),
-    onPrimaryContainer = Color(0xFFDBEAFE),
-    secondary = Color(0xFF93C5FD),
-    background = Color(0xFF0A0E27),
-    onBackground = Color(0xFFE2E8F0),
-    surface = Color(0xFF111732),
-    onSurface = Color(0xFFE2E8F0),
-    surfaceVariant = Color(0xFF1E2544),
-    onSurfaceVariant = Color(0xFFB4BCD0),
-    surfaceContainerLow = Color(0xFF0E1431),
-    outline = Color(0xFF3B4869),
-    outlineVariant = Color(0xFF252E4F),
-    error = Color(0xFFFF6B6B),
+    onPrimary = Color.Black,
+    primaryContainer = Color(0xFF3700B3),
+    secondary = Color(0xFF03DAC6),
+    onSecondary = Color.Black,
+    background = Color(0xFF121212),
+    onBackground = Color(0xFFE1E1E1),
+    surface = Color(0xFF1E1E1E),
+    onSurface = Color(0xFFE1E1E1),
+    surfaceVariant = Color(0xFF2D2D2D),
+    onSurfaceVariant = Color(0xFFBDBDBD),
+    surfaceContainerLow = Color(0xFF1A1A1A),
+    outline = Color(0xFF4A4A4A),
+    outlineVariant = Color(0xFF383838),
+    error = Color(0xFFCF6679),
 )
 
 private val MidnightExtra = MessengerExtraColors(
-    outgoingBubble = Color(0xFF1E3A8A),
-    incomingBubble = Color(0xFF1E2544),
-    chatWallpaper = Color(0xFF06091A),
-    chatPattern = Color(0xFF0C1128),
+    outgoingBubble = Color(0xFF365C8C),
+    incomingBubble = Color(0xFF2D2D2D),
+    chatWallpaper = Color(0xFF0D0D0D),
+    chatPattern = Color(0xFF1A1A1A),
 )
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -302,56 +321,27 @@ private val MidnightExtra = MessengerExtraColors(
 
 private val EmeraldDarkColors = darkColorScheme(
     primary = Color(0xFF34D399),
-    onPrimary = Color(0xFF052E22),
-    primaryContainer = Color(0xFF065F46),
-    onPrimaryContainer = Color(0xFFD1FAE5),
-    secondary = Color(0xFF6EE7B7),
-    background = Color(0xFF071510),
-    onBackground = Color(0xFFE0F2EC),
-    surface = Color(0xFF0F221B),
-    onSurface = Color(0xFFE0F2EC),
-    surfaceVariant = Color(0xFF1A3328),
-    onSurfaceVariant = Color(0xFFB0C8BE),
-    surfaceContainerLow = Color(0xFF0C1D17),
-    outline = Color(0xFF3B5B4D),
-    outlineVariant = Color(0xFF213C30),
-    error = Color(0xFFFF7675),
+    onPrimary = Color.Black,
+    primaryContainer = Color(0xFF3700B3),
+    secondary = Color(0xFF03DAC6),
+    onSecondary = Color.Black,
+    background = Color(0xFF121212),
+    onBackground = Color(0xFFE1E1E1),
+    surface = Color(0xFF1E1E1E),
+    onSurface = Color(0xFFE1E1E1),
+    surfaceVariant = Color(0xFF2D2D2D),
+    onSurfaceVariant = Color(0xFFBDBDBD),
+    surfaceContainerLow = Color(0xFF1A1A1A),
+    outline = Color(0xFF4A4A4A),
+    outlineVariant = Color(0xFF383838),
+    error = Color(0xFFCF6679),
 )
 
 private val EmeraldDarkExtra = MessengerExtraColors(
-    outgoingBubble = Color(0xFF064E3B),
-    incomingBubble = Color(0xFF1A3328),
-    chatWallpaper = Color(0xFF040D09),
-    chatPattern = Color(0xFF0A1812),
-)
-
-// ══════════════════════════════════════════════════════════════════════════════
-// 8. ROYAL_DARK — королевский фиолетово-синий
-// ══════════════════════════════════════════════════════════════════════════════
-
-private val RoyalDarkColors = darkColorScheme(
-    primary = Color(0xFFA78BFA),
-    onPrimary = Color(0xFF1E1038),
-    primaryContainer = Color(0xFF4C1D95),
-    onPrimaryContainer = Color(0xFFEDE9FE),
-    secondary = Color(0xFFC4B5FD),
-    background = Color(0xFF120B24),
-    onBackground = Color(0xFFE9E4F7),
-    surface = Color(0xFF1C1235),
-    onSurface = Color(0xFFE9E4F7),
-    surfaceVariant = Color(0xFF2A1E4A),
-    onSurfaceVariant = Color(0xFFC2B7D5),
-    surfaceContainerLow = Color(0xFF170E2D),
-    outline = Color(0xFF4A3A6B),
-    outlineVariant = Color(0xFF2E224A),
-    error = Color(0xFFFF8585),
-)
-
-private val RoyalDarkExtra = MessengerExtraColors(
-    outgoingBubble = Color(0xFF4C1D95),
-    incomingBubble = Color(0xFF2A1E4A),
-    chatWallpaper = Color(0xFF09061A),
-    chatPattern = Color(0xFF120C28),
+    outgoingBubble = Color(0xFF1E7A59),
+    incomingBubble = Color(0xFF2D2D2D),
+    chatWallpaper = Color(0xFF0D0D0D),
+    chatPattern = Color(0xFF1A1A1A),
 )
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -360,27 +350,27 @@ private val RoyalDarkExtra = MessengerExtraColors(
 
 private val CoralDarkColors = darkColorScheme(
     primary = Color(0xFFFB7185),
-    onPrimary = Color(0xFF3D0A14),
-    primaryContainer = Color(0xFF9F1239),
-    onPrimaryContainer = Color(0xFFFFE4E6),
-    secondary = Color(0xFFFDA4AF),
-    background = Color(0xFF1C0A0E),
-    onBackground = Color(0xFFFBE8EB),
-    surface = Color(0xFF2A1015),
-    onSurface = Color(0xFFFBE8EB),
-    surfaceVariant = Color(0xFF3D1821),
-    onSurfaceVariant = Color(0xFFD9B8BE),
-    surfaceContainerLow = Color(0xFF220C10),
-    outline = Color(0xFF6B3643),
-    outlineVariant = Color(0xFF401B24),
-    error = Color(0xFFFFB4A9),
+    onPrimary = Color.Black,
+    primaryContainer = Color(0xFF3700B3),
+    secondary = Color(0xFF03DAC6),
+    onSecondary = Color.Black,
+    background = Color(0xFF121212),
+    onBackground = Color(0xFFE1E1E1),
+    surface = Color(0xFF1E1E1E),
+    onSurface = Color(0xFFE1E1E1),
+    surfaceVariant = Color(0xFF2D2D2D),
+    onSurfaceVariant = Color(0xFFBDBDBD),
+    surfaceContainerLow = Color(0xFF1A1A1A),
+    outline = Color(0xFF4A4A4A),
+    outlineVariant = Color(0xFF383838),
+    error = Color(0xFFCF6679)
 )
 
 private val CoralDarkExtra = MessengerExtraColors(
-    outgoingBubble = Color(0xFF7E1D32),
-    incomingBubble = Color(0xFF3D1821),
-    chatWallpaper = Color(0xFF130508),
-    chatPattern = Color(0xFF1D090D),
+    outgoingBubble = Color(0xFF773640),
+    incomingBubble = Color(0xFF2D2D2D),
+    chatWallpaper = Color(0xFF0D0D0D),
+    chatPattern = Color(0xFF1A1A1A)
 )
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -389,27 +379,27 @@ private val CoralDarkExtra = MessengerExtraColors(
 
 private val SlateDarkColors = darkColorScheme(
     primary = Color(0xFF94A3B8),
-    onPrimary = Color(0xFF0F172A),
-    primaryContainer = Color(0xFF334155),
-    onPrimaryContainer = Color(0xFFE2E8F0),
-    secondary = Color(0xFFCBD5E1),
-    background = Color(0xFF0F172A),
-    onBackground = Color(0xFFE2E8F0),
-    surface = Color(0xFF1E293B),
-    onSurface = Color(0xFFE2E8F0),
-    surfaceVariant = Color(0xFF334155),
-    onSurfaceVariant = Color(0xFFCBD5E1),
-    surfaceContainerLow = Color(0xFF18223A),
-    outline = Color(0xFF475569),
-    outlineVariant = Color(0xFF2A3B54),
-    error = Color(0xFFFF8B7A),
+    onPrimary = Color.Black,
+    primaryContainer = Color(0xFF3700B3),
+    secondary = Color(0xFF03DAC6),
+    onSecondary = Color.Black,
+    background = Color(0xFF121212),
+    onBackground = Color(0xFFE1E1E1),
+    surface = Color(0xFF1E1E1E),
+    onSurface = Color(0xFFE1E1E1),
+    surfaceVariant = Color(0xFF2D2D2D),
+    onSurfaceVariant = Color(0xFFBDBDBD),
+    surfaceContainerLow = Color(0xFF1A1A1A),
+    outline = Color(0xFF4A4A4A),
+    outlineVariant = Color(0xFF383838),
+    error = Color(0xFFCF6679)
 )
 
 private val SlateDarkExtra = MessengerExtraColors(
-    outgoingBubble = Color(0xFF334155),
-    incomingBubble = Color(0xFF1E293B),
-    chatWallpaper = Color(0xFF0A1120),
-    chatPattern = Color(0xFF121C30),
+    outgoingBubble = Color(0xFF616870),
+    incomingBubble = Color(0xFF2D2D2D),
+    chatWallpaper = Color(0xFF0D0D0D),
+    chatPattern = Color(0xFF1A1A1A)
 )
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -424,7 +414,6 @@ fun resolveColorScheme(scheme: AppColorScheme, isDark: Boolean): ColorScheme = w
     AppColorScheme.MATERIAL_DARK -> MaterialDarkColors
     AppColorScheme.MIDNIGHT -> MidnightColors
     AppColorScheme.EMERALD_DARK -> EmeraldDarkColors
-    AppColorScheme.ROYAL_DARK -> RoyalDarkColors
     AppColorScheme.CORAL_DARK -> CoralDarkColors
     AppColorScheme.SLATE_DARK -> SlateDarkColors
 }
@@ -437,7 +426,6 @@ fun resolveExtraColors(scheme: AppColorScheme, isDark: Boolean): MessengerExtraC
     AppColorScheme.MATERIAL_DARK -> MaterialDarkExtra
     AppColorScheme.MIDNIGHT -> MidnightExtra
     AppColorScheme.EMERALD_DARK -> EmeraldDarkExtra
-    AppColorScheme.ROYAL_DARK -> RoyalDarkExtra
     AppColorScheme.CORAL_DARK -> CoralDarkExtra
     AppColorScheme.SLATE_DARK -> SlateDarkExtra
 }
@@ -451,7 +439,6 @@ fun AppColorScheme.previewColor(): Color = when (this) {
     AppColorScheme.MATERIAL_DARK -> Color(0xFFBB86FC)
     AppColorScheme.MIDNIGHT -> Color(0xFF60A5FA)
     AppColorScheme.EMERALD_DARK -> Color(0xFF34D399)
-    AppColorScheme.ROYAL_DARK -> Color(0xFFA78BFA)
     AppColorScheme.CORAL_DARK -> Color(0xFFFB7185)
     AppColorScheme.SLATE_DARK -> Color(0xFF94A3B8)
 }
@@ -459,6 +446,97 @@ fun AppColorScheme.previewColor(): Color = when (this) {
 // ══════════════════════════════════════════════════════════════════════════════
 // Тема-обёртка
 // ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Длительность кроссфейда всех цветов темы при её смене.
+ * 400 мс — достаточно плавно, чтобы не ловить «слепоту» при переходе с тёмной
+ * на светлую ночью, но не слишком затянуто.
+ */
+private const val THEME_TRANSITION_MS = 400
+
+/**
+ * Возвращает анимированный цвет: при смене [target] он плавно интерполируется
+ * за [THEME_TRANSITION_MS] мс вместо мгновенного переключения. Используется
+ * для каждого поля Material [ColorScheme] и дополнительных цветов мессенджера.
+ */
+@Composable
+private fun animatedColor(target: Color, label: String): Color =
+    animateColorAsState(
+        targetValue = target,
+        animationSpec = tween(durationMillis = THEME_TRANSITION_MS),
+        label = label,
+    ).value
+
+/**
+ * Оборачивает переданную [target]-схему и возвращает новую [ColorScheme],
+ * где каждое поле плавно анимировано. Так при смене цветовой схемы
+ * в настройках всё приложение переливается, а не «щёлкает» одним кадром.
+ */
+@Composable
+private fun animatedColorScheme(target: ColorScheme): ColorScheme = ColorScheme(
+    primary = animatedColor(target.primary, "primary"),
+    onPrimary = animatedColor(target.onPrimary, "onPrimary"),
+    primaryContainer = animatedColor(target.primaryContainer, "primaryContainer"),
+    onPrimaryContainer = animatedColor(target.onPrimaryContainer, "onPrimaryContainer"),
+    inversePrimary = animatedColor(target.inversePrimary, "inversePrimary"),
+    secondary = animatedColor(target.secondary, "secondary"),
+    onSecondary = animatedColor(target.onSecondary, "onSecondary"),
+    secondaryContainer = animatedColor(target.secondaryContainer, "secondaryContainer"),
+    onSecondaryContainer = animatedColor(target.onSecondaryContainer, "onSecondaryContainer"),
+    tertiary = animatedColor(target.tertiary, "tertiary"),
+    onTertiary = animatedColor(target.onTertiary, "onTertiary"),
+    tertiaryContainer = animatedColor(target.tertiaryContainer, "tertiaryContainer"),
+    onTertiaryContainer = animatedColor(target.onTertiaryContainer, "onTertiaryContainer"),
+    background = animatedColor(target.background, "background"),
+    onBackground = animatedColor(target.onBackground, "onBackground"),
+    surface = animatedColor(target.surface, "surface"),
+    onSurface = animatedColor(target.onSurface, "onSurface"),
+    surfaceVariant = animatedColor(target.surfaceVariant, "surfaceVariant"),
+    onSurfaceVariant = animatedColor(target.onSurfaceVariant, "onSurfaceVariant"),
+    surfaceTint = animatedColor(target.surfaceTint, "surfaceTint"),
+    inverseSurface = animatedColor(target.inverseSurface, "inverseSurface"),
+    inverseOnSurface = animatedColor(target.inverseOnSurface, "inverseOnSurface"),
+    error = animatedColor(target.error, "error"),
+    onError = animatedColor(target.onError, "onError"),
+    errorContainer = animatedColor(target.errorContainer, "errorContainer"),
+    onErrorContainer = animatedColor(target.onErrorContainer, "onErrorContainer"),
+    outline = animatedColor(target.outline, "outline"),
+    outlineVariant = animatedColor(target.outlineVariant, "outlineVariant"),
+    scrim = animatedColor(target.scrim, "scrim"),
+    surfaceBright = animatedColor(target.surfaceBright, "surfaceBright"),
+    surfaceDim = animatedColor(target.surfaceDim, "surfaceDim"),
+    surfaceContainer = animatedColor(target.surfaceContainer, "surfaceContainer"),
+    surfaceContainerHigh = animatedColor(target.surfaceContainerHigh, "surfaceContainerHigh"),
+    surfaceContainerHighest = animatedColor(target.surfaceContainerHighest, "surfaceContainerHighest"),
+    surfaceContainerLow = animatedColor(target.surfaceContainerLow, "surfaceContainerLow"),
+    surfaceContainerLowest = animatedColor(target.surfaceContainerLowest, "surfaceContainerLowest"),
+)
+
+/** Анимированная версия [MessengerExtraColors]. */
+@Composable
+private fun animatedExtraColors(target: MessengerExtraColors): MessengerExtraColors =
+    MessengerExtraColors(
+        outgoingBubble = animatedColor(target.outgoingBubble, "outgoingBubble"),
+        incomingBubble = animatedColor(target.incomingBubble, "incomingBubble"),
+        chatWallpaper = animatedColor(target.chatWallpaper, "chatWallpaper"),
+        chatPattern = animatedColor(target.chatPattern, "chatPattern"),
+    )
+
+/**
+ * Оставлен как no-op для обратной совместимости. Логика reveal теперь
+ * интегрирована прямо в [SecureMessengerTheme] через graphicsLayer —
+ * отдельный оверлей не нужен, но если на него ссылается старый код
+ * (MainActivity) — он просто ничего не рендерит.
+ */
+@Composable
+fun ThemeRevealOverlay() = Unit
+
+/**
+ * Длительность pixel-perfect reveal-анимации. 850 мс — достаточно,
+ * чтобы пользователь успел «проводить глазами» круг от центра до края
+ * экрана, но не настолько долго, чтобы ощущалось как лаг.
+ */
+private const val REVEAL_DURATION_MS = 850
 
 @Composable
 fun SecureMessengerTheme(
@@ -469,18 +547,80 @@ fun SecureMessengerTheme(
     // системное isSystemInDarkTheme(). Иначе CLASSIC/OCEAN/FOREST/SUNSET при
     // тёмной системной теме переключались в dark-вариант, а MATERIAL_DARK
     // при светлой системе давал непоследовательные шапки/статус-бары.
-    //
-    // Все схемы с isDark=true (Material Dark и новые тёмные) — тёмные,
-    // остальные — светлые.
+
+    val revealSpec by ThemeTransition.activeReveal.collectAsState()
+    var revealProgress by remember { mutableStateOf<Float?>(null) }
+
+    // Жизненный цикл reveal-анимации. Снимок старого UI в revealSpec.snapshot
+    // уже захвачен в момент клика (см. ThemeTransition.startReveal) — нам
+    // остаётся только запустить прогресс от 0 к 1 и по завершении сбросить.
+    LaunchedEffect(revealSpec?.nonce) {
+        if (revealSpec == null) return@LaunchedEffect
+        revealProgress = 0f
+        animate(
+            initialValue = 0f,
+            targetValue = 1f,
+            animationSpec = tween(durationMillis = REVEAL_DURATION_MS, easing = FastOutSlowInEasing),
+        ) { value, _ -> revealProgress = value }
+        revealProgress = null
+        ThemeTransition.endReveal()
+    }
+
     val isDark = colorScheme.isDark
-    val colors = resolveColorScheme(colorScheme, isDark)
-    val extra = resolveExtraColors(colorScheme, isDark)
+    val targetColors = resolveColorScheme(colorScheme, isDark)
+    val targetExtra = resolveExtraColors(colorScheme, isDark)
+
+    // Во время reveal отключаем crossfade цветов — поверх снимка старого UI
+    // уже нарисован новый, дополнительная анимация цветов создаёт визуальный
+    // шум. В остальное время плавная переливка цветов остаётся (например,
+    // при force_logout или при переходе между темами одной «светлоты»).
+    val colors = if (revealProgress == null) animatedColorScheme(targetColors) else targetColors
+    val extra = if (revealProgress == null) animatedExtraColors(targetExtra) else targetExtra
 
     CompositionLocalProvider(LocalMessengerColors provides extra) {
         MaterialTheme(
             colorScheme = colors,
             typography = MessengerTypography,
-            content = content,
-        )
+        ) {
+            Box(modifier = Modifier.fillMaxSize()) {
+                // Основное содержимое приложения — МаterialTheme уже
+                // применил новую цветовую схему, поэтому content() рендерит
+                // новый UI с первого кадра reveal.
+                content()
+
+                // Overlay: рисуем СНИМОК старого UI поверх нового, но только
+                // ВНЕ растущего круга в центре. Круг имеет радиус 0 на старте →
+                // пользователь видит старый UI полностью. По мере роста круга
+                // старый UI «отступает», открывая уже отрисованный под ним
+                // новый UI. Клип через EvenOdd-path (rect + oval).
+                val progress = revealProgress
+                val snapshot = revealSpec?.snapshot
+                if (progress != null && snapshot != null) {
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        val center = Offset(size.width / 2f, size.height / 2f)
+                        val maxRadius = hypot(size.width / 2f, size.height / 2f) + 24f
+                        val radius = maxRadius * progress
+
+                        if (radius < maxRadius) {
+                            val clip = Path().apply {
+                                addRect(Rect(0f, 0f, size.width, size.height))
+                                addOval(
+                                    Rect(
+                                        center.x - radius,
+                                        center.y - radius,
+                                        center.x + radius,
+                                        center.y + radius,
+                                    )
+                                )
+                                fillType = PathFillType.EvenOdd
+                            }
+                            clipPath(clip) {
+                                drawImage(image = snapshot)
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

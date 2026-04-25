@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -42,7 +43,7 @@ import androidx.compose.material.icons.filled.Wallpaper
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.Vibration
-import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -59,6 +60,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
@@ -80,6 +82,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.secure.messenger.BuildConfig
 import com.secure.messenger.presentation.theme.AppColorScheme
 import com.secure.messenger.presentation.theme.ChatWallpaper
+import com.secure.messenger.presentation.theme.ThemeTransition
 import com.secure.messenger.presentation.theme.previewColor
 import kotlinx.coroutines.launch
 
@@ -89,6 +92,7 @@ private const val PRIVACY_POLICY_URL = "https://example.com/privacy"
 @Composable
 fun SettingsScreen(
     onBack: () -> Unit,
+    onOpenDiagnostics: () -> Unit = {},
     viewModel: SettingsViewModel = hiltViewModel(),
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
@@ -128,6 +132,13 @@ fun SettingsScreen(
                 .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            // ── Доступ для звонков и уведомлений ──────────────────────────
+            //   Сверху: пункты с не выданными разрешениями (если есть).
+            //   Внизу всегда: ссылка на полный чек-лист в DiagnosticsScreen.
+            com.secure.messenger.presentation.ui.permissions.PermissionsSection(
+                onOpenDiagnostics = onOpenDiagnostics,
+            )
+
             // ── Уведомления ────────────────────────────────────────────────
             OneUiSectionLabel("Уведомления")
 
@@ -145,7 +156,7 @@ fun SettingsScreen(
                 OneUiDivider()
 
                 OneUiToggleItem(
-                    icon = Icons.Default.VolumeUp,
+                    icon = Icons.AutoMirrored.Filled.VolumeUp,
                     iconTint = MaterialTheme.colorScheme.primary,
                     title = "Звук",
                     subtitle = if (state.soundEnabled) "Включён" else "Выключен",
@@ -194,6 +205,9 @@ fun SettingsScreen(
                 // Горизонтально-скроллируемая лента схем — их стало 10, в один
                 // ряд равномерно уже не влезают.
                 val schemeScroll = rememberScrollState()
+                // Получаем корневой Android View для захвата текущего UI в битмап
+                // ПЕРЕД сменой темы — нужен для круговой reveal-анимации.
+                val rootView = LocalView.current
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -208,7 +222,21 @@ fun SettingsScreen(
                             modifier = Modifier
                                 .widthIn(min = 60.dp)
                                 .clip(RoundedCornerShape(12.dp))
-                                .clickable { viewModel.setColorScheme(scheme) }
+                                .clickable {
+                                    // Reveal запускаем ТОЛЬКО при смене
+                                    // светлота (light ↔ dark). Внутри одной
+                                    // светлоты достаточно плавного color
+                                    // crossfade — круг там выглядит как
+                                    // лишнее движение. Захват View снимает
+                                    // пиксели ДО того как ViewModel применит
+                                    // новую схему и recomposition перерисует.
+                                    if (scheme != state.colorScheme &&
+                                        scheme.isDark != state.colorScheme.isDark
+                                    ) {
+                                        ThemeTransition.startReveal(rootView)
+                                    }
+                                    viewModel.setColorScheme(scheme)
+                                }
                                 .padding(horizontal = 4.dp, vertical = 4.dp),
                         ) {
                             Box(
@@ -246,6 +274,14 @@ fun SettingsScreen(
                             )
                         }
                     }
+                }
+
+                // Инфо-плашка: матовое стекло (BlurEffect) доступно только
+                // с Android 12. На более ранних версиях блюра нет, вместо
+                // него показываем непрозрачную шапку/инпут. Текст выводим
+                // только на устройствах с SDK < 31, чтобы не засорять UI.
+                if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.S) {
+                    BlurUnsupportedHint()
                 }
 
                 OneUiDivider()
@@ -287,6 +323,16 @@ fun SettingsScreen(
                             onClick = { viewModel.setWallpaper(wp) },
                         )
                     }
+                }
+
+                // Ползунок размытия фона. Активен только когда выбрана картинка —
+                // для «Без фона» блюрить нечего.
+                if (state.wallpaper != ChatWallpaper.NONE) {
+                    BlurSlider(
+                        value = state.wallpaperBlur,
+                        onValueChange = { viewModel.setWallpaperBlur(it) },
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
                 }
             }
 
@@ -994,6 +1040,137 @@ private fun ChangePasswordDialog(
     )
 }
 
+// ── Ползунок «Размытие фона» ──────────────────────────────────────────────
+
+/**
+ * Кастомный слайдер для настройки размытия обоев чата:
+ *  - градиентная подложка под активным треком (primary → primaryContainer)
+ *  - чуть более толстый track (8dp) со скруглёнными концами
+ *  - крупный thumb с двойным кольцом (primary + белая внутренняя точка)
+ *  - значение «42%» рядом с подписью — обновляется в реальном времени
+ *  - маркировки 0 / 50 / 100 под треком
+ */
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+@Composable
+private fun BlurSlider(
+    value: Int,
+    onValueChange: (Int) -> Unit,
+) {
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 4.dp),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
+            // Заголовок + значение
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "Размытие фона",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.weight(1f),
+                )
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.18f),
+                ) {
+                    Text(
+                        text = "$value%",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // Сам слайдер с кастомным thumb и track
+            androidx.compose.material3.Slider(
+                value = value.toFloat(),
+                onValueChange = { onValueChange(it.toInt()) },
+                valueRange = 0f..100f,
+                colors = androidx.compose.material3.SliderDefaults.colors(
+                    thumbColor = MaterialTheme.colorScheme.primary,
+                    activeTrackColor = MaterialTheme.colorScheme.primary,
+                    inactiveTrackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.22f),
+                ),
+                thumb = {
+                    // Двойное кольцо: внешний primary 24dp + внутренний белый 10dp
+                    Box(
+                        modifier = Modifier
+                            .size(24.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.primary),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(10.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.onPrimary),
+                        )
+                    }
+                },
+                track = { sliderState ->
+                    val fraction = (sliderState.value / 100f).coerceIn(0f, 1f)
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(8.dp)
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth(fraction)
+                                .fillMaxHeight()
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(
+                                    androidx.compose.ui.graphics.Brush.horizontalGradient(
+                                        listOf(
+                                            MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
+                                            MaterialTheme.colorScheme.primary,
+                                        )
+                                    )
+                                ),
+                        )
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+            )
+
+            // Маркировки
+            Row(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = "0",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 10.sp,
+                )
+                Spacer(modifier = Modifier.weight(1f))
+                Text(
+                    text = "50",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 10.sp,
+                )
+                Spacer(modifier = Modifier.weight(1f))
+                Text(
+                    text = "100",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 10.sp,
+                )
+            }
+        }
+    }
+}
+
 // ── Превью обоев для селектора в настройках ────────────────────────────────
 
 @Composable
@@ -1063,6 +1240,39 @@ private fun WallpaperPreview(
             fontSize = 10.sp,
             textAlign = TextAlign.Center,
             maxLines = 1,
+        )
+    }
+}
+
+/**
+ * Небольшая информационная плашка, которая показывается только пользователям
+ * с Android версии ниже 12 (API < 31). Сообщает о том, что эффект матового
+ * стекла (BlurEffect) доступен только на Android 12+ — на их устройстве
+ * шапка и поле ввода рендерятся просто непрозрачными для лучшей читаемости.
+ */
+@Composable
+private fun BlurUnsupportedHint() {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.Top,
+    ) {
+        Icon(
+            imageVector = Icons.Default.Info,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier
+                .size(20.dp)
+                .padding(top = 2.dp),
+        )
+        Spacer(modifier = Modifier.width(12.dp))
+        Text(
+            text = "Эффект матового стекла в шапке и поле ввода чата доступен " +
+                    "начиная с Android 12. На вашем устройстве они рендерятся " +
+                    "непрозрачными — так сообщения читаются чётко.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }

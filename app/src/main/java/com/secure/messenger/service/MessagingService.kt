@@ -133,6 +133,24 @@ class MessagingService : Service() {
                         Timber.w("WS disconnected — reconnect in ${reconnectDelayMs}ms")
                         scheduleReconnect()
                     }
+                    is SignalingEvent.GroupInfoUpdated -> scope.launch {
+                        incomingMessageHandler.handleGroupInfoUpdated(event.chatId, event.title, event.avatarUrl)
+                    }
+                    is SignalingEvent.GroupMemberAdded -> scope.launch {
+                        incomingMessageHandler.handleGroupMemberAdded(event.chatId, event.userId, event.epoch)
+                    }
+                    is SignalingEvent.GroupMemberRemoved -> scope.launch {
+                        incomingMessageHandler.handleGroupMemberRemoved(event.chatId, event.userId, event.epoch)
+                    }
+                    is SignalingEvent.GroupRoleChanged -> scope.launch {
+                        incomingMessageHandler.handleGroupRoleChanged(event.chatId, event.userId, event.role)
+                    }
+                    is SignalingEvent.GroupDeleted -> scope.launch {
+                        incomingMessageHandler.handleGroupDeleted(event.chatId)
+                    }
+                    is SignalingEvent.GroupSenderKeyReady -> scope.launch {
+                        incomingMessageHandler.handleGroupSenderKeyReady(event.chatId, event.ownerId, event.epoch)
+                    }
                     else -> Unit
                 }
             }

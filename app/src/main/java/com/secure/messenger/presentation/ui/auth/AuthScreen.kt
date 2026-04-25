@@ -8,19 +8,27 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -65,6 +73,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.core.content.ContextCompat
 import com.secure.messenger.service.SmsReceiver
 import androidx.compose.ui.Modifier
@@ -118,37 +127,72 @@ fun AuthScreen(
                 )
         ) {}
 
+        // Определяем, открыта ли клавиатура — если да, плавно ужимаем
+        // шапку с логотипом, чтобы форма со всеми кнопками всегда помещалась
+        // над клавиатурой без необходимости скроллить вручную.
+        val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+        // Дополнительный отступ, чтобы логотип не залезал под вырез камеры
+        // на устройствах с hole-punch/notch. statusBarsPadding() ниже
+        // обрабатывает сам статус-бар, но дизайнерский запас сверху даёт
+        // визуальное «дыхание» между иконками статус-бара и логотипом.
+        val topSpacerHeight by animateDpAsState(
+            targetValue = if (imeVisible) 20.dp else 40.dp,
+            animationSpec = tween(durationMillis = 250),
+            label = "auth_top_spacer",
+        )
+        val logoSize by animateDpAsState(
+            targetValue = if (imeVisible) 56.dp else 90.dp,
+            animationSpec = tween(durationMillis = 250),
+            label = "auth_logo_size",
+        )
+        val headerBottomSpacer by animateDpAsState(
+            targetValue = if (imeVisible) 16.dp else 32.dp,
+            animationSpec = tween(durationMillis = 250),
+            label = "auth_header_bottom",
+        )
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .imePadding(),
+                // Учитываем статус-бар сверху — иначе на устройствах с hole-punch
+                // (вырез фронтальной камеры по центру верха) логотип и название
+                // заезжали под иконку камеры.
+                .statusBarsPadding()
+                // Контент дополнительно делаем скроллящимся — на маленьких
+                // экранах и в ландшафте этого достаточно, чтобы при активной
+                // клавиатуре пользователь мог добраться до любой кнопки.
+                .verticalScroll(rememberScrollState())
+                .imePadding()
+                .navigationBarsPadding(),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             // ── Шапка с логотипом ──────────────────────────────────────────
-            Spacer(modifier = Modifier.height(64.dp))
+            Spacer(modifier = Modifier.height(topSpacerHeight))
             Image(
                 painter = painterResource(R.drawable.avatar_placeholder),
                 contentDescription = null,
                 modifier = Modifier
-                    .size(90.dp)
+                    .size(logoSize)
                     .clip(CircleShape),
             )
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(if (imeVisible) 8.dp else 16.dp))
             Text(
                 text = "Grizzly Messenger",
                 style = MaterialTheme.typography.titleMedium.copy(
-                    fontSize = 22.sp,
+                    fontSize = if (imeVisible) 18.sp else 22.sp,
                     fontWeight = FontWeight.Bold,
                 ),
                 color = Color.White,
             )
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = "Мессенджер со сквозным шифрованием",
-                style = MaterialTheme.typography.bodySmall,
-                color = Color.White.copy(alpha = 0.8f),
-            )
-            Spacer(modifier = Modifier.height(32.dp))
+            if (!imeVisible) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "Мессенджер со сквозным шифрованием",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.White.copy(alpha = 0.8f),
+                )
+            }
+            Spacer(modifier = Modifier.height(headerBottomSpacer))
 
             // ── Карточка с формой ──────────────────────────────────────────
             Surface(
@@ -217,6 +261,14 @@ fun AuthScreen(
 
 // ── Шаг 1: Ввод телефона ──────────────────────────────────────────────────────
 
+/**
+ * Единая высота всех интерактивных полей на экране авторизации —
+ * Material 3 default для OutlinedTextField. Используется и для
+ * Country-пикера (Surface), чтобы визуально поля были одинаковыми
+ * на любом устройстве и системном шрифте.
+ */
+private val FieldHeight = 56.dp
+
 @Composable
 private fun PhoneInputStep(
     state: AuthUiState,
@@ -244,15 +296,19 @@ private fun PhoneInputStep(
         )
         Spacer(modifier = Modifier.height(24.dp))
 
-        // Кнопка выбора страны
+        // Кнопка выбора страны — фиксируем высоту строго как у OutlinedTextField,
+        // иначе на разных плотностях/шрифтах поле «страна» получается
+        // заметно ниже/выше поля с номером.
         Surface(
             onClick = onShowPicker,
             shape = RoundedCornerShape(12.dp),
             color = MaterialTheme.colorScheme.surfaceVariant,
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(FieldHeight),
         ) {
             Row(
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+                modifier = Modifier.padding(horizontal = 16.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(text = state.country.flag, fontSize = 22.sp)
@@ -301,7 +357,9 @@ private fun PhoneInputStep(
                 if (state.phoneNumber.length == maxLen) onSubmit()
             }),
             singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(FieldHeight),
             shape = RoundedCornerShape(12.dp),
             colors = OutlinedTextFieldDefaults.colors(
                 focusedBorderColor = MaterialTheme.colorScheme.primary,
@@ -414,7 +472,7 @@ private fun OtpInputStep(
             placeholder = {
                 Text(
                     "• • • • • •",
-                    letterSpacing = 8.sp,
+                    letterSpacing = 6.sp,
                     textAlign = TextAlign.Center,
                     modifier = Modifier.fillMaxWidth(),
                 )
@@ -428,14 +486,18 @@ private fun OtpInputStep(
                 if (state.otp.length == 6) onSubmit()
             }),
             singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
+            // Фиксируем единую высоту FieldHeight, чтобы OTP-инпут
+            // визуально совпадал с остальными полями авторизации.
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(FieldHeight),
             shape = RoundedCornerShape(12.dp),
             colors = OutlinedTextFieldDefaults.colors(
                 focusedBorderColor = MaterialTheme.colorScheme.primary,
             ),
             textStyle = MaterialTheme.typography.bodyLarge.copy(
-                letterSpacing = 8.sp,
-                fontSize = 24.sp,
+                letterSpacing = 6.sp,
+                fontSize = 18.sp,
                 textAlign = TextAlign.Center,
             ),
             isError = state.error != null,
@@ -563,7 +625,9 @@ private fun PasswordInputStep(
                 if (!isNewPassword) onSubmit()
             }),
             singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(FieldHeight),
             shape = RoundedCornerShape(12.dp),
             colors = OutlinedTextFieldDefaults.colors(
                 focusedBorderColor = MaterialTheme.colorScheme.primary,
@@ -601,7 +665,9 @@ private fun PasswordInputStep(
                     onSubmit()
                 }),
                 singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(FieldHeight),
                 shape = RoundedCornerShape(12.dp),
                 colors = OutlinedTextFieldDefaults.colors(
                     focusedBorderColor = MaterialTheme.colorScheme.primary,

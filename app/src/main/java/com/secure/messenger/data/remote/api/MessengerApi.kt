@@ -1,7 +1,17 @@
 package com.secure.messenger.data.remote.api
 
+import com.secure.messenger.data.remote.api.dto.AddMemberDto
+import com.secure.messenger.data.remote.api.dto.ChangeRoleDto
 import com.secure.messenger.data.remote.api.dto.ChatDto
+import com.secure.messenger.data.remote.api.dto.CreateGroupChatDto
+import com.secure.messenger.data.remote.api.dto.EpochResponseDto
+import com.secure.messenger.data.remote.api.dto.GroupAvatarUploadDto
+import com.secure.messenger.data.remote.api.dto.LeaveResponseDto
 import com.secure.messenger.data.remote.api.dto.MessageDto
+import com.secure.messenger.data.remote.api.dto.SenderKeyEntryDto
+import com.secure.messenger.data.remote.api.dto.TransferOwnershipDto
+import com.secure.messenger.data.remote.api.dto.UpdateGroupInfoDto
+import com.secure.messenger.data.remote.api.dto.UploadSenderKeysDto
 import com.secure.messenger.data.remote.api.dto.UserDto
 import okhttp3.MultipartBody
 import retrofit2.http.Body
@@ -101,7 +111,65 @@ interface MessengerApi {
     suspend fun getOrCreateDirectChat(@Body body: Map<String, String>): ApiResponse<ChatDto>
 
     @POST("chats/group")
-    suspend fun createGroupChat(@Body body: Map<String, Any>): ApiResponse<ChatDto>
+    suspend fun createGroupChat(@Body body: CreateGroupChatDto): ApiResponse<ChatDto>
+
+    // ── Groups (1.0.68) ──────────────────────────────────────────────────────
+
+    @PATCH("chats/{chatId}")
+    suspend fun updateGroupInfo(
+        @Path("chatId") chatId: String,
+        @Body body: UpdateGroupInfoDto,
+    ): ApiResponse<Unit>
+
+    @Multipart
+    @POST("chats/{chatId}/avatar")
+    suspend fun uploadGroupAvatar(
+        @Path("chatId") chatId: String,
+        @Part avatar: MultipartBody.Part,
+    ): ApiResponse<GroupAvatarUploadDto>
+
+    @POST("chats/{chatId}/members")
+    suspend fun addGroupMember(
+        @Path("chatId") chatId: String,
+        @Body body: AddMemberDto,
+    ): ApiResponse<EpochResponseDto>
+
+    @DELETE("chats/{chatId}/members/{userId}")
+    suspend fun removeGroupMember(
+        @Path("chatId") chatId: String,
+        @Path("userId") userId: String,
+    ): ApiResponse<EpochResponseDto>
+
+    @POST("chats/{chatId}/leave")
+    suspend fun leaveGroup(@Path("chatId") chatId: String): ApiResponse<LeaveResponseDto>
+
+    @DELETE("chats/{chatId}")
+    suspend fun deleteGroup(@Path("chatId") chatId: String): ApiResponse<Unit>
+
+    @PATCH("chats/{chatId}/members/{userId}/role")
+    suspend fun changeGroupRole(
+        @Path("chatId") chatId: String,
+        @Path("userId") userId: String,
+        @Body body: ChangeRoleDto,
+    ): ApiResponse<Unit>
+
+    @POST("chats/{chatId}/transfer-ownership")
+    suspend fun transferGroupOwnership(
+        @Path("chatId") chatId: String,
+        @Body body: TransferOwnershipDto,
+    ): ApiResponse<Unit>
+
+    @POST("chats/{chatId}/sender-keys")
+    suspend fun uploadSenderKeys(
+        @Path("chatId") chatId: String,
+        @Body body: UploadSenderKeysDto,
+    ): ApiResponse<Unit>
+
+    @GET("chats/{chatId}/sender-keys")
+    suspend fun fetchSenderKeys(
+        @Path("chatId") chatId: String,
+        @Query("epoch") epoch: Int? = null,
+    ): ApiResponse<List<SenderKeyEntryDto>>
 
     // ── Messages ──────────────────────────────────────────────────────────────
 
@@ -152,6 +220,9 @@ data class SendMessageRequest(
     val encryptedContent: String,
     val type: String = "TEXT",
     val replyToId: String? = null,
+    // Для групповых сообщений — epoch sender-ключа, которым шифровали.
+    // Для DIRECT всегда null (сервер сохранит NULL в БД).
+    val groupEpoch: Int? = null,
 )
 
 /** Версия APK у клиента — отправляется при каждом старте для админ-панели. */

@@ -12,7 +12,12 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -55,6 +60,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -93,6 +99,7 @@ fun ProfileEditScreen(
 
     var showLogoutDialog by remember { mutableStateOf(false) }
     var showAvatarSheet by remember { mutableStateOf(false) }
+    var avatarExpanded by remember { mutableStateOf(false) }
     val sheetState = rememberModalBottomSheetState()
     val scope = rememberCoroutineScope()
 
@@ -155,6 +162,31 @@ fun ProfileEditScreen(
         )
     }
 
+    // ── Fullscreen-просмотр своего аватара ──────────────────────────────────
+    // Раскрытие аватара — inline-эффект на самой карточке (не overlay), см.
+    // ниже состояние avatarExpanded и анимацию height/corner/offset.
+
+    // System back — сворачивает развёрнутый аватар, а не уходит со страницы.
+    androidx.activity.compose.BackHandler(enabled = avatarExpanded) {
+        avatarExpanded = false
+    }
+
+    // Status-bar: иконки белые когда фото развёрнуто (фото тёмное),
+    // обратно к теме при свёрнутом. Восстанавливаем дефолт при уходе с экрана.
+    val view = androidx.compose.ui.platform.LocalView.current
+    val isDarkTheme = MaterialTheme.colorScheme.background.luminance() < 0.5f
+    androidx.compose.runtime.DisposableEffect(avatarExpanded) {
+        val window = (view.context as? android.app.Activity)?.window
+        val controller = window?.let {
+            androidx.core.view.WindowCompat.getInsetsController(it, view)
+        }
+        val previous = controller?.isAppearanceLightStatusBars
+        controller?.isAppearanceLightStatusBars = if (avatarExpanded) false else !isDarkTheme
+        onDispose {
+            previous?.let { controller?.isAppearanceLightStatusBars = it }
+        }
+    }
+
     // ── Шторка выбора источника аватара ──────────────────────────────────────
     if (showAvatarSheet) {
         ModalBottomSheet(
@@ -201,29 +233,66 @@ fun ProfileEditScreen(
         }
     }
 
+    // Анимация раскрытия аватара (Telegram-style). При expanded:
+    //  • Surface-header «Мой профиль» сворачивается;
+    //  • карточка-аватар растягивается до 50% высоты экрана и заезжает
+    //    поверх статус-бара (за счёт того, что верхний header исчезает,
+    //    а у самой карточки нет statusBarsPadding);
+    //  • скругление углов карточки уходит в 0 — фото становится «во всё окно».
+    val configuration = androidx.compose.ui.platform.LocalConfiguration.current
+    val expandedHeightDp = (configuration.screenHeightDp * 0.5f).dp
+    val avatarHeight by androidx.compose.animation.core.animateDpAsState(
+        targetValue = if (avatarExpanded) expandedHeightDp else 200.dp,
+        animationSpec = androidx.compose.animation.core.tween(
+            durationMillis = 320,
+            easing = androidx.compose.animation.core.FastOutSlowInEasing,
+        ),
+        label = "avatar-height",
+    )
+    val avatarCorner by androidx.compose.animation.core.animateDpAsState(
+        targetValue = if (avatarExpanded) 0.dp else 18.dp,
+        animationSpec = androidx.compose.animation.core.tween(320),
+        label = "avatar-corner",
+    )
+    // Боковой отступ контейнера: при expanded убираем, чтобы карточка
+    // занимала всю ширину экрана без полей слева/справа.
+    val containerHorizontalPad by androidx.compose.animation.core.animateDpAsState(
+        targetValue = if (avatarExpanded) 0.dp else 16.dp,
+        animationSpec = androidx.compose.animation.core.tween(320),
+        label = "container-pad",
+    )
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.surfaceContainerLow),
     ) {
         // ── OneUI-стиль: большой заголовок ─────────────────────────────────
-        Surface(
-            color = MaterialTheme.colorScheme.surface,
-            shadowElevation = 0.dp,
+        //  Скрывается когда аватар развернут — освобождает status-bar и
+        //  визуально передаёт его карточке-аватару.
+        androidx.compose.animation.AnimatedVisibility(
+            visible = !avatarExpanded,
+            enter = androidx.compose.animation.expandVertically(),
+            exit = androidx.compose.animation.shrinkVertically(),
         ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .statusBarsPadding()
-                    .padding(start = 24.dp, end = 24.dp, top = 32.dp, bottom = 20.dp),
+            Surface(
+                color = MaterialTheme.colorScheme.surface,
+                shadowElevation = 0.dp,
             ) {
-                Text(
-                    text = "Мой профиль",
-                    style = MaterialTheme.typography.headlineLarge,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 34.sp,
-                    color = MaterialTheme.colorScheme.onSurface,
-                )
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .statusBarsPadding()
+                        .padding(start = 24.dp, end = 24.dp, top = 32.dp, bottom = 20.dp),
+                ) {
+                    Text(
+                        text = "Мой профиль",
+                        style = MaterialTheme.typography.headlineLarge,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 34.sp,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                }
             }
         }
 
@@ -232,7 +301,7 @@ fun ProfileEditScreen(
                 .fillMaxSize()
                 .imePadding()
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 12.dp),
+                .padding(horizontal = containerHorizontalPad, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             // ── Аватар на всю карточку как фон ──────────────────────────
@@ -245,14 +314,77 @@ fun ProfileEditScreen(
                 }
             }
 
+            // Свайп ВНИЗ по карточке-аватару — свернуть. Триггер: totalDrag
+            // больше 20% expandedHeight (~10% высоты экрана). При движении
+            // карточка визуально следует за пальцем (translationY) — это даёт
+            // тактильный feedback, без него пользователю казалось, что свайп
+            // вообще не реагирует.
+            val swipeThresholdPx = with(LocalDensity.current) {
+                expandedHeightDp.toPx() * 0.20f
+            }
+            val dragY = remember { androidx.compose.animation.core.Animatable(0f) }
+            val swipeScope = rememberCoroutineScope()
+            // Сброс смещения при ручном collapse (через тап/back), иначе
+            // следующее открытие началось бы с уже сдвинутой карточки.
+            LaunchedEffect(avatarExpanded) {
+                if (!avatarExpanded) dragY.snapTo(0f)
+            }
             Surface(
-                shape = RoundedCornerShape(18.dp),
+                shape = RoundedCornerShape(avatarCorner),
                 color = MaterialTheme.colorScheme.surface,
                 tonalElevation = 1.dp,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(200.dp)
-                    .clickable { showAvatarSheet = true },
+                    .height(avatarHeight)
+                    .graphicsLayer { translationY = dragY.value }
+                    .pointerInput(avatarExpanded) {
+                        if (!avatarExpanded) return@pointerInput
+                        var totalDrag = 0f
+                        detectVerticalDragGestures(
+                            onVerticalDrag = { change, delta ->
+                                if (delta > 0 || totalDrag > 0) {
+                                    totalDrag = (totalDrag + delta).coerceAtLeast(0f)
+                                    swipeScope.launch { dragY.snapTo(totalDrag) }
+                                    // Помечаем event'ы как использованные —
+                                    // иначе родительский verticalScroll
+                                    // ниже мог перехватывать жест.
+                                    change.consume()
+                                }
+                            },
+                            onDragEnd = {
+                                if (totalDrag > swipeThresholdPx) {
+                                    avatarExpanded = false
+                                } else {
+                                    swipeScope.launch {
+                                        dragY.animateTo(
+                                            0f,
+                                            androidx.compose.animation.core.tween(180),
+                                        )
+                                    }
+                                }
+                                totalDrag = 0f
+                            },
+                            onDragCancel = {
+                                swipeScope.launch {
+                                    dragY.animateTo(
+                                        0f,
+                                        androidx.compose.animation.core.tween(180),
+                                    )
+                                }
+                                totalDrag = 0f
+                            },
+                        )
+                    }
+                    // Тап: если есть аватар — раскрываем/сворачиваем карточку
+                    // (Telegram-style); если фото нет — сразу bottom sheet
+                    // с выбором фото (нечего показывать в полном размере).
+                    .clickable {
+                        if (resolvedAvatarUrl != null) {
+                            avatarExpanded = !avatarExpanded
+                        } else {
+                            showAvatarSheet = true
+                        }
+                    },
             ) {
                 Box(modifier = Modifier.fillMaxSize()) {
                     // Фоновое фото
@@ -326,17 +458,27 @@ fun ProfileEditScreen(
                         }
                     }
 
-                    // Подсказка справа
+                    // Подсказка справа — кликабельная: тап по карточке
+                    // открывает/закрывает inline-просмотр аватара; изменение
+                    // вызывается отдельным нажатием по этой плашке.
+                    //
+                    // Когда карточка свёрнута (200dp) — плашка в правом
+                    // ВЕРХНЕМ углу. При expanded карточка заезжает поверх
+                    // status-bar, и плашка в TopEnd оказалась бы прямо под
+                    // часами/иконками сети — это нечитаемо. Переносим её в
+                    // правый НИЖНИЙ угол: имя/username слева внизу, плашка
+                    // справа внизу, ничего не наезжает на системную шторку.
                     Text(
                         text = "Изменить",
                         style = MaterialTheme.typography.labelSmall,
-                        color = Color.White.copy(alpha = 0.7f),
+                        color = Color.White.copy(alpha = 0.85f),
                         modifier = Modifier
-                            .align(Alignment.TopEnd)
+                            .align(if (avatarExpanded) Alignment.BottomEnd else Alignment.TopEnd)
                             .padding(12.dp)
                             .clip(RoundedCornerShape(8.dp))
-                            .background(Color.Black.copy(alpha = 0.3f))
-                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                            .background(Color.Black.copy(alpha = 0.4f))
+                            .clickable { showAvatarSheet = true }
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
                     )
                 }
             }

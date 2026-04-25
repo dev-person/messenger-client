@@ -34,6 +34,7 @@ data class SettingsUiState(
     val vibrationEnabled: Boolean = true,
     val colorScheme: AppColorScheme = AppColorScheme.CLASSIC,
     val wallpaper: ChatWallpaper = ChatWallpaper.NONE,
+    val wallpaperBlur: Int = 0,
     // Password dialog
     val showPasswordDialog: Boolean = false,
     val hasExistingPassword: Boolean = false,
@@ -97,6 +98,7 @@ class SettingsViewModel @Inject constructor(
         vibrationEnabled     = prefs.getBoolean(KEY_VIBRATION, true),
         colorScheme          = ThemePreferences.colorScheme.value,
         wallpaper            = ThemePreferences.wallpaper.value,
+        wallpaperBlur        = ThemePreferences.wallpaperBlur.value,
     )
 
     fun toggleNotifications() {
@@ -117,7 +119,16 @@ class SettingsViewModel @Inject constructor(
         _uiState.value = _uiState.value.copy(vibrationEnabled = newValue)
     }
 
+    /**
+     * Применяет новую цветовую схему. Сам reveal-анимацию здесь НЕ запускаем —
+     * она требует доступа к Android View для захвата снимка старого UI в
+     * Bitmap, а это можно сделать только из Composable (через LocalView).
+     * Триггер живёт в SettingsScreen и вызывает [ThemeTransition.startReveal]
+     * ДО того как мы здесь поменяем схему.
+     */
     fun setColorScheme(scheme: AppColorScheme) {
+        val current = _uiState.value.colorScheme
+        if (current == scheme) return
         ThemePreferences.setColorScheme(scheme)
         _uiState.value = _uiState.value.copy(colorScheme = scheme)
     }
@@ -125,6 +136,11 @@ class SettingsViewModel @Inject constructor(
     fun setWallpaper(wp: ChatWallpaper) {
         ThemePreferences.setWallpaper(wp)
         _uiState.value = _uiState.value.copy(wallpaper = wp)
+    }
+
+    fun setWallpaperBlur(value: Int) {
+        ThemePreferences.setWallpaperBlur(value)
+        _uiState.value = _uiState.value.copy(wallpaperBlur = value)
     }
 
     /**

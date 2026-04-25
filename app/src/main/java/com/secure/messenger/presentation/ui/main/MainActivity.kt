@@ -183,6 +183,10 @@ class MainActivity : ComponentActivity() {
                     // Диалог обновления приложения
                     UpdateDialog(updateManager = updateManager)
                 }
+
+                // Reveal-анимация смены темы теперь встроена внутрь
+                // SecureMessengerTheme через graphicsLayer — отдельный overlay
+                // больше не нужен.
             }
         }
     }

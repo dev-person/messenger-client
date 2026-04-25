@@ -47,6 +47,7 @@ import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.AlternateEmail
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Done
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Delete
@@ -80,10 +81,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import kotlinx.coroutines.flow.filter
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -133,10 +134,17 @@ import com.secure.messenger.utils.isSameDay
 /**
  * Плоский элемент списка чата. Альбом из нескольких картинок одного
  * отправителя рендерится как ОДИН элемент-плитка (а не N отдельных bubble).
+ * DateHeader — горизонтальная плашка с датой («Сегодня», «14 марта» и т.д.),
+ * раньше рисовалась инлайново внутри itemsIndexed; вынесена в отдельный тип,
+ * чтобы работать с reverseLayout без костылей.
  */
 private sealed interface ChatItem {
     val key: String
     val timestamp: Long
+
+    data class DateHeader(override val timestamp: Long) : ChatItem {
+        override val key get() = "date-$timestamp"
+    }
 
     data class Single(val message: Message) : ChatItem {
         override val key get() = message.id
@@ -156,12 +164,16 @@ private sealed interface ChatItem {
 
 /**
  * Группирует подряд идущие IMAGE-сообщения одного отправителя с одинаковым
- * groupId в альбом. Остальные сообщения остаются Single. Сортирует картинки
- * внутри альбома по groupIndex для стабильного порядка.
+ * groupId в альбом + вставляет [ChatItem.DateHeader] в начале каждого нового дня.
+ * Возвращает элементы в ХРОНОЛОГИЧЕСКОМ порядке (oldest → newest). Для отображения
+ * с reverseLayout=true список нужно перевернуть непосредственно перед передачей
+ * в LazyColumn.
  */
 private fun groupChatItems(messages: List<Message>): List<ChatItem> {
     if (messages.isEmpty()) return emptyList()
-    val result = mutableListOf<ChatItem>()
+
+    // 1. Группируем картинки в альбомы
+    val grouped = mutableListOf<ChatItem>()
     var i = 0
     while (i < messages.size) {
         val m = messages[i]
@@ -180,7 +192,7 @@ private fun groupChatItems(messages: List<Message>): List<ChatItem> {
                 album.add(next)
                 j++
             }
-            result.add(
+            grouped.add(
                 ChatItem.Album(
                     groupId = gi.groupId,
                     senderId = m.senderId,
@@ -191,9 +203,19 @@ private fun groupChatItems(messages: List<Message>): List<ChatItem> {
             )
             i = j
         } else {
-            result.add(ChatItem.Single(m))
+            grouped.add(ChatItem.Single(m))
             i++
         }
+    }
+
+    // 2. Вставляем DateHeader перед первым элементом каждого нового календарного дня
+    val result = mutableListOf<ChatItem>()
+    for ((idx, item) in grouped.withIndex()) {
+        val prev = if (idx > 0) grouped[idx - 1] else null
+        if (prev == null || !isSameDay(prev.timestamp, item.timestamp)) {
+            result.add(ChatItem.DateHeader(item.timestamp))
+        }
+        result.add(item)
     }
     return result
 }
@@ -204,6 +226,7 @@ private fun groupChatItems(messages: List<Message>): List<ChatItem> {
 fun ChatScreen(
     onBack: () -> Unit,
     onCallClick: (userId: String, isVideo: Boolean, peerName: String) -> Unit,
+    onGroupInfoClick: (chatId: String) -> Unit = {},
     viewModel: ChatViewModel = hiltViewModel(),
 ) {
     val messages by viewModel.messages.collectAsStateWithLifecycle()
@@ -213,6 +236,10 @@ fun ChatScreen(
     val currentUserId by viewModel.currentUserId.collectAsStateWithLifecycle()
     val isOtherOnline by viewModel.isOtherUserOnline.collectAsStateWithLifecycle()
     val otherUser by viewModel.otherUser.collectAsStateWithLifecycle()
+    val hasOutdatedMembers by viewModel.hasOutdatedGroupMembers.collectAsStateWithLifecycle()
+    val groupMembers by viewModel.groupMembers.collectAsStateWithLifecycle()
+    val groupOnlineCount by viewModel.groupOnlineCount.collectAsStateWithLifecycle()
+    val groupTypingNames by viewModel.groupTypingNames.collectAsStateWithLifecycle()
     val isBotChat = chatInfo?.otherUserId == "00000000-0000-0000-0000-000000000001"
     val isTyping by viewModel.isTyping.collectAsStateWithLifecycle()
     val isRecording by viewModel.isRecording.collectAsStateWithLifecycle()
@@ -236,15 +263,35 @@ fun ChatScreen(
         if (granted) viewModel.startVoiceRecording()
     }
 
+    // Хэлпер: декодирует URI и отправляет картинку, либо сообщает об ошибке
+    // пользователю (стикер слишком большой / формат не поддержан). Раньше
+    // стикеры, не прошедшие по размеру, молча проглатывались — пользователь
+    // тапал и ничего не происходило.
+    val sendMediaFromUri: (android.net.Uri) -> Unit = { uri ->
+        when (val r = com.secure.messenger.utils.ImageCodec.loadAndCompressDetailed(context, uri)) {
+            is com.secure.messenger.utils.ImageCodec.LoadResult.Ok -> {
+                viewModel.sendImage(r.data)
+            }
+            is com.secure.messenger.utils.ImageCodec.LoadResult.TooLarge -> {
+                val mb = r.sizeBytes / 1024.0 / 1024.0
+                val limitMb = r.limitBytes / 1024.0 / 1024.0
+                viewModel.reportError(
+                    "Стикер слишком большой (%.1f МБ, максимум %.1f МБ)"
+                        .format(mb, limitMb)
+                )
+            }
+            is com.secure.messenger.utils.ImageCodec.LoadResult.Failed -> {
+                viewModel.reportError(r.reason)
+            }
+        }
+    }
+
     // Image picker — современный системный медиа-пикер для ОДНОЙ картинки
     // (используется для стикеров из клавиатуры, он работает по одному URI)
     val imagePickerLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia()
     ) { uri ->
-        if (uri != null) {
-            val data = com.secure.messenger.utils.ImageCodec.loadAndCompress(context, uri)
-            if (data != null) viewModel.sendImage(data)
-        }
+        if (uri != null) sendMediaFromUri(uri)
     }
 
     // Множественный пикер — до 15 картинок за раз. При выборе одной автоматически
@@ -292,39 +339,45 @@ fun ChatScreen(
         )
     }
 
-    // Группируем сообщения в chatItems заранее — индекс в listState теперь
-    // ссылается на chatItems (альбом = один элемент), а не на messages.
+    // Группируем сообщения в chatItems (альбом = один элемент, плюс DateHeader
+    // перед каждой новой датой). Затем реверсим ОДИН раз для reverseLayout:
+    // индекс 0 в этом списке = САМОЕ новое сообщение, визуально находится
+    // внизу экрана. Это убирает проблему «сначала загружается верх, потом
+    // скроллится вниз» — LazyColumn сразу рендерит нижнюю часть списка,
+    // где только что и находится пользователь.
     val chatItems = remember(messages) { groupChatItems(messages) }
+    val reversedItems = remember(chatItems) { chatItems.asReversed() }
 
-    // Прокрутка к последнему сообщению при первом открытии чата.
-    // В диалоге с кучей картинок размеры айтемов меняются пока Coil
-    // декодирует — один scrollToItem становится неверным. Поэтому держим
-    // последний айтем в конце, пока layout не стабилизируется (~1.5с).
-    LaunchedEffect(Unit) {
-        snapshotFlow { chatItems.size }
-            .filter { it > 0 }
-            .first()
-        repeat(10) {
-            val target = (chatItems.size - 1).coerceAtLeast(0)
-            listState.scrollToItem(target)
-            kotlinx.coroutines.delay(150)
+    // ── Автоскролл при НОВОМ сообщении ─────────────────────────────────────
+    // При reverseLayout=true индекс 0 — это низ экрана (самое новое). Если
+    // пользователь листал историю вверх и пришло новое сообщение от
+    // собеседника — мы НЕ перебиваем чтение. Но если сообщение своё, или
+    // пользователь уже у «низа» (firstVisibleItemIndex == 0), — плавно
+    // возвращаем к самому низу, чтобы сообщение было видно.
+    val newestKey = reversedItems.firstOrNull()?.key
+    LaunchedEffect(newestKey, currentUserId) {
+        if (newestKey == null || reversedItems.isEmpty()) return@LaunchedEffect
+        val newest = reversedItems.first()
+        val ownSend = when (newest) {
+            is ChatItem.Single -> newest.message.senderId == currentUserId
+            is ChatItem.Album  -> newest.senderId == currentUserId
+            is ChatItem.DateHeader -> false
+        }
+        val userAtBottom = listState.firstVisibleItemIndex == 0
+        if (ownSend || userAtBottom) {
+            listState.animateScrollToItem(0)
         }
     }
 
-    // Авто-скролл при новом сообщении — только если уже у конца списка
-    LaunchedEffect(chatItems.size) {
-        if (chatItems.isNotEmpty()) {
-            val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1
-            if (lastVisible >= chatItems.size - 3) {
-                listState.animateScrollToItem(chatItems.size - 1)
-            }
-        }
-    }
-
-    // Подгрузка старых сообщений при скролле вверх
-    LaunchedEffect(listState) {
-        snapshotFlow { listState.firstVisibleItemIndex }
-            .filter { it == 0 }
+    // ── Умная подгрузка старых сообщений ──────────────────────────────────
+    // В reverseLayout=true листание ВВЕРХ (к старым) = увеличение индекса.
+    // Триггерим подгрузку, когда до верхнего конца списка осталось ≤ 5
+    // айтемов — так, чтобы новые сообщения успели подъехать невидимо для
+    // пользователя. loadOlderMessages() сам защищён от retry-шторма.
+    LaunchedEffect(listState, reversedItems.size) {
+        if (reversedItems.isEmpty()) return@LaunchedEffect
+        snapshotFlow { listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1 }
+            .filter { it >= 0 && it >= reversedItems.size - 5 }
             .collect { viewModel.loadOlderMessages() }
     }
 
@@ -396,37 +449,23 @@ fun ChatScreen(
                 LazyColumn(
                     state = listState,
                     modifier = Modifier.fillMaxSize(),
+                    // reverseLayout=true — индекс 0 (самое новое сообщение)
+                    // находится ВНИЗУ экрана. Пользователь открывает чат и
+                    // сразу видит последние сообщения, без промежуточного
+                    // «загружаем всю пачку сверху, потом скроллим вниз».
+                    reverseLayout = true,
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                        // При reverseLayout top/bottom paddings трактуются
+                        // от соответствующих краёв экрана: top = сверху под
+                        // шапкой (там прогрузятся старые), bottom = сверху
+                        // над инпутом (там живёт самое новое).
                         top = topBarHeightDp + 8.dp,
-                        // bottom = высота инпута + небольшой запас, чтобы последнее
-                        // сообщение при прокрутке в конец лежало ровно над инпутом.
                         bottom = inputBarHeightDp + 8.dp,
                     ),
                 ) {
-                    // Индикатор загрузки старых сообщений
-                    if (uiState.isLoadingOlder) {
-                        item("loading_older") {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(8.dp),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                androidx.compose.material3.CircularProgressIndicator(
-                                    modifier = Modifier.size(24.dp),
-                                    strokeWidth = 2.dp,
-                                )
-                            }
-                        }
-                    }
-                    itemsIndexed(chatItems, key = { _, it -> it.key }) { index, item ->
-                        val prevItem = chatItems.getOrNull(index - 1)
-
-                        if (prevItem == null || !isSameDay(prevItem.timestamp, item.timestamp)) {
-                            DateSeparator(timestamp = item.timestamp)
-                        }
-
+                    itemsIndexed(reversedItems, key = { _, it -> it.key }) { index, item ->
                         when (item) {
+                            is ChatItem.DateHeader -> DateSeparator(timestamp = item.timestamp)
                             is ChatItem.Single -> {
                                 val message = item.message
                                 val isBotMessage = message.senderId == "00000000-0000-0000-0000-000000000001"
@@ -446,22 +485,24 @@ fun ChatScreen(
                                         replyTo = replyTo,
                                         isOutgoing = isOutgoing,
                                         isHighlighted = highlightedMessageId == message.id,
+                                        senderName = resolveGroupSenderName(
+                                            chat = chatInfo,
+                                            senderId = message.senderId,
+                                            isOutgoing = isOutgoing,
+                                            members = groupMembers,
+                                        ),
                                         onReply  = { viewModel.startReplying(message) },
                                         onQuoteClick = { quotedId ->
-                                            val targetIndex = messages.indexOfFirst { it.id == quotedId }
-                                            if (targetIndex >= 0) {
+                                            val targetItemIndex = reversedItems.indexOfFirst {
+                                                when (it) {
+                                                    is ChatItem.Single -> it.message.id == quotedId
+                                                    is ChatItem.Album -> it.messages.any { m -> m.id == quotedId }
+                                                    is ChatItem.DateHeader -> false
+                                                }
+                                            }
+                                            if (targetItemIndex >= 0) {
                                                 coroutineScope.launch {
-                                                    // listState индексирует chatItems, а не messages.
-                                                    // Находим позицию в chatItems где лежит quoted сообщение.
-                                                    val targetItemIndex = chatItems.indexOfFirst {
-                                                        when (it) {
-                                                            is ChatItem.Single -> it.message.id == quotedId
-                                                            is ChatItem.Album -> it.messages.any { m -> m.id == quotedId }
-                                                        }
-                                                    }
-                                                    if (targetItemIndex >= 0) {
-                                                        listState.animateScrollToItem(targetItemIndex)
-                                                    }
+                                                    listState.animateScrollToItem(targetItemIndex)
                                                 }
                                                 viewModel.highlightMessage(quotedId)
                                             }
@@ -478,10 +519,40 @@ fun ChatScreen(
                                 AlbumBubble(
                                     messages = item.messages,
                                     isOutgoing = isOutgoing,
+                                    senderName = resolveGroupSenderName(
+                                        chat = chatInfo,
+                                        senderId = item.senderId,
+                                        isOutgoing = isOutgoing,
+                                        members = groupMembers,
+                                    ),
                                     onDelete = if (isOutgoing) {
                                         { msg -> viewModel.deleteMessage(msg) }
                                     } else null,
                                 )
+                            }
+                        }
+                    }
+
+                    // Индикатор загрузки старых сообщений — размещаем ПОСЛЕ
+                    // всех айтемов в DSL-порядке. При reverseLayout=true это
+                    // означает визуально САМЫЙ ВЕРХ экрана. Слот всегда имеет
+                    // фиксированную высоту (пока есть что грузить), чтобы его
+                    // появление/исчезновение не двигало сообщения ниже — это и
+                    // давало «дрыгание» списка в прошлой версии.
+                    if (uiState.hasOlderMessages) {
+                        item(key = "older_loader_slot", contentType = "older_loader") {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(40.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                if (uiState.isLoadingOlder) {
+                                    androidx.compose.material3.CircularProgressIndicator(
+                                        modifier = Modifier.size(24.dp),
+                                        strokeWidth = 2.dp,
+                                    )
+                                }
                             }
                         }
                     }
@@ -505,15 +576,54 @@ fun ChatScreen(
                     }
                 },
         ) {
-            ChatTopBar(
-                chatInfo = chatInfo,
-                currentUserId = currentUserId,
-                isOtherOnline = isOtherOnline,
-                isTyping = isTyping,
-                onBack = onBack,
-                onCallClick = onCallClick,
-                onAvatarClick = { otherUser?.let { showProfileUser = it } },
-            )
+            // Column нужен чтобы шапка и плашка-предупреждение рендерились
+            // друг под другом, а не накладывались поверх (внешний Box —
+            // именно с `align(TopStart)` для blur-оверлея, и его дети по
+            // дефолту стэкаются). onSizeChanged внешнего Box получит
+            // суммарную высоту Column → topBarHeightPx учитывает и плашку,
+            // LazyColumn ниже не залезает под неё.
+            Column {
+                ChatTopBar(
+                    chatInfo = chatInfo,
+                    currentUserId = currentUserId,
+                    isOtherOnline = isOtherOnline,
+                    isTyping = isTyping,
+                    groupMemberCount = groupMembers.size,
+                    groupOnlineCount = groupOnlineCount,
+                    groupTypingNames = groupTypingNames.values.toList(),
+                    onBack = onBack,
+                    onCallClick = onCallClick,
+                    onAvatarClick = { otherUser?.let { showProfileUser = it } },
+                    onGroupInfoClick = { chatInfo?.id?.let(onGroupInfoClick) },
+                )
+                if (chatInfo?.type == ChatType.GROUP && hasOutdatedMembers) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        shadowElevation = 0.dp,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { chatInfo?.id?.let(onGroupInfoClick) },
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Lock,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.size(18.dp),
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Кто-то из участников ещё не обновил приложение и не сможет читать сообщения",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                            )
+                        }
+                    }
+                }
+            }
         }
 
         // ── Поле ввода рендерится ОВЕРЛЕЕМ в outer Box, а не в Column —
@@ -551,10 +661,7 @@ fun ChatScreen(
                     )
                 )
             },
-            onContentReceived = { uri ->
-                val data = com.secure.messenger.utils.ImageCodec.loadAndCompress(context, uri)
-                if (data != null) viewModel.sendImage(data)
-            },
+            onContentReceived = { uri -> sendMediaFromUri(uri) },
             onStartRecording = {
                 if (androidx.core.content.ContextCompat.checkSelfPermission(
                         context,
@@ -617,20 +724,27 @@ private fun ChatTopBar(
     currentUserId: String?,
     isOtherOnline: Boolean,
     isTyping: Boolean,
+    groupMemberCount: Int = 0,
+    groupOnlineCount: Int = 0,
+    groupTypingNames: List<String> = emptyList(),
     onBack: () -> Unit,
     onCallClick: (userId: String, isVideo: Boolean, peerName: String) -> Unit,
     onAvatarClick: () -> Unit = {},
+    onGroupInfoClick: () -> Unit = {},
 ) {
     val peerId   = chatInfo?.otherUserId ?: ""
     val peerName = chatInfo?.title ?: ""
     val isDirectChat = chatInfo == null || chatInfo.type != ChatType.GROUP
     var menuVisible by remember { mutableStateOf(false) }
 
+    // На Android 12+ под шапкой живёт real-blur (BackdropBlurEffect) и 0.72
+        // достаточно для «матового стекла». На более ранних версиях блюра нет —
+        // полупрозрачная шапка выглядит как просто тускло-серая, и сообщения
+        // через неё читаются невнятно. Повышаем альфу до 0.96, чтобы шапка
+        // оставалась чёткой и не мешала чтению.
+    val topBarAlpha = if (android.os.Build.VERSION.SDK_INT >= 31) 0.72f else 0.96f
     Surface(
-        // Полупрозрачная «матовая» шапка — как у инпута внизу. На Android 12+
-        // ниже применяется real-blur к контенту ПОД шапкой через
-        // BackdropBlurEffect, здесь просто подложка с альфой.
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.72f),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = topBarAlpha),
         shadowElevation = 2.dp,
     ) {
         Row(
@@ -647,10 +761,12 @@ private fun ChatTopBar(
                 )
             }
 
-            // Аватар с индикатором онлайн (клик — профиль)
+            // Аватар с индикатором онлайн. Для direct — клик открывает профиль
+            // собеседника; для group — клик открывает экран информации о группе
+            // (такой же как клик по названию).
             Box(
                 modifier = if (isDirectChat) Modifier.clickable(onClick = onAvatarClick)
-                else Modifier,
+                else Modifier.clickable(onClick = onGroupInfoClick),
             ) {
                 AvatarImage(url = chatInfo?.avatarUrl, name = chatInfo?.title ?: "?", size = 46)
                 if (isDirectChat && isOtherOnline) {
@@ -667,9 +783,15 @@ private fun ChatTopBar(
                 }
             }
 
-            Spacer(modifier = Modifier.width(12.dp))
+            Spacer(modifier = Modifier.width(10.dp))
 
-            Column(modifier = Modifier.weight(1f)) {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    // Клик по названию и подзаголовку: для группы открывает
+                    // экран информации; для direct — профиль собеседника.
+                    .clickable(onClick = if (isDirectChat) onAvatarClick else onGroupInfoClick),
+            ) {
                 Text(
                     text = chatInfo?.title ?: "Чат",
                     style = MaterialTheme.typography.headlineMedium,
@@ -679,20 +801,22 @@ private fun ChatTopBar(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
-                // Статус: печатает / в сети / не в сети / кол-во участников
-                val subtitle = when {
-                    isDirectChat && isTyping -> "печатает..."
-                    chatInfo?.type == ChatType.GROUP -> "${chatInfo.members.size} участников"
-                    isDirectChat && isOtherOnline -> "в сети"
-                    isDirectChat -> "не в сети"
-                    else -> ""
-                }
+                val isGroupTyping = chatInfo?.type == ChatType.GROUP && groupTypingNames.isNotEmpty()
+                val subtitle = chatSubtitle(
+                    chat = chatInfo,
+                    isDirectChat = isDirectChat,
+                    isOtherOnline = isOtherOnline,
+                    isDirectTyping = isTyping,
+                    groupMemberCount = groupMemberCount,
+                    groupOnlineCount = groupOnlineCount,
+                    groupTypingNames = groupTypingNames,
+                )
                 if (subtitle.isNotEmpty()) {
                     Text(
                         text = subtitle,
                         style = MaterialTheme.typography.bodySmall,
                         color = when {
-                            isTyping -> MaterialTheme.colorScheme.primary
+                            isTyping || isGroupTyping -> MaterialTheme.colorScheme.primary
                             isOtherOnline -> Color(0xFF4CAF50)
                             else -> MaterialTheme.colorScheme.onSurfaceVariant
                         },
@@ -776,6 +900,83 @@ private fun DateSeparator(timestamp: Long) {
  * Текст «Звонок · 1:23» / «Звонок отклонён» / «Видеозвонок · 0:14» оставляем
  * как есть — они одинаково подходят обоим.
  */
+// ── Helpers для групповых сообщений (1.0.68) ─────────────────────────────────
+
+/**
+ * Имя автора в групповом чате — для шапки над чужими сообщениями. Возвращает
+ * displayName из подгруженных members; для DIRECT, своих сообщений или ещё не
+ * загруженных участников — null (UI не рендерит ничего, чтобы не показывать
+ * сырой UUID).
+ */
+private fun resolveGroupSenderName(
+    chat: Chat?,
+    senderId: String,
+    isOutgoing: Boolean,
+    members: List<User>,
+): String? {
+    if (chat?.type != ChatType.GROUP || isOutgoing) return null
+    return members.firstOrNull { it.id == senderId }
+        ?.displayName
+        ?.takeIf { it.isNotBlank() }
+}
+
+/**
+ * Текст под названием чата в шапке. Изолирован в отдельную функцию, чтобы не
+ * раздувать composable: для DIRECT/GROUP логика и приоритеты разные, а в
+ * самой шапке остаётся только Text(subtitle).
+ */
+private fun chatSubtitle(
+    chat: Chat?,
+    isDirectChat: Boolean,
+    isOtherOnline: Boolean,
+    isDirectTyping: Boolean,
+    groupMemberCount: Int,
+    groupOnlineCount: Int,
+    groupTypingNames: List<String>,
+): String = when {
+    // DIRECT
+    isDirectChat && isDirectTyping -> "печатает..."
+    isDirectChat && isOtherOnline -> "в сети"
+    isDirectChat -> "не в сети"
+    // GROUP
+    chat?.type == ChatType.GROUP && groupTypingNames.isNotEmpty() ->
+        groupTypingSubtitle(groupTypingNames)
+    chat?.type == ChatType.GROUP -> {
+        val count = groupMemberCount.takeIf { it > 0 } ?: chat.members.size
+        if (groupOnlineCount > 0) "$count участников · $groupOnlineCount онлайн"
+        else "$count участников"
+    }
+    else -> ""
+}
+
+/**
+ * Компактный текст «X печатает…» для группы. До трёх человек называем
+ * по именам, дальше — счётчик «X и ещё N».
+ */
+private fun groupTypingSubtitle(typingNames: List<String>): String = when (typingNames.size) {
+    0 -> ""
+    1 -> "${typingNames[0]} печатает…"
+    2 -> "${typingNames[0]} и ${typingNames[1]} печатают…"
+    else -> "${typingNames[0]} и ещё ${typingNames.size - 1} печатают…"
+}
+
+/** Подпись «Имя автора» над/внутри bubble для чужих сообщений в группе. */
+@Composable
+private fun GroupSenderLabel(
+    name: String,
+    modifier: Modifier = Modifier,
+) {
+    Text(
+        text = name,
+        style = MaterialTheme.typography.bodySmall,
+        fontWeight = FontWeight.SemiBold,
+        color = MaterialTheme.colorScheme.primary,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        modifier = modifier,
+    )
+}
+
 private fun displaySystemMessageText(rawText: String, isOwnMessage: Boolean): String {
     if (!isOwnMessage) return rawText
     return when {
@@ -869,6 +1070,8 @@ private fun MessageBubble(
     onQuoteClick: (String) -> Unit,
     onDelete: (() -> Unit)?,
     onEdit: (() -> Unit)?,
+    /** Имя автора — показывается над bubble в групповых чатах для чужих сообщений. */
+    senderName: String? = null,
 ) {
     val extra = LocalMessengerColors.current
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -937,6 +1140,15 @@ private fun MessageBubble(
                     )
                     .animateContentSize(),
             ) {
+                // Имя автора в групповом чате (только для чужих сообщений).
+                // Показываем ВНУТРИ bubble сверху; для медиа-режима (стикеры,
+                // одиночные картинки) подавляем — там нет фона, имя смотрелось
+                // бы инородно поверх контента.
+                if (senderName != null && !isOutgoing && !isMediaOnly) {
+                    GroupSenderLabel(name = senderName)
+                    Spacer(modifier = Modifier.height(2.dp))
+                }
+
                 // Цитата (если ответ на другое сообщение)
                 if (replyTo != null) {
                     QuotedMessagePreview(
@@ -1567,6 +1779,8 @@ private fun AlbumBubble(
     messages: List<Message>,
     isOutgoing: Boolean,
     onDelete: ((Message) -> Unit)? = null,
+    /** Имя автора альбома — показывается над плиткой в групповых чатах. */
+    senderName: String? = null,
 ) {
     if (messages.isEmpty()) return
     val count = messages.size
@@ -1601,11 +1815,21 @@ private fun AlbumBubble(
         horizontalArrangement = if (isOutgoing) Arrangement.End else Arrangement.Start,
     ) {
         Box {
-            Column(
-                modifier = Modifier
-                    .width(albumWidth)
-                    .clip(RoundedCornerShape(14.dp))
-                    .longPressActionable(
+            // Внешний Column — содержит подпись автора (для групп) и сами плитки.
+            // Внутренний Column ниже — это собственно «карточка» альбома: clip,
+            // longPress, действия с альбомом. Делим, чтобы текст имени не попадал
+            // под clip и не зависел от longPressActionable плиток.
+            Column(modifier = Modifier.width(albumWidth)) {
+                if (senderName != null && !isOutgoing) {
+                    GroupSenderLabel(
+                        name = senderName,
+                        modifier = Modifier.padding(start = 4.dp, bottom = 2.dp),
+                    )
+                }
+                Column(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(14.dp))
+                        .longPressActionable(
                         onLongPress = { offset ->
                             // Если в selection-режиме — пустое долгое нажатие не открывает меню
                             if (!selectionMode) {
@@ -1842,8 +2066,9 @@ private fun AlbumBubble(
                     }
                 },
             )
-        }
-    }
+            }   // ColumnExt (sender label + плитки)
+        }       // Box
+    }           // Row
 
     fullscreenIndex?.let { idx ->
         val msg = messages.getOrNull(idx) ?: return@let
@@ -2126,12 +2351,17 @@ private fun MessageInputBar(
     onStartRecording: () -> Unit = {},
     onStopRecording: (cancel: Boolean) -> Unit = {},
 ) {
+    // На Android 12+ под инпутом живёт real-blur, 0.88 даёт «матовое стекло».
+    // На более ранних Android блюра нет, полупрозрачная панель смотрится
+    // тускло и буквы сообщений просвечивают сквозь инпут — поднимаем альфу
+    // до 0.97, чтобы поле ввода оставалось чётким и собранным.
+    val inputAlpha = if (android.os.Build.VERSION.SDK_INT >= 31) 0.88f else 0.97f
     Surface(
         modifier = modifier,
         shadowElevation = 8.dp,
         // Полупрозрачная подложка — сквозь инпут просвечивают обои чата,
         // как у плашки «Здесь пока нет сообщений».
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = inputAlpha),
     ) {
         Column {
             // Полоска редактирования
@@ -2756,17 +2986,26 @@ private fun ProfileInfoRow(
 private fun ChatWallpaper() {
     val selectedWp by com.secure.messenger.presentation.theme.ThemePreferences.wallpaper
         .collectAsStateWithLifecycle()
+    val blurPercent by com.secure.messenger.presentation.theme.ThemePreferences.wallpaperBlur
+        .collectAsStateWithLifecycle()
     val wpDrawable = selectedWp.drawableRes ?: return  // NONE → фон не рисуем
 
-    // Выбрана картинка-обои — рисуем её на весь фон и поверх слегка затемняем
-    // полупрозрачной плашкой под цвет темы, чтобы сообщения хорошо читались.
+    // 0..100% → 0..30dp радиуса размытия. Modifier.blur работает на API 31+,
+    // на более старых — без эффекта, но крашей нет.
+    val blurRadius = (blurPercent * 0.30f).dp
+
     val extra = LocalMessengerColors.current
     Box(modifier = Modifier.fillMaxSize()) {
         androidx.compose.foundation.Image(
             painter = androidx.compose.ui.res.painterResource(wpDrawable),
             contentDescription = null,
             contentScale = ContentScale.Crop,
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier
+                .fillMaxSize()
+                .then(
+                    if (blurRadius > 0.dp) Modifier.blur(blurRadius)
+                    else Modifier
+                ),
         )
         Box(
             modifier = Modifier

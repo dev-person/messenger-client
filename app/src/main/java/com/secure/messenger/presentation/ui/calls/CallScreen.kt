@@ -37,7 +37,7 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.VideocamOff
-import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -125,6 +125,23 @@ fun CallScreen(
     val localVideo     by viewModel.localVideoTrack.collectAsStateWithLifecycle()
     val resolvedName   by viewModel.peerDisplayName.collectAsStateWithLifecycle()
     val peerAvatarUrl  by viewModel.peerAvatarUrl.collectAsStateWithLifecycle()
+
+    // Пока открыт экран звонка — кнопки громкости управляют каналом
+    // STREAM_VOICE_CALL (а не STREAM_RING, который Android по умолчанию
+    // выбирает для приложения без активного телефонного режима). Без этого
+    // прибавление громкости на громкой связи увеличивает уровень звонка,
+    // а не голоса собеседника, что выглядит как «не работает».
+    val activity = androidx.compose.ui.platform.LocalContext.current as? android.app.Activity
+    DisposableEffect(activity) {
+        val previous = activity?.volumeControlStream
+        activity?.volumeControlStream = android.media.AudioManager.STREAM_VOICE_CALL
+        onDispose {
+            // Восстанавливаем дефолтное поведение, чтобы вне звонка громкость
+            // снова управляла мультимедиа.
+            activity?.volumeControlStream =
+                previous ?: android.media.AudioManager.USE_DEFAULT_STREAM_TYPE
+        }
+    }
 
     // Защита от двойного popBackStack — onCallEnd только один раз
     var callEndHandled by remember { mutableStateOf(false) }
@@ -279,6 +296,13 @@ fun CallScreen(
                     videoTrack = track,
                     modifier = Modifier.fillMaxSize(),
                     eglBaseContext = viewModel.webRtcManager.eglBase.eglBaseContext,
+                    // Зеркалим только своё превью (фронталка) — как зеркало в
+                    // ванной. Без этого, если махнуть правой рукой, на превью
+                    // выглядит «левая», и кажется, что камера сломана. У
+                    // собеседника изображение придёт уже в нормальной
+                    // ориентации (повторно отзеркаливать нельзя — он видит
+                    // меня «как меня видят»).
+                    onTextureViewCreated = { it.setMirror(true) },
                     rendererEvents = object : RendererCommon.RendererEvents {
                         override fun onFirstFrameRendered() = Unit
                         override fun onFrameResolutionChanged(w: Int, h: Int, r: Int) = Unit
@@ -417,7 +441,7 @@ fun CallScreen(
                         onClick = viewModel::toggleMute,
                     )
                     GlassToggleButton(
-                        icon = Icons.Default.VolumeUp,
+                        icon = Icons.AutoMirrored.Filled.VolumeUp,
                         label = "Динамик",
                         active = uiState.isSpeakerOn,
                         onClick = viewModel::toggleSpeaker,

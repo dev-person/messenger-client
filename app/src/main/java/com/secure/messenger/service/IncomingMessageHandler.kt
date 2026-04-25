@@ -2,6 +2,7 @@ package com.secure.messenger.service
 
 import android.util.Base64
 import com.secure.messenger.data.local.dao.ChatDao
+import com.secure.messenger.data.local.dao.GroupSenderKeyDao
 import com.secure.messenger.data.local.dao.MessageDao
 import com.secure.messenger.data.local.dao.UserDao
 import com.secure.messenger.data.local.entities.ChatEntity
@@ -12,7 +13,9 @@ import com.secure.messenger.data.remote.websocket.SignalingMessage
 import com.secure.messenger.domain.model.MessageStatus
 import com.secure.messenger.domain.model.MessageType
 import com.secure.messenger.domain.repository.AuthRepository
+import com.secure.messenger.domain.repository.ChatRepository
 import com.secure.messenger.utils.CryptoManager
+import com.secure.messenger.utils.GroupCryptoManager
 import com.secure.messenger.utils.LocalKeyStore
 import com.squareup.moshi.Moshi
 import dagger.Lazy
@@ -37,13 +40,18 @@ class IncomingMessageHandler @Inject constructor(
     private val chatDao: ChatDao,
     private val messageDao: MessageDao,
     private val userDao: UserDao,
+    private val groupSenderKeyDao: GroupSenderKeyDao,
     private val api: MessengerApi,
     private val cryptoManager: CryptoManager,
+    private val groupCryptoManager: GroupCryptoManager,
     private val localKeyStore: LocalKeyStore,
     private val moshi: Moshi,
     // Lazy чтобы избежать циклической зависимости (AuthRepository не должна
     // тащить за собой весь handler в свой граф инициализации).
     private val authRepository: Lazy<AuthRepository>,
+    // Lazy — ChatRepository -> SignalingClient -> MessagingService -> IncomingMessageHandler
+    // нужен чтобы тянуть свежие sender-ключи при ротации.
+    private val chatRepository: Lazy<ChatRepository>,
 ) {
     private val adapter = moshi.adapter(SignalingMessage::class.java)
 
@@ -134,28 +142,35 @@ class IncomingMessageHandler @Inject constructor(
                 chatDao.incrementUnread(chatId, System.currentTimeMillis())
             }
 
+            // Групповые сообщения (1.0.68) — отдельная ветка дешифровки через sender key.
+            val chatForDecrypt = chatDao.getById(chatId)
+            val isGroup = chatForDecrypt?.type == "GROUP"
+
             // Расшифровываем — пробуем текущий приватный ключ + все legacy
             val myPrivateKeyBase64 = localKeyStore.getPrivateKey() ?: run {
                 Timber.w("IncomingMessageHandler: no local private key")
                 return null
             }
             val myPrivateKeyBytes = Base64.decode(myPrivateKeyBase64, Base64.NO_WRAP)
-            val senderPublicKeyBytes = Base64.decode(sender.publicKey, Base64.NO_WRAP)
-            val secrets = mutableListOf(
-                cryptoManager.computeSharedSecret(myPrivateKeyBytes, senderPublicKeyBytes)
-            )
-            for (legacy in localKeyStore.getLegacyPrivateKeys()) {
-                if (legacy == myPrivateKeyBase64) continue
-                runCatching {
-                    val bytes = Base64.decode(legacy, Base64.NO_WRAP)
-                    secrets.add(cryptoManager.computeSharedSecret(bytes, senderPublicKeyBytes))
-                }
-            }
-            var decryptedContent = cryptoManager.decryptMessageWithAnyKey(
-                encryptedContent, secrets, messageId,
-            )
 
-            if (decryptedContent == null) {
+            var decryptedContent: String? = if (isGroup) {
+                decryptGroupMessage(chatId, senderId, messageId, encryptedContent)
+            } else {
+                val senderPublicKeyBytes = Base64.decode(sender.publicKey, Base64.NO_WRAP)
+                val secrets = mutableListOf(
+                    cryptoManager.computeSharedSecret(myPrivateKeyBytes, senderPublicKeyBytes)
+                )
+                for (legacy in localKeyStore.getLegacyPrivateKeys()) {
+                    if (legacy == myPrivateKeyBase64) continue
+                    runCatching {
+                        val bytes = Base64.decode(legacy, Base64.NO_WRAP)
+                        secrets.add(cryptoManager.computeSharedSecret(bytes, senderPublicKeyBytes))
+                    }
+                }
+                cryptoManager.decryptMessageWithAnyKey(encryptedContent, secrets, messageId)
+            }
+
+            if (!isGroup && decryptedContent == null) {
                 // Расшифровка не удалась — отправитель мог обновить ключевую пару (перелогин).
                 // Запрашиваем актуальный публичный ключ с сервера и пробуем ещё раз.
                 val freshDto = runCatching { api.getUserById(senderId).data }.getOrNull()
@@ -182,6 +197,8 @@ class IncomingMessageHandler @Inject constructor(
                 }
                 if (decryptedContent == null) decryptedContent = "[Не удалось расшифровать]"
             }
+            // Для group-случая ветка выше не исполняется — fallback отдельно.
+            if (decryptedContent == null) decryptedContent = "[Не удалось расшифровать]"
 
             val timestamp = if (timestampStr != null) {
                 try { Instant.parse(timestampStr).toEpochMilli() } catch (_: Exception) { System.currentTimeMillis() }
@@ -295,6 +312,155 @@ class IncomingMessageHandler @Inject constructor(
     /** Помечает все сообщения от других пользователей в чате как READ, когда собеседник открывает чат. */
     suspend fun handleMessagesRead(chatId: String, readerId: String) {
         messageDao.markChatMessagesRead(chatId, readerId)
+    }
+
+    // ── Групповые сообщения (1.0.68) ─────────────────────────────────────────
+
+    /**
+     * Расшифровывает групповое сообщение. Алгоритм:
+     *  1. Ищем sender key владельца [senderId] в локальной БД — сначала тот
+     *     epoch, что сейчас у чата, потом самый свежий из имеющихся.
+     *  2. Пытаемся расшифровать — если удалось, возвращаем текст.
+     *  3. Если ключа нет или он не подошёл — тянем с сервера свежие sender
+     *     keys через [ChatRepository.refreshSenderKeys] и повторяем попытку.
+     *  4. Если и после этого не получилось — вернём null, вызывающий
+     *     поставит плашку «[Не удалось расшифровать]».
+     */
+    private suspend fun decryptGroupMessage(
+        chatId: String,
+        senderId: String,
+        messageId: String,
+        encryptedContent: String,
+    ): String? {
+        // Пробуем все имеющиеся sender keys этого отправителя по всем
+        // epoch'ам — не только текущему. Сценарий: после logout/login
+        // в БД могли остаться/появиться ключи из разных epoch'ов, и
+        // конкретное сообщение зашифровано под одним из них. Сужать
+        // поиск нельзя — иначе сообщения старых epoch'ов превращаются
+        // в плашку «не удалось расшифровать».
+        suspend fun tryWithCurrentDb(): String? {
+            for (key in groupSenderKeyDao.listByOwner(chatId, senderId)) {
+                val bytes = runCatching {
+                    Base64.decode(key.senderKey, Base64.NO_WRAP)
+                }.getOrNull() ?: continue
+                val text = groupCryptoManager.decryptGroupMessage(encryptedContent, bytes, messageId)
+                if (text != null) return text
+            }
+            return null
+        }
+
+        tryWithCurrentDb()?.let { return it }
+
+        // Промах → тянем свежие ключи (без фильтра по epoch) и повторяем.
+        runCatching {
+            chatRepository.get().refreshSenderKeys(chatId)
+        }.onFailure { e ->
+            Timber.w(e, "decryptGroupMessage: refreshSenderKeys failed for chat=$chatId")
+        }
+        return tryWithCurrentDb()
+    }
+
+    // ── События групп (1.0.68) ───────────────────────────────────────────────
+
+    suspend fun handleGroupInfoUpdated(chatId: String, title: String?, avatarUrl: String?) {
+        val chat = chatDao.getById(chatId) ?: return
+        chatDao.upsert(chat.copy(
+            title = title ?: chat.title,
+            avatarUrl = avatarUrl ?: chat.avatarUrl,
+            updatedAt = System.currentTimeMillis(),
+        ))
+    }
+
+    /**
+     * Новый участник добавлен в группу.
+     *
+     *  - Если это я — полный sync чата + забираю чужие sender-ключи + генерю
+     *    свой ключ и раздаю остальным (иначе я бы не смог отправлять).
+     *  - Если это кто-то другой — я обновляю свой epoch и отправляю ему свой
+     *    sender-ключ (чтобы новый участник мог читать мои сообщения). Ротация
+     *    своего ключа не требуется (дизайн 1.0.68 §1.2).
+     */
+    suspend fun handleGroupMemberAdded(chatId: String, userId: String, epoch: Int) {
+        val chat = chatDao.getById(chatId)
+        val myId = currentUserIdSync() ?: return
+        if (chat != null) {
+            chatDao.upsert(chat.copy(currentEpoch = epoch))
+        }
+
+        if (userId == myId) {
+            runCatching {
+                // 1. Тянем актуальные данные чата (title, members, epoch).
+                chatRepository.get().syncChats(myId)
+                // 2. Забираем чужие sender keys (ownerId=другие, recipientId=я),
+                //    чтобы потом расшифровывать их входящие сообщения.
+                chatRepository.get().refreshSenderKeys(chatId)
+                // 3. Генерим свой sender key и раздаём всем остальным участникам —
+                //    без этого шага encryptForChat падал с «Нет sender key
+                //    для группы (epoch=N)» при попытке отправить сообщение.
+                val otherMembers = chatRepository.get().getGroupMembers(chatId)
+                    .filter { it.id != myId }
+                if (otherMembers.isNotEmpty()) {
+                    chatRepository.get().uploadMySenderKey(chatId, epoch, otherMembers)
+                }
+            }
+        } else {
+            // Другого участника добавили — я существующий член. Мне нужно
+            // поделиться своим sender-ключом с новым участником, чтобы он
+            // мог расшифровать мои будущие сообщения. Ключ не ротируем —
+            // заливаем один и тот же, но под новым epoch чтобы encryptForChat
+            // находил его при отправке (ищет по currentEpoch).
+            runCatching {
+                chatRepository.get().uploadMySenderKey(
+                    chatId = chatId,
+                    epoch = epoch,
+                    recipients = chatRepository.get().getGroupMembers(chatId)
+                        .filter { it.id != myId },
+                )
+            }
+        }
+    }
+
+    suspend fun handleGroupMemberRemoved(chatId: String, userId: String, epoch: Int) {
+        val chat = chatDao.getById(chatId) ?: return
+        val myId = currentUserIdSync()
+        if (userId == myId) {
+            // Меня кикнули — чистим чат и ключи локально.
+            groupSenderKeyDao.deleteByChat(chatId)
+            chatDao.deleteById(chatId)
+            return
+        }
+        chatDao.upsert(chat.copy(currentEpoch = epoch))
+        groupSenderKeyDao.deleteByOwner(chatId, userId)
+    }
+
+    suspend fun handleGroupRoleChanged(chatId: String, userId: String, role: String) {
+        val chat = chatDao.getById(chatId) ?: return
+        val myId = currentUserIdSync()
+        if (userId == myId) {
+            // Моя роль поменялась — обновляем myRole в чате.
+            chatDao.upsert(chat.copy(myRole = role))
+        }
+        // Для других участников роль отображается только в GroupInfoScreen —
+        // там при открытии тянется getGroupMembers() c сервера, так что
+        // локально дополнительно ничего делать не нужно.
+    }
+
+    suspend fun handleGroupDeleted(chatId: String) {
+        groupSenderKeyDao.deleteByChat(chatId)
+        chatDao.deleteById(chatId)
+    }
+
+    /**
+     * Прилетел новый sender key от владельца [ownerId] под [epoch] — стягиваем
+     * его и добавляем в локальную БД. Без этого сообщения владельца в этом
+     * epoch'е расшифровать невозможно.
+     */
+    suspend fun handleGroupSenderKeyReady(chatId: String, ownerId: String, epoch: Int) {
+        runCatching {
+            chatRepository.get().refreshSenderKeys(chatId, epoch)
+        }.onFailure { e ->
+            Timber.w(e, "handleGroupSenderKeyReady: refresh failed chat=$chatId owner=$ownerId epoch=$epoch")
+        }
     }
 
     /**

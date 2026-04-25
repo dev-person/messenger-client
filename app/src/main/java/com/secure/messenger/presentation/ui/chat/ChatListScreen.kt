@@ -31,7 +31,12 @@ import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.Group
+import androidx.compose.material.icons.filled.GroupAdd
+import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -90,6 +95,7 @@ private val AvatarPalette = listOf(
 fun ChatListScreen(
     onChatClick: (chatId: String) -> Unit,
     onNewChatClick: () -> Unit = {},
+    onCreateGroupClick: () -> Unit = {},
     onProfileClick: () -> Unit = {},
     viewModel: ChatListViewModel = hiltViewModel(),
 ) {
@@ -258,17 +264,44 @@ fun ChatListScreen(
             }
         }
 
-        // FAB
-        FloatingActionButton(
-            onClick = onNewChatClick,
-            containerColor = MaterialTheme.colorScheme.primary,
-            contentColor = MaterialTheme.colorScheme.onPrimary,
-            shape = CircleShape,
+        // FAB + меню с выбором «Новый чат» / «Новая группа». Клик открывает
+        // dropdown под кнопкой; долгий тап сразу ведёт на Контакты (быстрый
+        // путь к новому direct-чату) без всплывающего меню.
+        var fabMenuExpanded by remember { mutableStateOf(false) }
+        Box(
             modifier = Modifier
                 .align(Alignment.BottomEnd)
                 .padding(24.dp),
         ) {
-            Icon(Icons.Default.Edit, contentDescription = "Новый чат")
+            FloatingActionButton(
+                onClick = { fabMenuExpanded = true },
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary,
+                shape = CircleShape,
+            ) {
+                Icon(Icons.Default.Edit, contentDescription = "Написать")
+            }
+            DropdownMenu(
+                expanded = fabMenuExpanded,
+                onDismissRequest = { fabMenuExpanded = false },
+            ) {
+                DropdownMenuItem(
+                    leadingIcon = { Icon(Icons.Default.PersonAdd, contentDescription = null) },
+                    text = { Text("Новый чат") },
+                    onClick = {
+                        fabMenuExpanded = false
+                        onNewChatClick()
+                    },
+                )
+                DropdownMenuItem(
+                    leadingIcon = { Icon(Icons.Default.GroupAdd, contentDescription = null) },
+                    text = { Text("Новая группа") },
+                    onClick = {
+                        fabMenuExpanded = false
+                        onCreateGroupClick()
+                    },
+                )
+            }
         }
 
         // Snackbar для ошибок
@@ -396,7 +429,30 @@ private fun ChatRow(
                 val isOtherUserOnline = chat.isOtherOnline
                 Box {
                     AvatarImage(url = chat.avatarUrl, name = chat.title, size = 52)
-                    if (chat.isPinned && !isTyping) {
+                    // Бейдж группы — иконка с двумя силуэтами в правом нижнем
+                    // углу. Показываем для GROUP всегда, даже если есть pin
+                    // (тип чата важнее визуально). Pin для группы передаём
+                    // через сортировку и не показываем на аватаре отдельно.
+                    if (chat.type == ChatType.GROUP) {
+                        Box(
+                            modifier = Modifier
+                                .size(20.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.surface)
+                                .padding(2.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.primary)
+                                .align(Alignment.BottomEnd),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Group,
+                                contentDescription = "Группа",
+                                tint = MaterialTheme.colorScheme.onPrimary,
+                                modifier = Modifier.size(12.dp),
+                            )
+                        }
+                    } else if (chat.isPinned && !isTyping) {
                         Box(
                             contentAlignment = Alignment.Center,
                             modifier = Modifier

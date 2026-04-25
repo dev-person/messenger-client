@@ -1,5 +1,7 @@
 # SecureMessenger — Architecture Overview
 
+> **Группы (в разработке с 1.0.68):** детальный дизайн см. [GROUPS_DESIGN.md](GROUPS_DESIGN.md) — архитектура групповых чатов, протокол Sender Keys для E2E, план на три релиза (фундамент → история → звонки).
+
 ## Project Structure
 
 ```
