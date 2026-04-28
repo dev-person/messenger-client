@@ -15,6 +15,16 @@ interface AuthRepository {
     suspend fun verifyPassword(password: String): Result<Unit>
     suspend fun deletePassword(otpCode: String): Result<Unit>
     suspend fun updateProfile(displayName: String, username: String, bio: String?): Result<User>
+
+    /**
+     * Публикует НОВЫЙ публичный ключ на сервере, не меняя профиль. Используется
+     * во время атомарной смены пароля: нужно опубликовать новый pubKey ДО того
+     * как локально перезаписать keypair, чтобы при отказе сервера откатиться.
+     * Без [publicKey] метод не имеет смысла — для публикации текущего pubKey
+     * есть [updateProfile].
+     */
+    suspend fun publishPublicKey(publicKey: String): Result<Unit>
+
     suspend fun uploadAvatar(imageBytes: ByteArray, extension: String): Result<User>
     suspend fun logout()
     fun isLoggedIn(): Boolean

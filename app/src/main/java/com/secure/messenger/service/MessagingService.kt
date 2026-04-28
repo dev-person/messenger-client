@@ -60,7 +60,13 @@ class MessagingService : Service() {
         const val ACTION_FORCE_LOGOUT = "com.secure.messenger.FORCE_LOGOUT"
         const val CHANNEL_CALL    = "call_channel"    // входящий звонок — максимальный приоритет
         const val CHANNEL_MESSAGE = "message_channel" // новое сообщение
-        const val NOTIF_ID_CALL   = 1001              // уведомление о звонке (одно, заменяется)
+        const val NOTIF_ID_CALL       = 1001          // уведомление о 1-1 звонке
+        const val NOTIF_ID_GROUP_CALL = 1002          // уведомление о групповом звонке
+
+        /** Extra-ключи для Intent уведомления группового звонка. */
+        const val EXTRA_GROUP_CALL_CHAT_ID = "group_call_chat_id"
+        const val EXTRA_GROUP_CALL_ID      = "group_call_id"
+        const val EXTRA_GROUP_CALL_VIDEO   = "group_call_video"
     }
 
     override fun onCreate() {
@@ -151,6 +157,13 @@ class MessagingService : Service() {
                     is SignalingEvent.GroupSenderKeyReady -> scope.launch {
                         incomingMessageHandler.handleGroupSenderKeyReady(event.chatId, event.ownerId, event.epoch)
                     }
+                    is SignalingEvent.GroupCallInvite -> scope.launch {
+                        showGroupCallNotification(event)
+                    }
+                    is SignalingEvent.GroupCallEnded -> {
+                        // Убираем notification если она ещё висит
+                        nm.cancel(NOTIF_ID_GROUP_CALL)
+                    }
                     else -> Unit
                 }
             }
@@ -186,7 +199,10 @@ class MessagingService : Service() {
         // Не показываем уведомление когда приложение на переднем плане —
         // пользователь уже видит сообщения в UI
         if (com.secure.messenger.MessengerApp.isInForeground) return
-        showMessageNotification(senderName = info.first, content = info.second)
+        // Приглушённый чат — пуш не показываем (FcmService применяет ту же
+        // логику для FCM-пути; тут симметрично для WS-пути).
+        if (com.secure.messenger.data.local.MutedChatsPrefs.isMuted(this, info.third)) return
+        showMessageNotification(senderName = info.first, content = info.second, chatId = info.third)
     }
 
     // ── Уведомления ───────────────────────────────────────────────────────────
@@ -213,9 +229,18 @@ class MessagingService : Service() {
         )
         wl.acquire(5 * 60_000L) // auto-release matches notification timeout (5 min)
 
+        // Кладём данные звонка в extras, чтобы MainActivity при тапе на
+        // notification могла открыть CallScreen напрямую (без зависимости от
+        // того, успел ли CallRepository подхватить WS-event incoming_call).
+        val callIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(FcmService.EXTRA_INCOMING_CALL_ID, event.callId)
+            putExtra(FcmService.EXTRA_INCOMING_CALLER_ID, event.callerId)
+            putExtra(FcmService.EXTRA_INCOMING_CALL_VIDEO, event.isVideo)
+            putExtra(FcmService.EXTRA_INCOMING_CALLER_NAME, callerName)
+        }
         val openIntent = PendingIntent.getActivity(
-            this, NOTIF_ID_CALL,
-            Intent(this, MainActivity::class.java),
+            this, NOTIF_ID_CALL, callIntent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
 
@@ -237,11 +262,103 @@ class MessagingService : Service() {
         nm.notify(NOTIF_ID_CALL, builder.build())
     }
 
+    /**
+     * Уведомление о групповом звонке. Тап → MainActivity с extras → она
+     * пушит на GroupCallScreen с existingCallId. Показываем full-screen
+     * intent (как у 1-1 звонка), чтобы экран загорелся даже из заблокированного
+     * состояния.
+     *
+     * [event.invitedUserIds] управляет рингтоном: если меня нет в списке —
+     * звонок инициировался не для меня (инициатор выбрал других участников
+     * группы), full-screen / звук пропускаем. Плашку «Идёт звонок» в чате
+     * пользователь всё равно увидит — она строится из active-call поллинга,
+     * а не из этой нотификации.
+     */
+    @Suppress("DEPRECATION")
+    private suspend fun showGroupCallNotification(event: SignalingEvent.GroupCallInvite) {
+        val myId = incomingMessageHandler.currentUserIdSync()
+        // Если инициатор явно перечислил приглашённых и меня там нет — не звоним.
+        // Пустой список = «всем» (бэкап для старых клиентов или старт без выбора).
+        if (event.invitedUserIds.isNotEmpty() && myId != null && myId !in event.invitedUserIds) {
+            return
+        }
+
+        val isVideo = event.type == "VIDEO"
+
+        // Если приложение уже открыто — не показываем notification со
+        // звонком: она скрывается под текущим экраном и выглядит как обычный
+        // пуш. Вместо этого сразу запускаем MainActivity с extras — UI
+        // навигирует на GroupCallScreen и показывает pre-join overlay
+        // (большие кнопки «Принять/Отклонить»). Background-кейс остаётся
+        // как был — full-screen notification + рингтон.
+        if (com.secure.messenger.MessengerApp.isInForeground) {
+            val launchIntent = Intent(
+                this, com.secure.messenger.presentation.ui.main.MainActivity::class.java,
+            ).apply {
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_NEW_TASK
+                putExtra(EXTRA_GROUP_CALL_CHAT_ID, event.chatId)
+                putExtra(EXTRA_GROUP_CALL_ID, event.callId)
+                putExtra(EXTRA_GROUP_CALL_VIDEO, isVideo)
+            }
+            startActivity(launchIntent)
+            return
+        }
+
+        val starterName = incomingMessageHandler.getDisplayName(event.startedBy)
+
+        // Wake lock — как для 1-1 звонка, чтобы экран загорелся
+        val pm = getSystemService(android.os.PowerManager::class.java)
+        val wl = pm.newWakeLock(
+            android.os.PowerManager.FULL_WAKE_LOCK or android.os.PowerManager.ACQUIRE_CAUSES_WAKEUP,
+            "messenger:incoming_group_call_wake",
+        )
+        wl.acquire(5 * 60_000L)
+
+        val openIntent = android.app.PendingIntent.getActivity(
+            this, NOTIF_ID_GROUP_CALL,
+            Intent(this, com.secure.messenger.presentation.ui.main.MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                putExtra(EXTRA_GROUP_CALL_CHAT_ID, event.chatId)
+                putExtra(EXTRA_GROUP_CALL_ID, event.callId)
+                putExtra(EXTRA_GROUP_CALL_VIDEO, isVideo)
+            },
+            android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+
+        val ringtoneUri = android.media.RingtoneManager.getDefaultUri(
+            android.media.RingtoneManager.TYPE_RINGTONE,
+        )
+
+        val notification = NotificationCompat.Builder(this, CHANNEL_CALL)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(if (isVideo) "Групповой видеозвонок" else "Групповой звонок")
+            .setContentText("$starterName приглашает в групповой звонок")
+            .setContentIntent(openIntent)
+            .setFullScreenIntent(openIntent, true)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setVibrate(longArrayOf(0, 500, 300, 500, 300, 500))
+            .setSound(ringtoneUri)
+            .setAutoCancel(true)
+            .setTimeoutAfter(5 * 60_000L)
+            .build()
+
+        nm.notify(NOTIF_ID_GROUP_CALL, notification)
+    }
+
     /** Всплывающее уведомление о новом сообщении с вибрацией. */
-    private fun showMessageNotification(senderName: String, content: String) {
+    private fun showMessageNotification(senderName: String, content: String, chatId: String) {
+        // Уникальный requestCode и SINGLE_TOP — иначе разные чаты делят один
+        // PendingIntent и тап открывает не тот чат.
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(FcmService.EXTRA_OPEN_CHAT_ID, chatId)
+        }
         val openIntent = PendingIntent.getActivity(
-            this, senderName.hashCode(),
-            Intent(this, MainActivity::class.java),
+            this, chatId.hashCode(),
+            intent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
 
@@ -268,7 +385,10 @@ class MessagingService : Service() {
             .setPublicVersion(publicNotification)
             .build()
 
-        nm.notify(senderName.hashCode(), notification)
+        // ID на чат, а не на отправителя — иначе два разных чата от одного
+        // и того же юзера перезаписывали бы друг друга, а в группе все
+        // сообщения летят под одним «отправителем» = группой.
+        nm.notify(chatId.hashCode(), notification)
     }
 
     // ── Создание каналов уведомлений (идемпотентно) ────────────────────────────

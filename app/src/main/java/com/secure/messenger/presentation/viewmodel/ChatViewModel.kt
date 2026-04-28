@@ -45,7 +45,18 @@ data class ChatUiState(
     val editingMessage: Message? = null,
     val replyingTo: Message? = null,
     val isLoadingOlder: Boolean = false,
-    val hasOlderMessages: Boolean = true,
+    /**
+     * true пока init-fetch первой страницы сообщений не завершён И в локальном
+     * кеше пусто. UI в этом окне рисует skeleton вместо плашки «нет сообщений»,
+     * иначе при открытии чата с холодным кешем мелькает фолбэк-пустота.
+     */
+    val isInitialLoading: Boolean = true,
+    // По умолчанию считаем что старее нет — иначе при открытии чата с малой
+    // историей предикат пагинации `lastVisible >= size-5` неизбежно срабатывает
+    // ДО того, как асинхронный fetchMessages успеет выставить флаг в false,
+    // и юзер видит ложный спиннер «загружаю старые». Фетч-цикл в init
+    // включит флаг обратно, если сервер реально вернул полную страницу.
+    val hasOlderMessages: Boolean = false,
     val showEmojiPicker: Boolean = false,
 )
 
@@ -57,8 +68,11 @@ class ChatViewModel @Inject constructor(
     private val sendMessageUseCase: SendMessageUseCase,
     authRepository: AuthRepository,
     private val userDao: UserDao,
+    private val messageDao: com.secure.messenger.data.local.dao.MessageDao,
+    private val callRepository: com.secure.messenger.domain.repository.CallRepository,
     private val signalingClient: SignalingClient,
     private val soundManager: SoundManager,
+    private val localKeyStore: com.secure.messenger.utils.LocalKeyStore,
 ) : ViewModel() {
 
     private val voiceRecorder = VoiceRecorder(context)
@@ -70,17 +84,68 @@ class ChatViewModel @Inject constructor(
         .map { it?.id }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
+    /** Мой публичный ключ — для отображения safety code в профиле собеседника. */
+    val myPublicKey: String? get() = localKeyStore.getPublicKey()
+
     // Список сообщений текущего чата — обновляется в реальном времени через WebSocket
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     val messages: StateFlow<List<Message>> = displayLimit
         .flatMapLatest { limit -> chatRepository.observeMessages(chatId, limit) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    // Метаданные текущего чата (название, аватар, участники) — для отображения в шапке экрана
+    // Метаданные текущего чата (название, аватар, участники) — для отображения в шапке экрана.
+    // SharingStarted.Eagerly: flow стартует сразу при создании VM (не ждёт subscriber'а),
+    // так что к моменту первой композиции ChatTopBar чат уже подгружен из локальной БД
+    // и шапка не мелькает фолбэком «Чат».
     val chatInfo: StateFlow<Chat?> = chatRepository
         .observeChats()
         .map { list -> list.find { it.id == chatId } }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
+    /**
+     * Активный 1-1 звонок (любой), независимо от того, в каком чате он идёт.
+     * Если звонок есть и юзер свернул его back-кнопкой / PiP'ом — ChatScreen
+     * показывает плашку «Идёт звонок · вернуться» под своей шапкой.
+     */
+    val activeCall: StateFlow<com.secure.messenger.domain.model.Call?> =
+        callRepository.activeCall
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    /**
+     * Активный групповой звонок в этом чате (если идёт). Используется для
+     * плашки «Идёт звонок · присоединиться» над списком сообщений.
+     * null = никакого звонка нет.
+     */
+    private val _activeGroupCall = MutableStateFlow<com.secure.messenger.data.remote.api.dto.GroupCallDto?>(null)
+    val activeGroupCall: StateFlow<com.secure.messenger.data.remote.api.dto.GroupCallDto?> =
+        _activeGroupCall.asStateFlow()
+
+    init {
+        // Подтягиваем актуальное состояние при открытии чата
+        viewModelScope.launch {
+            runCatching { chatRepository.getActiveGroupCall(chatId).getOrNull() }
+                .onSuccess { _activeGroupCall.value = it }
+        }
+        // Слушаем WS-события — invite/ended — чтобы плашка появлялась/исчезала live
+        viewModelScope.launch {
+            signalingClient.events.collect { event ->
+                when (event) {
+                    is com.secure.messenger.data.remote.websocket.SignalingEvent.GroupCallInvite ->
+                        if (event.chatId == chatId) {
+                            // Подтягиваем полный объект с участниками
+                            runCatching {
+                                chatRepository.getActiveGroupCall(chatId).getOrNull()
+                            }.onSuccess { _activeGroupCall.value = it }
+                        }
+                    is com.secure.messenger.data.remote.websocket.SignalingEvent.GroupCallEnded ->
+                        if (_activeGroupCall.value?.id == event.callId) {
+                            _activeGroupCall.value = null
+                        }
+                    else -> Unit
+                }
+            }
+        }
+    }
 
     // Онлайн-статус собеседника — реактивно из Room (обновляется через WebSocket user_status)
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
@@ -125,16 +190,25 @@ class ChatViewModel @Inject constructor(
     val groupMembers: StateFlow<List<User>> = _groupMembers.asStateFlow()
 
     init {
+        // Список участников читаем реактивно из локального кеша (chat_members
+        // JOIN users) — UI получает данные мгновенно при открытии чата, без
+        // ожидания сети. Сетевой refresh запускаем отдельно и без UI-спиннера:
+        // его результат сам прольётся в Flow через chatMemberDao.
+        viewModelScope.launch {
+            chatRepository.observeGroupMembers(chatId).collect { members ->
+                _groupMembers.value = members
+            }
+        }
         viewModelScope.launch {
             chatInfo
                 .filterNotNull()
                 .filter { it.type == ChatType.GROUP }
-                // Пересчитываем при смене chatId или epoch'а — больше ничего
-                // не должно триггерить лишний REST-запрос.
                 .distinctUntilChangedBy { it.id to it.currentEpoch }
                 .collect { chat ->
                     runCatching { chatRepository.getGroupMembers(chat.id) }
-                        .onSuccess { _groupMembers.value = it }
+                        .onFailure { e ->
+                            Timber.w(e, "ChatViewModel: refresh group members failed")
+                        }
                 }
         }
     }
@@ -189,11 +263,66 @@ class ChatViewModel @Inject constructor(
     private val _inputText = MutableStateFlow("")
     val inputText: StateFlow<String> = _inputText.asStateFlow()
 
+    /**
+     * Память «этот чат точно пустой» — флаг ставится после успешного
+     * fetchMessages вернувшего 0 сообщений, чистится при первом непустом
+     * messages.collect. Без него юзер при каждом повторном открытии пустого
+     * чата видел skeleton ~800мс пока сеть не вернула очередной []. Теперь
+     * skeleton показываем только при первом холодном открытии.
+     */
+    private val knownEmptyPrefs = context.getSharedPreferences(
+        "chats_known_empty", Context.MODE_PRIVATE,
+    )
+    private val isKnownEmpty: Boolean = knownEmptyPrefs.getBoolean(chatId, false)
+
     init {
-        // Загружаем историю сообщений с сервера при открытии чата (+ синхронизация удалений)
+        // Если уже знаем что чат пустой — не показываем skeleton, сразу
+        // EmptyChatHint. Это убирает мерцание при повторных открытиях.
+        if (isKnownEmpty) {
+            _uiState.value = _uiState.value.copy(isInitialLoading = false)
+        }
+
+        // Загружаем историю сообщений с сервера при открытии чата (+ синхронизация удалений).
+        // Если сервер вернул меньше страницы — отключаем флаг hasOlderMessages,
+        // чтобы LazyColumn в чатах с малым числом сообщений не показывал ложный
+        // спиннер «загружаю старые» при первой же отрисовке.
         viewModelScope.launch {
-            chatRepository.fetchMessages(chatId).onFailure { e ->
-                Timber.e(e, "fetchMessages failed for chatId=$chatId")
+            chatRepository.fetchMessages(chatId)
+                .onSuccess { hasMore ->
+                    // Включаем пагинацию только если сервер реально вернул
+                    // полную страницу (есть смысл фетчить старее).
+                    _uiState.value = _uiState.value.copy(
+                        hasOlderMessages = hasMore,
+                        isInitialLoading = false,
+                    )
+                    // Если после успешного fetch'а локально 0 сообщений — чат
+                    // действительно пустой, помечаем чтобы при следующем открытии
+                    // не светить skeleton'ом.
+                    if (messages.value.isEmpty()) {
+                        knownEmptyPrefs.edit().putBoolean(chatId, true).apply()
+                    }
+                }
+                .onFailure { e ->
+                    Timber.e(e, "fetchMessages failed for chatId=$chatId")
+                    _uiState.value = _uiState.value.copy(isInitialLoading = false)
+                }
+        }
+        // Снимаем skeleton как только в БД появилось хотя бы одно сообщение,
+        // и тут же снимаем флаг known-empty (оказался не пустой).
+        viewModelScope.launch {
+            messages.filter { it.isNotEmpty() }.first()
+            knownEmptyPrefs.edit().remove(chatId).apply()
+            if (_uiState.value.isInitialLoading) {
+                _uiState.value = _uiState.value.copy(isInitialLoading = false)
+            }
+        }
+        // Hard timeout: skeleton не должен висеть дольше 800мс. Если сеть
+        // тормозит и в кеше пусто — лучше показать EmptyChatHint, чем держать
+        // юзера на пустом скелетоне неопределённо долго.
+        viewModelScope.launch {
+            kotlinx.coroutines.delay(800)
+            if (_uiState.value.isInitialLoading) {
+                _uiState.value = _uiState.value.copy(isInitialLoading = false)
             }
         }
         // Помечаем все сообщения как прочитанные при открытии чата
@@ -577,12 +706,24 @@ class ChatViewModel @Inject constructor(
         }
     }
 
-    /** Подгружает старые сообщения (вызывается при скролле вверх) */
+    /** Подгружает старые сообщения (вызывается при скролле вверх).
+     *
+     *  Логика двухуровневая:
+     *  1. Если в локальной БД есть сообщения СТАРЕЕ самого старого видимого
+     *     — просто увеличиваем displayLimit, observeMessages эмитит больше.
+     *     Без сетевого запроса.
+     *  2. Если локально дальше нечего — идём в сеть за следующей страницей,
+     *     если сервер ранее сообщал что страницы есть (hasOlderMessages).
+     *
+     *  Раньше шаг 1 пропускался (всегда лезли в сеть), и при `hasOlderMessages
+     *  = false` пагинация вообще не работала — даже если в БД лежали старые
+     *  сообщения от прошлой сессии. Юзер видел только 20 свежих.
+     */
     private var lastLoadOlderFailedAt = 0L
 
     fun loadOlderMessages() {
         val state = _uiState.value
-        if (state.isLoadingOlder || !state.hasOlderMessages) return
+        if (state.isLoadingOlder) return
         // Защита от retry-шторма: если предыдущая попытка упала меньше 3
         // секунд назад — не пытаемся снова (иначе при 503 от nginx firstVisible=0
         // триггерит подгрузку в цикле, и мы долбим сервер).
@@ -592,9 +733,33 @@ class ChatViewModel @Inject constructor(
         _uiState.value = state.copy(isLoadingOlder = true)
 
         viewModelScope.launch {
+            val localOlderCount = runCatching {
+                messageDao.countOlderThan(chatId, oldest.timestamp)
+            }.getOrDefault(0)
+
+            // Локально есть старее — РАСШИРЯЕМ ОКНО мгновенно. Юзер видит
+            // продолжение списка без сетевой задержки.
+            if (localOlderCount > 0) {
+                displayLimit.value += PAGE_SIZE
+                _uiState.value = _uiState.value.copy(isLoadingOlder = false)
+            }
+
+            // Параллельно (или вместо, если локально было пусто) идём в сеть.
+            // Это нужно для синхронизации удалений: если на той стороне юзер
+            // что-то удалил пока меня не было онлайн, fetchOlderMessages
+            // увидит это в diff'е по диапазону и подтянет состояние сервера.
+            // hasOlderMessages — подсказка от прошлого fetch'а; даже если он
+            // false, дёрнуть один раз сверх кеша имеет смысл (sync deletions).
+            val shouldFetchNetwork = state.hasOlderMessages || localOlderCount == 0
+            if (!shouldFetchNetwork) return@launch
+
             chatRepository.fetchOlderMessages(chatId, oldest.timestamp)
                 .onSuccess { hasMore ->
-                    displayLimit.value += PAGE_SIZE
+                    // Если ОКНО ещё не расширили (localOlderCount == 0) — расширяем
+                    // теперь, после прихода данных. Иначе уже расширено выше.
+                    if (localOlderCount == 0) {
+                        displayLimit.value += PAGE_SIZE
+                    }
                     _uiState.value = _uiState.value.copy(isLoadingOlder = false, hasOlderMessages = hasMore)
                 }
                 .onFailure { e ->

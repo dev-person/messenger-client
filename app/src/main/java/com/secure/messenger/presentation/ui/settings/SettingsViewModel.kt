@@ -19,6 +19,7 @@ import com.secure.messenger.utils.CryptoManager
 import com.secure.messenger.utils.LegacyKeyManager
 import com.secure.messenger.utils.LocalKeyStore
 import com.secure.messenger.utils.UpdateManager
+import timber.log.Timber
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -237,18 +238,19 @@ class SettingsViewModel @Inject constructor(
                     val phone = user?.phone ?: return@launch
                     val userId = user.id
 
-                    // Выводим ключ из пароля
-                    val (publicKey, privateKey) = cryptoManager.deriveKeyPairFromPassword(phone, password)
+                    // Сначала тянем legacy-blob, чтобы узнать KDF (v1/v2) — этой
+                    // же KDF выводим identity-keypair, иначе получим другой
+                    // keypair и переписка не расшифруется.
+                    val kdfVersion = legacyKeyManager.downloadAndSaveLegacyKeys(phone, password)
+                    val (publicKey, privateKey) = legacyKeyManager.deriveIdentityKeypair(
+                        kdfVersion, phone, password,
+                    )
                     val publicKeyBase64 = Base64.encodeToString(publicKey, Base64.NO_WRAP)
                     val privateKeyBase64 = Base64.encodeToString(privateKey, Base64.NO_WRAP)
                     localKeyStore.saveKeyPair(publicKeyBase64, privateKeyBase64, fromPassword = true)
                     localKeyStore.setOwner(userId)
 
                     authRepository.updateProfile(displayName = "", username = "", bio = null)
-
-                    // Скачиваем с сервера legacy-ключи — для расшифровки сообщений,
-                    // зашифрованных более ранними (до текущего пароля) ключами
-                    legacyKeyManager.downloadAndSaveLegacyKeys(phone, password)
 
                     // Пересинхронизируем — decryptOrKeepExisting сохранит ранее
                     // расшифрованные сообщения и попробует расшифровать неудачные новым ключом
@@ -303,11 +305,37 @@ class SettingsViewModel @Inject constructor(
             _uiState.value = _uiState.value.copy(unlockLoading = true)
             authRepository.deletePassword(code)
                 .onSuccess {
+                    // Сохраняем старый keypair на случай отката если publish упадёт.
+                    val oldPub = localKeyStore.getPublicKey()
+                    val oldPriv = localKeyStore.getPrivateKey()
+
                     val (publicKey, privateKey) = cryptoManager.generateKeyPair()
                     val publicKeyBase64 = Base64.encodeToString(publicKey, Base64.NO_WRAP)
                     val privateKeyBase64 = Base64.encodeToString(privateKey, Base64.NO_WRAP)
+
+                    // Атомарно: сначала publish на сервер, и только потом
+                    // перезаписываем локальный keypair. При отказе сервера —
+                    // ничего не меняем локально.
+                    val publishResult = authRepository.publishPublicKey(publicKeyBase64)
+                    if (publishResult.isFailure) {
+                        _uiState.value = _uiState.value.copy(
+                            unlockError = "Ключ удалён, но не удалось опубликовать новый. Повторите позже.",
+                            unlockLoading = false,
+                        )
+                        Timber.e(publishResult.exceptionOrNull(), "deleteKey: publishKey failed")
+                        return@onSuccess
+                    }
                     localKeyStore.saveKeyPair(publicKeyBase64, privateKeyBase64)
-                    authRepository.updateProfile(displayName = "", username = "", bio = null)
+                    // Старый ключ кладём в legacy — он бесполезен без пароля,
+                    // но если юзер передумает (например, удалил по ошибке —
+                    // legacy-blob ещё на сервере), сообщения хотя бы локально
+                    // расшифровываются.
+                    if (oldPriv != null) {
+                        localKeyStore.addLegacyPrivateKey(oldPriv)
+                    }
+                    // Подавляем неиспользуемую переменную (на будущее — может
+                    // пригодиться для rollback логики).
+                    @Suppress("UNUSED_VARIABLE") val _unused = oldPub
 
                     _uiState.value = _uiState.value.copy(
                         showUnlockDialog = false,
@@ -381,61 +409,103 @@ class SettingsViewModel @Inject constructor(
             _uiState.value = _uiState.value.copy(passwordLoading = true)
 
             val oldPwd = state.oldPassword.ifEmpty { null }
-            authRepository.setPassword(state.newPassword, oldPwd)
-                .onSuccess {
-                    // Получаем телефон текущего пользователя
-                    val user = authRepository.currentUser.first()
-                    val phone = user?.phone ?: return@launch
 
-                    // Приватный ключ ДО смены пароля — его нужно сохранить как
-                    // legacy, чтобы старые сообщения (зашифрованные им) можно
-                    // было расшифровать после ротации ключа.
-                    val prevPrivateKey = localKeyStore.getPrivateKey()
+            // Атомарная схема: каждый шаг МОЖЕТ упасть, и чтобы не оставить
+            // юзера в полу-сломанном состоянии (server-side новый ключ есть,
+            // local нет; либо наоборот) — сначала всё, что может ломаться
+            // на сервере, потом локальные изменения, потом «подчистка»
+            // legacy-blob. Если сервер отказал на любом из критичных шагов —
+            // НИЧЕГО не меняем локально и сообщаем юзеру об ошибке.
 
-                    // Генерируем новый ключ из телефон+новый_пароль
-                    val (publicKey, privateKey) = cryptoManager.deriveKeyPairFromPassword(phone, state.newPassword)
-                    val publicKeyBase64 = Base64.encodeToString(publicKey, Base64.NO_WRAP)
-                    val privateKeyBase64 = Base64.encodeToString(privateKey, Base64.NO_WRAP)
-                    localKeyStore.saveKeyPair(publicKeyBase64, privateKeyBase64, fromPassword = true)
+            // 1. Установить пароль на сервере (валидирует старый пароль)
+            val setPwdResult = authRepository.setPassword(state.newPassword, oldPwd)
+            if (setPwdResult.isFailure) {
+                _uiState.value = _uiState.value.copy(
+                    passwordError = setPwdResult.exceptionOrNull()?.message ?: "Ошибка",
+                    passwordLoading = false,
+                )
+                return@launch
+            }
 
-                    // Загружаем новый публичный ключ на сервер
-                    authRepository.updateProfile(displayName = "", username = "", bio = null)
+            val user = authRepository.currentUser.first()
+            val phone = user?.phone
+            if (phone == null) {
+                _uiState.value = _uiState.value.copy(
+                    passwordError = "Профиль не загружен",
+                    passwordLoading = false,
+                )
+                return@launch
+            }
 
-                    // Ротация legacy-blob:
-                    //  - Если был старый пароль — существующий blob зашифрован им,
-                    //    перешифровываем его новым + добавляем prevPrivateKey.
-                    //  - Если это первая установка пароля (oldPwd=null) — prevPrivateKey
-                    //    это случайный ключ из «беспарольного» периода, его надо
-                    //    сохранить как legacy.
-                    if (prevPrivateKey != null) {
-                        if (oldPwd != null) {
-                            legacyKeyManager.rotateLegacyKeysOnPasswordChange(
-                                phone = phone,
-                                oldPassword = oldPwd,
-                                newPassword = state.newPassword,
-                                currentPrivateKeyBase64 = prevPrivateKey,
-                            )
-                        } else {
-                            legacyKeyManager.uploadCurrentKeyAsLegacy(
-                                currentRandomPrivateKeyBase64 = prevPrivateKey,
-                                phone = phone,
-                                password = state.newPassword,
-                            )
-                        }
+            // 2. Старый приватный — нам нужен и для legacy-blob'а (если был
+            //    старый пароль), и чтобы сохранить его в legacy после ротации.
+            val prevPrivateKey = localKeyStore.getPrivateKey()
+
+            // 3. Сгенерировать новую пару ключей В ПАМЯТИ — пока никуда не
+            //    сохраняем. Если что-то ниже упадёт, локально всё остаётся
+            //    как было. Всегда Argon2id (v2) — после смены пароля юзер
+            //    автоматически мигрирует с PBKDF2 (если был на v1).
+            val (newPubKey, newPrivKey) = cryptoManager.deriveKeyPairFromPasswordV2(
+                phone, state.newPassword,
+            )
+            val newPubBase64 = Base64.encodeToString(newPubKey, Base64.NO_WRAP)
+            val newPrivBase64 = Base64.encodeToString(newPrivKey, Base64.NO_WRAP)
+
+            // 4. КРИТИЧЕСКИЙ ШАГ: опубликовать новый publicKey на сервере.
+            //    Если этот шаг упадёт — все наши будущие сообщения собеседники
+            //    зашифруют под СТАРЫЙ pubKey (а у нас будет новый privKey),
+            //    и расшифровка провалится. Поэтому — сначала publish, и только
+            //    потом перезаписываем локальный keypair.
+            val publishResult = authRepository.publishPublicKey(newPubBase64)
+            if (publishResult.isFailure) {
+                _uiState.value = _uiState.value.copy(
+                    passwordError = "Не удалось опубликовать новый ключ. " +
+                        "Пароль изменён, но повторите смену пароля чтобы " +
+                        "обновить ключ шифрования.",
+                    passwordLoading = false,
+                )
+                Timber.e(publishResult.exceptionOrNull(), "changePassword: publishKey failed")
+                return@launch
+            }
+
+            // 5. Локально сохраняем новый keypair и кладём старый в legacy-list.
+            //    Эти операции не сетевые — практически не падают.
+            localKeyStore.saveKeyPair(newPubBase64, newPrivBase64, fromPassword = true)
+            if (prevPrivateKey != null) {
+                localKeyStore.addLegacyPrivateKey(prevPrivateKey)
+            }
+
+            // 6. Обновить legacy-blob на сервере (для recovery при логине
+            //    на новом устройстве). Если это упадёт — не критично:
+            //    локально у нас ВСЁ есть, мы можем общаться. Просто на новом
+            //    устройстве не подтянутся самые свежие legacy-ключи. Логируем
+            //    warning и продолжаем.
+            if (prevPrivateKey != null) {
+                runCatching {
+                    if (oldPwd != null) {
+                        legacyKeyManager.rotateLegacyKeysOnPasswordChange(
+                            phone = phone,
+                            oldPassword = oldPwd,
+                            newPassword = state.newPassword,
+                            currentPrivateKeyBase64 = prevPrivateKey,
+                        )
+                    } else {
+                        legacyKeyManager.uploadCurrentKeyAsLegacy(
+                            currentRandomPrivateKeyBase64 = prevPrivateKey,
+                            phone = phone,
+                            password = state.newPassword,
+                        )
                     }
+                }.onFailure {
+                    Timber.w(it, "changePassword: legacy blob upload failed (recoverable)")
+                }
+            }
 
-                    _uiState.value = _uiState.value.copy(
-                        showPasswordDialog = false,
-                        passwordLoading = false,
-                    )
-                    Toast.makeText(appContext, "Пароль изменён", Toast.LENGTH_SHORT).show()
-                }
-                .onFailure { e ->
-                    _uiState.value = _uiState.value.copy(
-                        passwordError = e.message ?: "Ошибка",
-                        passwordLoading = false,
-                    )
-                }
+            _uiState.value = _uiState.value.copy(
+                showPasswordDialog = false,
+                passwordLoading = false,
+            )
+            Toast.makeText(appContext, "Пароль изменён", Toast.LENGTH_SHORT).show()
         }
     }
 

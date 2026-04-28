@@ -28,6 +28,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Block
+import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Favorite
@@ -242,6 +243,7 @@ fun ChatListScreen(
             } else if (chats.isEmpty()) {
                 EmptyChatList(modifier = Modifier.weight(1f))
             } else {
+                val activeCallChats by viewModel.activeCallChats.collectAsStateWithLifecycle()
                 LazyColumn(
                     modifier = Modifier
                         .fillMaxSize()
@@ -253,7 +255,17 @@ fun ChatListScreen(
                             chat = chat,
                             currentUserId = currentUser?.id,
                             isTyping = chat.id in typingChats,
-                            onClick = { onChatClick(chat.id) },
+                            hasActiveGroupCall = chat.id in activeCallChats,
+                            onClick = {
+                                // Eager prefetch: запускаем fetchMessages в момент
+                                // тапа, не дожидаясь монтирования ChatScreen. Пока
+                                // Compose навигирует, сетевой запрос уже летит —
+                                // и к моменту когда ChatViewModel.init вызовет тот
+                                // же fetchMessages, кеш либо уже наполнен, либо
+                                // запрос на полпути. Видим сообщения почти сразу.
+                                viewModel.prefetchChat(chat.id)
+                                onChatClick(chat.id)
+                            },
                             onDeleteChat = { viewModel.deleteChat(chat.id) },
                             onBlockUser = {
                                 chat.otherUserId?.let { userId -> viewModel.blockUser(userId) }
@@ -395,6 +407,7 @@ private fun ChatRow(
     chat: Chat,
     currentUserId: String?,
     isTyping: Boolean,
+    hasActiveGroupCall: Boolean = false,
     onClick: () -> Unit,
     onDeleteChat: () -> Unit,
     onBlockUser: () -> Unit,
@@ -434,23 +447,62 @@ private fun ChatRow(
                     // (тип чата важнее визуально). Pin для группы передаём
                     // через сортировку и не показываем на аватаре отдельно.
                     if (chat.type == ChatType.GROUP) {
-                        Box(
-                            modifier = Modifier
-                                .size(20.dp)
-                                .clip(CircleShape)
-                                .background(MaterialTheme.colorScheme.surface)
-                                .padding(2.dp)
-                                .clip(CircleShape)
-                                .background(MaterialTheme.colorScheme.primary)
-                                .align(Alignment.BottomEnd),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Group,
-                                contentDescription = "Группа",
-                                tint = MaterialTheme.colorScheme.onPrimary,
-                                modifier = Modifier.size(12.dp),
-                            )
+                        // Если в группе сейчас идёт звонок — заменяем иконку
+                        // силуэтов зелёной телефонной трубкой (пульсирующей),
+                        // чтобы юзер сразу видел «здесь звонок» в списке чатов.
+                        // Анимацию rememberInfiniteTransition запускаем ТОЛЬКО для
+                        // группы с активным звонком: каждый infiniteTransition
+                        // регистрирует frame callback ~60fps, и для списка из
+                        // 10+ групп без звонка это даёт ощутимый jank при заходе
+                        // на экран (особенно при возврате из чата).
+                        if (hasActiveGroupCall) {
+                            val callPulse by rememberInfiniteTransition(label = "call-pulse")
+                                .animateFloat(
+                                    initialValue = 0.85f,
+                                    targetValue = 1.15f,
+                                    animationSpec = infiniteRepeatable(
+                                        animation = tween(800, easing = FastOutSlowInEasing),
+                                        repeatMode = RepeatMode.Reverse,
+                                    ),
+                                    label = "pulse",
+                                )
+                            Box(
+                                modifier = Modifier
+                                    .size((20 * callPulse).dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.surface)
+                                    .padding(2.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFF4CAF50))
+                                    .align(Alignment.BottomEnd),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Call,
+                                    contentDescription = "Идёт звонок",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(12.dp),
+                                )
+                            }
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .size(20.dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.surface)
+                                    .padding(2.dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.primary)
+                                    .align(Alignment.BottomEnd),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Group,
+                                    contentDescription = "Группа",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(12.dp),
+                                )
+                            }
                         }
                     } else if (chat.isPinned && !isTyping) {
                         Box(
@@ -527,7 +579,7 @@ private fun ChatRow(
                                 "печатает..."
                             } else {
                                 chat.lastMessage?.let { msg ->
-                                    when (msg.type) {
+                                    val raw = when (msg.type) {
                                         MessageType.TEXT   -> msg.content
                                         MessageType.IMAGE  -> "📷 Фото"
                                         MessageType.VIDEO  -> "🎬 Видео"
@@ -541,6 +593,14 @@ private fun ChatRow(
                                                 isOwnMessage = msg.senderId == currentUserId,
                                             )
                                         }
+                                    }
+                                    // Если decryptedContent — плашка (sender-keys
+                                    // ещё не загружены на cold start), показываем
+                                    // нейтральный плейсхолдер вместо «не удалось».
+                                    when (raw) {
+                                        "[Не удалось расшифровать]",
+                                        "[Групповые чаты не поддерживаются]" -> "🔒 Зашифрованное сообщение"
+                                        else -> raw
                                     }
                                 } ?: "Нет сообщений"
                             },
@@ -705,16 +765,23 @@ private fun EmptyChatList(modifier: Modifier = Modifier) {
 
 /**
  * Перерасчёт текста системного сообщения для превью в списке чатов.
- * Дублирует логику ChatScreen.displaySystemMessageText, но локально — чтобы
- * не тащить cross-screen зависимости. Если перечень кейсов разрастётся,
- * вынесу в общий util.
+ * Дублирует логику ChatScreen.displaySystemMessageText. Префикс
+ * «Исходящий» / «Входящий» добавляется в зависимости от того, кто звонил.
  */
 private fun displaySystemPreviewText(rawText: String, isOwnMessage: Boolean): String {
-    if (!isOwnMessage) return rawText
-    return when {
-        rawText == "Пропущенный Звонок"      -> "Звонок без ответа"
-        rawText == "Пропущенный Видеозвонок" -> "Видеозвонок без ответа"
-        else                                  -> rawText
+    return when (rawText) {
+        "Пропущенный Звонок"      -> if (isOwnMessage) "Звонок без ответа" else "Пропущенный звонок"
+        "Пропущенный Видеозвонок" -> if (isOwnMessage) "Видеозвонок без ответа" else "Пропущенный видеозвонок"
+        "Звонок отклонён"         -> if (isOwnMessage) "Исходящий звонок отклонён" else "Входящий звонок отклонён"
+        "Видеозвонок отклонён"    -> if (isOwnMessage) "Исходящий видеозвонок отклонён" else "Входящий видеозвонок отклонён"
+        else -> {
+            val direction = if (isOwnMessage) "Исходящий" else "Входящий"
+            when {
+                rawText.startsWith("Звонок · ")      -> "$direction звонок · ${rawText.removePrefix("Звонок · ")}"
+                rawText.startsWith("Видеозвонок · ") -> "$direction видеозвонок · ${rawText.removePrefix("Видеозвонок · ")}"
+                else -> rawText
+            }
+        }
     }
 }
 

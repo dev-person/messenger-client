@@ -37,9 +37,12 @@ import timber.log.Timber
  */
 @Singleton
 class IncomingMessageHandler @Inject constructor(
+    @dagger.hilt.android.qualifiers.ApplicationContext
+    private val context: android.content.Context,
     private val chatDao: ChatDao,
     private val messageDao: MessageDao,
     private val userDao: UserDao,
+    private val chatMemberDao: com.secure.messenger.data.local.dao.ChatMemberDao,
     private val groupSenderKeyDao: GroupSenderKeyDao,
     private val api: MessengerApi,
     private val cryptoManager: CryptoManager,
@@ -56,14 +59,16 @@ class IncomingMessageHandler @Inject constructor(
     private val adapter = moshi.adapter(SignalingMessage::class.java)
 
     /** Возвращает UUID текущего пользователя (или null если не авторизован). */
-    private suspend fun currentUserIdSync(): String? =
+    suspend fun currentUserIdSync(): String? =
         runCatching { authRepository.get().currentUser.first()?.id }.getOrNull()
 
     /**
      * Разбирает, расшифровывает и сохраняет входящее WebSocket-сообщение.
-     * Возвращает Pair(имя_отправителя, расшифрованный_текст) для уведомления, или null при ошибке.
+     * Возвращает Triple(имя_отправителя, расшифрованный_текст, chatId) для
+     * уведомления, или null при ошибке. chatId нужен чтобы тап по уведомлению
+     * открывал именно нужный чат, а не просто launcher-активность.
      */
-    suspend fun handle(json: String): Pair<String, String>? {
+    suspend fun handle(json: String): Triple<String, String, String>? {
         try {
             val msg = adapter.fromJson(json) ?: return null
             val payload = msg.payload ?: return null
@@ -111,6 +116,8 @@ class IncomingMessageHandler @Inject constructor(
                     Timber.w("IncomingMessageHandler: sender $senderId not found on server")
                     return null
                 }
+                com.secure.messenger.data.local.KeyChangeTracker
+                    .observePublicKey(context, dto.id, dto.publicKey)
                 UserEntity(
                     id = dto.id, phone = dto.phone, username = dto.username,
                     displayName = dto.displayName, avatarUrl = dto.avatarUrl,
@@ -153,8 +160,12 @@ class IncomingMessageHandler @Inject constructor(
             }
             val myPrivateKeyBytes = Base64.decode(myPrivateKeyBase64, Base64.NO_WRAP)
 
+            // AAD-binding: chatId|senderId|messageId|type. Decrypt сначала
+            // с AAD, при промахе — без (для исторических сообщений).
+            val aad = cryptoManager.canonicalMessageAad(chatId, senderId, messageId, msgType)
+
             var decryptedContent: String? = if (isGroup) {
-                decryptGroupMessage(chatId, senderId, messageId, encryptedContent)
+                decryptGroupMessage(chatId, senderId, messageId, encryptedContent, aad)
             } else {
                 val senderPublicKeyBytes = Base64.decode(sender.publicKey, Base64.NO_WRAP)
                 val secrets = mutableListOf(
@@ -167,7 +178,7 @@ class IncomingMessageHandler @Inject constructor(
                         secrets.add(cryptoManager.computeSharedSecret(bytes, senderPublicKeyBytes))
                     }
                 }
-                cryptoManager.decryptMessageWithAnyKey(encryptedContent, secrets, messageId)
+                cryptoManager.decryptMessageWithAnyKey(encryptedContent, secrets, messageId, aad)
             }
 
             if (!isGroup && decryptedContent == null) {
@@ -188,10 +199,14 @@ class IncomingMessageHandler @Inject constructor(
                         }
                     }
                     decryptedContent = cryptoManager.decryptMessageWithAnyKey(
-                        encryptedContent, freshSecrets, messageId,
+                        encryptedContent, freshSecrets, messageId, aad,
                     )
                     if (decryptedContent != null) {
-                        // Сохраняем обновлённый ключ чтобы следующие сообщения расшифровывались сразу
+                        // Сохраняем обновлённый ключ. KeyChangeTracker зафиксирует
+                        // факт смены — UI покажет баннер, юзер сможет сверить
+                        // safety-code с собеседником.
+                        com.secure.messenger.data.local.KeyChangeTracker
+                            .observePublicKey(context, freshDto.id, freshDto.publicKey)
                         userDao.upsert(sender.copy(publicKey = freshDto.publicKey))
                     }
                 }
@@ -229,7 +244,7 @@ class IncomingMessageHandler @Inject constructor(
                 MessageType.IMAGE.name -> "Фото"
                 else -> decryptedContent.take(120)
             }
-            return Pair(sender.displayName, notificationText)
+            return Triple(sender.displayName, notificationText, chatId)
 
         } catch (e: Exception) {
             Timber.e(e, "IncomingMessageHandler: failed to process message")
@@ -248,14 +263,42 @@ class IncomingMessageHandler @Inject constructor(
         val otherUserId = chat.otherUserId ?: return
         val otherUser = userDao.getById(otherUserId) ?: return
 
+        val existing = messageDao.getById(messageId) ?: return
+        val myId = currentUserIdSync()
+
+        // Если редактирую СВОЁ сообщение — локальная запись уже обновлена
+        // через ChatRepository.editMessage (правильный decryptedContent уже в
+        // БД). Сервер ретранслирует event message_edited всем участникам
+        // включая отправителя; повторно расшифровывать его тут не надо —
+        // это даст AAD-mismatch (мы шифровали с senderId=я, а тут пытались
+        // бы decrypt'ить с senderId=otherUserId), сообщение записалось бы
+        // как «не удалось расшифровать» и исчезло из UI.
+        if (existing.senderId == myId) return
+
         val myPrivateKeyBase64 = localKeyStore.getPrivateKey() ?: return
         val myPrivateKeyBytes = Base64.decode(myPrivateKeyBase64, Base64.NO_WRAP)
         val theirPubKeyBytes = Base64.decode(otherUser.publicKey, Base64.NO_WRAP)
         val sharedSecret = cryptoManager.computeSharedSecret(myPrivateKeyBytes, theirPubKeyBytes)
-        val decrypted = cryptoManager.decryptMessage(encryptedContent, sharedSecret, messageId)
-            ?: "[Не удалось расшифровать]"
 
-        messageDao.updateContent(messageId, encryptedContent, decrypted)
+        // AAD строится по senderId оригинала (а не по otherUserId): для
+        // входящего собеседник и есть автор, но для собственного сообщения
+        // (если когда-нибудь дойдём сюда) автором был бы я.
+        val aad = cryptoManager.canonicalMessageAad(
+            chatId = chatId,
+            senderId = existing.senderId,
+            messageId = messageId,
+            type = existing.type,
+        )
+
+        val decrypted = cryptoManager.decryptMessage(encryptedContent, sharedSecret, messageId, aad)
+        // Не затираем правильный текст плашкой «не удалось расшифровать»,
+        // если decrypt не прошёл: лучше оставить предыдущую версию, чем
+        // прятать сообщение из UI (observeMessages фильтрует плашки).
+        if (decrypted != null) {
+            messageDao.updateContent(messageId, encryptedContent, decrypted)
+        } else {
+            Timber.w("handleEdit: decrypt failed for $messageId, keeping previous text")
+        }
     }
 
     /** Обновляет онлайн-статус пользователя в локальной БД. */
@@ -331,6 +374,7 @@ class IncomingMessageHandler @Inject constructor(
         senderId: String,
         messageId: String,
         encryptedContent: String,
+        aad: ByteArray? = null,
     ): String? {
         // Пробуем все имеющиеся sender keys этого отправителя по всем
         // epoch'ам — не только текущему. Сценарий: после logout/login
@@ -343,7 +387,7 @@ class IncomingMessageHandler @Inject constructor(
                 val bytes = runCatching {
                     Base64.decode(key.senderKey, Base64.NO_WRAP)
                 }.getOrNull() ?: continue
-                val text = groupCryptoManager.decryptGroupMessage(encryptedContent, bytes, messageId)
+                val text = groupCryptoManager.decryptGroupMessage(encryptedContent, bytes, messageId, aad)
                 if (text != null) return text
             }
             return null
@@ -404,11 +448,12 @@ class IncomingMessageHandler @Inject constructor(
                 }
             }
         } else {
-            // Другого участника добавили — я существующий член. Мне нужно
-            // поделиться своим sender-ключом с новым участником, чтобы он
-            // мог расшифровать мои будущие сообщения. Ключ не ротируем —
-            // заливаем один и тот же, но под новым epoch чтобы encryptForChat
-            // находил его при отправке (ищет по currentEpoch).
+            // Другого участника добавили — я существующий член. Мне нужно:
+            //   1. Поделиться своим sender-ключом для НОВОГО epoch — чтобы
+            //      новенький мог читать мои будущие сообщения.
+            //   2. Поделиться своими СТАРЫМИ sender keys (всех прошлых epoch'ов) —
+            //      чтобы новенький мог расшифровать историю моих сообщений
+            //      до его добавления.
             runCatching {
                 chatRepository.get().uploadMySenderKey(
                     chatId = chatId,
@@ -416,6 +461,9 @@ class IncomingMessageHandler @Inject constructor(
                     recipients = chatRepository.get().getGroupMembers(chatId)
                         .filter { it.id != myId },
                 )
+            }
+            runCatching {
+                chatRepository.get().shareHistoryWithNewMember(chatId, userId)
             }
         }
     }
@@ -426,10 +474,14 @@ class IncomingMessageHandler @Inject constructor(
         if (userId == myId) {
             // Меня кикнули — чистим чат и ключи локально.
             groupSenderKeyDao.deleteByChat(chatId)
+            chatMemberDao.deleteAllForChat(chatId)
             chatDao.deleteById(chatId)
             return
         }
         chatDao.upsert(chat.copy(currentEpoch = epoch))
+        // GroupInfoScreen, подписанный на observeGroupMembers, увидит уход
+        // мгновенно — без ожидания следующего syncChats.
+        chatMemberDao.delete(chatId, userId)
         groupSenderKeyDao.deleteByOwner(chatId, userId)
     }
 
@@ -440,13 +492,18 @@ class IncomingMessageHandler @Inject constructor(
             // Моя роль поменялась — обновляем myRole в чате.
             chatDao.upsert(chat.copy(myRole = role))
         }
-        // Для других участников роль отображается только в GroupInfoScreen —
-        // там при открытии тянется getGroupMembers() c сервера, так что
-        // локально дополнительно ничего делать не нужно.
+        // Локальный chat_members хранит роль каждого участника отдельной
+        // строкой — патчим её, чтобы UI GroupInfo сразу показал новую роль.
+        chatMemberDao.upsert(
+            com.secure.messenger.data.local.entities.ChatMemberEntity(
+                chatId = chatId, userId = userId, role = role,
+            )
+        )
     }
 
     suspend fun handleGroupDeleted(chatId: String) {
         groupSenderKeyDao.deleteByChat(chatId)
+        chatMemberDao.deleteAllForChat(chatId)
         chatDao.deleteById(chatId)
     }
 

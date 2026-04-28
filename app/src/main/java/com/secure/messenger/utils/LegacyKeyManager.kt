@@ -10,18 +10,22 @@ import javax.inject.Singleton
 
 /**
  * Управляет legacy X25519 приватными ключами пользователя — теми, которые
- * когда-то использовались, но были заменены (например, при установке пароля
- * шифрования случайный ключ был заменён на password-derived).
+ * когда-то использовались, но были заменены при смене пароля.
  *
- * Формат blob-а на сервере — JSON-массив:
- *   [{"enc": "base64(iv||ct||tag)"}, ...]
+ * Формат blob-а на сервере:
+ *   v1 (старый): JSON-массив `[{"enc":"base64(iv||ct||tag)"}, ...]`
+ *   v2 (новый):  JSON-объект `{"v":2,"keys":[{"enc":"..."}, ...]}`
  *
- * `enc` — AES-256-GCM шифротекст приватного ключа X25519.
- * Ключ шифрования выводится из (телефон + текущий пароль) через PBKDF2.
- * Сервер пароля не знает — blob для него непрозрачен, E2E сохранён.
+ * Версия определяет KDF, которым выводится симметричный ключ для шифрования
+ * legacy и identity-keypair'а:
+ *   v1 → PBKDF2-HMAC-SHA256 (100k iter)
+ *   v2 → Argon2id (m=64MiB, t=3, p=1)
  *
- * При каждой смене пароля blob ПЕРЕШИФРОВЫВАЕТСЯ новым ключом, чтобы
- * старый пароль не оставался валидным для расшифровки списка.
+ * Argon2id защищает от GPU brute-force несравнимо лучше — поэтому при ЛЮБОЙ
+ * смене пароля автоматически мигрируем на v2. Старые юзеры без смены пароля
+ * остаются на v1, но при следующей смене перейдут.
+ *
+ * Сервер пароля и KDF не знает — blob для него непрозрачен, E2E сохранён.
  */
 @Singleton
 class LegacyKeyManager @Inject constructor(
@@ -30,13 +34,54 @@ class LegacyKeyManager @Inject constructor(
     private val authRepository: AuthRepository,
 ) {
     /**
+     * Версия blob'а на сервере. 1 — PBKDF2 (исторический), 2 — Argon2id (новый).
+     * Используется и для ключа shifroвания blob-а, и для derive identity-keypair'а
+     * (оба должны идти одной KDF — иначе на новом устройстве не сойдётся keypair).
+     */
+    enum class KdfVersion(val value: Int) {
+        V1_PBKDF2(1),
+        V2_ARGON2ID(2);
+
+        companion object {
+            fun fromInt(v: Int): KdfVersion = entries.firstOrNull { it.value == v } ?: V1_PBKDF2
+        }
+    }
+
+    /**
+     * Определяет KDF-версию по содержимому blob-а. Пустой/некорректный → V1
+     * (это безопасный дефолт для старых клиентов).
+     */
+    fun detectVersion(blob: String): KdfVersion {
+        if (blob.isBlank()) return KdfVersion.V1_PBKDF2
+        val trimmed = blob.trimStart()
+        if (!trimmed.startsWith("{")) return KdfVersion.V1_PBKDF2
+        return runCatching {
+            KdfVersion.fromInt(JSONObject(blob).optInt("v", 1))
+        }.getOrDefault(KdfVersion.V1_PBKDF2)
+    }
+
+    /** Симметричный ключ legacy-blob'а под нужную версию. */
+    private fun deriveLegacyKey(version: KdfVersion, phone: String, password: String): ByteArray =
+        when (version) {
+            KdfVersion.V1_PBKDF2 -> cryptoManager.derivePasswordSymmetricKey(phone, password)
+            KdfVersion.V2_ARGON2ID -> cryptoManager.derivePasswordSymmetricKeyV2(phone, password)
+        }
+
+    /** Identity X25519 keypair под нужную версию. */
+    fun deriveIdentityKeypair(
+        version: KdfVersion,
+        phone: String,
+        password: String,
+    ): Pair<ByteArray, ByteArray> = when (version) {
+        KdfVersion.V1_PBKDF2 -> cryptoManager.deriveKeyPairFromPassword(phone, password)
+        KdfVersion.V2_ARGON2ID -> cryptoManager.deriveKeyPairFromPasswordV2(phone, password)
+    }
+
+    /**
      * Первичная установка пароля: текущий случайный privateKey шифруется
-     * под новый пароль и загружается на сервер (вместе с уже существующими
-     * legacy-ключами, если такие есть).
-     *
-     * @param currentRandomPrivateKeyBase64  приватный ключ ДО установки пароля
-     * @param phone  телефон (часть KDF)
-     * @param password  только что установленный пароль
+     * под новый пароль (V2 — все новые blob-ы пишем в Argon2id) и загружается
+     * на сервер. На старых клиентах функция не вызывалась бы — это код для
+     * v2-эры.
      */
     suspend fun uploadCurrentKeyAsLegacy(
         currentRandomPrivateKeyBase64: String,
@@ -44,42 +89,47 @@ class LegacyKeyManager @Inject constructor(
         password: String,
     ) {
         runCatching {
-            // Добавляем локально
             localKeyStore.addLegacyPrivateKey(currentRandomPrivateKeyBase64)
-
-            // Собираем список ВСЕХ legacy-ключей (и добавленный только что тоже)
             val allLegacy = localKeyStore.getLegacyPrivateKeys()
-            val sym = cryptoManager.derivePasswordSymmetricKey(phone, password)
-            val blob = encodeLegacyList(allLegacy, sym)
+            val sym = deriveLegacyKey(KdfVersion.V2_ARGON2ID, phone, password)
+            val blob = encodeLegacyList(allLegacy, sym, KdfVersion.V2_ARGON2ID)
             authRepository.putLegacyKeys(blob)
         }.onFailure { Timber.e(it, "uploadCurrentKeyAsLegacy failed") }
     }
 
     /**
-     * Логин на новом устройстве: после успешной верификации пароля
-     * скачиваем blob с сервера, расшифровываем и сохраняем ключи локально.
-     * Они станут fallback-ом для расшифровки старых сообщений.
+     * Логин на новом устройстве: тянем blob с сервера, определяем версию
+     * KDF из формата blob-а, расшифровываем и сохраняем legacy-ключи локально.
+     * Возвращаем версию — caller использует ту же KDF для derive identity
+     * keypair (иначе keypair не сойдётся с тем что на других устройствах).
      */
-    suspend fun downloadAndSaveLegacyKeys(phone: String, password: String) {
-        runCatching {
-            val blob = authRepository.getLegacyKeys().getOrNull() ?: return@runCatching
-            if (blob.isBlank()) return@runCatching
-            val sym = cryptoManager.derivePasswordSymmetricKey(phone, password)
-            val keys = decodeLegacyList(blob, sym)
+    suspend fun downloadAndSaveLegacyKeys(
+        phone: String,
+        password: String,
+    ): KdfVersion {
+        return runCatching {
+            val blob = authRepository.getLegacyKeys().getOrNull() ?: return@runCatching KdfVersion.V1_PBKDF2
+            if (blob.isBlank()) return@runCatching KdfVersion.V1_PBKDF2
+            val version = detectVersion(blob)
+            val sym = deriveLegacyKey(version, phone, password)
+            val keys = decodeLegacyList(blob, sym, version)
             if (keys.isNotEmpty()) {
-                // Сохраняем локально, объединяя с уже имеющимися
                 val existing = localKeyStore.getLegacyPrivateKeys().toMutableSet()
                 existing.addAll(keys)
                 localKeyStore.setLegacyPrivateKeys(existing.toList())
-                Timber.d("Legacy keys: скачано ${keys.size}, всего локально ${existing.size}")
+                Timber.d("Legacy keys: скачано ${keys.size} (v=${version.value}), всего локально ${existing.size}")
             }
-        }.onFailure { Timber.e(it, "downloadAndSaveLegacyKeys failed") }
+            version
+        }.onFailure {
+            Timber.e(it, "downloadAndSaveLegacyKeys failed")
+        }.getOrDefault(KdfVersion.V1_PBKDF2)
     }
 
     /**
-     * Смена пароля: blob был зашифрован СТАРЫМ паролем. Пере-шифровываем
-     * его новым паролем, добавляя туда же ТЕКУЩИЙ (pre-change) приватный
-     * ключ — после смены он тоже станет «устаревшим».
+     * Смена пароля: blob был зашифрован старым паролем (под версией X), пере-
+     * шифровываем НОВЫМ паролем и ВСЕГДА в формат v2 (Argon2id) — auto-миграция.
+     * Добавляем туда же текущий (pre-change) приватный ключ — после смены он
+     * тоже становится legacy.
      */
     suspend fun rotateLegacyKeysOnPasswordChange(
         phone: String,
@@ -88,51 +138,61 @@ class LegacyKeyManager @Inject constructor(
         currentPrivateKeyBase64: String,
     ) {
         runCatching {
-            val oldSym = cryptoManager.derivePasswordSymmetricKey(phone, oldPassword)
-            val newSym = cryptoManager.derivePasswordSymmetricKey(phone, newPassword)
-
-            // 1. Скачиваем и расшифровываем существующий blob
             val existingBlob = authRepository.getLegacyKeys().getOrNull() ?: ""
             val existingKeys: List<String> = if (existingBlob.isBlank()) {
                 emptyList()
             } else {
-                decodeLegacyList(existingBlob, oldSym)
+                val oldVersion = detectVersion(existingBlob)
+                val oldSym = deriveLegacyKey(oldVersion, phone, oldPassword)
+                decodeLegacyList(existingBlob, oldSym, oldVersion)
             }
 
-            // 2. Добавляем текущий приватный ключ (он теперь тоже legacy)
             val combined = (existingKeys + currentPrivateKeyBase64).distinct()
 
-            // 3. Сохраняем локально, шифруем новым паролем, льём на сервер
+            // Сохраняем локально и заливаем v2-blob новым паролем
             localKeyStore.setLegacyPrivateKeys(combined)
-            val newBlob = encodeLegacyList(combined, newSym)
+            val newSym = deriveLegacyKey(KdfVersion.V2_ARGON2ID, phone, newPassword)
+            val newBlob = encodeLegacyList(combined, newSym, KdfVersion.V2_ARGON2ID)
             authRepository.putLegacyKeys(newBlob)
         }.onFailure { Timber.e(it, "rotateLegacyKeysOnPasswordChange failed") }
     }
 
     // ── Encode / Decode ──────────────────────────────────────────────────────
 
-    private fun encodeLegacyList(privateKeysBase64: List<String>, symKey: ByteArray): String {
+    private fun encodeLegacyList(
+        privateKeysBase64: List<String>,
+        symKey: ByteArray,
+        version: KdfVersion,
+    ): String {
         val arr = JSONArray()
         for (priv in privateKeysBase64.distinct()) {
             val privBytes = Base64.decode(priv, Base64.NO_WRAP)
             val enc = cryptoManager.encryptBytes(privBytes, symKey)
             arr.put(JSONObject().put("enc", enc))
         }
-        return arr.toString()
+        return when (version) {
+            KdfVersion.V1_PBKDF2 -> arr.toString() // legacy формат — оставляем как есть
+            KdfVersion.V2_ARGON2ID -> JSONObject().put("v", 2).put("keys", arr).toString()
+        }
     }
 
-    private fun decodeLegacyList(blob: String, symKey: ByteArray): List<String> {
-        return runCatching {
-            val arr = JSONArray(blob)
-            val out = mutableListOf<String>()
-            for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
-                val enc = obj.optString("enc", "")
-                if (enc.isEmpty()) continue
-                val bytes = cryptoManager.decryptBytes(enc, symKey) ?: continue
-                out.add(Base64.encodeToString(bytes, Base64.NO_WRAP))
-            }
-            out
-        }.getOrDefault(emptyList())
-    }
+    private fun decodeLegacyList(
+        blob: String,
+        symKey: ByteArray,
+        version: KdfVersion,
+    ): List<String> = runCatching {
+        val arr = when (version) {
+            KdfVersion.V1_PBKDF2 -> JSONArray(blob)
+            KdfVersion.V2_ARGON2ID -> JSONObject(blob).getJSONArray("keys")
+        }
+        val out = mutableListOf<String>()
+        for (i in 0 until arr.length()) {
+            val obj = arr.getJSONObject(i)
+            val enc = obj.optString("enc", "")
+            if (enc.isEmpty()) continue
+            val bytes = cryptoManager.decryptBytes(enc, symKey) ?: continue
+            out.add(Base64.encodeToString(bytes, Base64.NO_WRAP))
+        }
+        out
+    }.getOrDefault(emptyList())
 }

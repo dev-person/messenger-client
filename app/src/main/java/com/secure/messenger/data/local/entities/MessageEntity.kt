@@ -10,7 +10,13 @@ import com.secure.messenger.domain.model.MessageType
 
 @Entity(
     tableName = "messages",
-    indices = [Index("chatId"), Index("timestamp")],
+    // Составной (chatId, timestamp DESC) — критичен для observeAllWithLastMessage
+    // и для observeMessages: оба делают «last N сообщений в чате» через
+    // ORDER BY timestamp DESC LIMIT N. Без составного индекса SQLite ловит
+    // chatId по одному индексу, но потом сортирует in-memory — на 20 чатов
+    // × 1000 сообщений это 200мс задержки на каждый emit Flow, что и
+    // выглядит как «блокировка скролла» при возврате на список.
+    indices = [Index(value = ["chatId", "timestamp"]), Index("timestamp")],
 )
 data class MessageEntity(
     @PrimaryKey val id: String,

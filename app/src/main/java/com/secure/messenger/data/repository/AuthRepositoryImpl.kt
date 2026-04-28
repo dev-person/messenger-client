@@ -211,6 +211,13 @@ class AuthRepositoryImpl @Inject constructor(
         user
     }
 
+    override suspend fun publishPublicKey(publicKey: String): Result<Unit> = runCatching {
+        // Шлём только publicKey — серверу остальные поля знакомы.
+        api.updateProfile(mapOf("publicKey" to publicKey)).data
+            ?: error("Server returned null")
+        Unit
+    }
+
     override suspend fun uploadAvatar(imageBytes: ByteArray, extension: String): Result<User> = runCatching {
         val mimeType = if (extension.equals("png", ignoreCase = true)) "image/png" else "image/jpeg"
         val requestBody = imageBytes.toRequestBody(mimeType.toMediaType())

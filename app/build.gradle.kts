@@ -15,8 +15,8 @@ android {
         applicationId = "com.secure.messenger"
         minSdk = 26
         targetSdk = 35
-        versionCode = 68
-        versionName = "1.0.68 alfa"
+        versionCode = 71
+        versionName = "1.0.71 alfa"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         // Room schema export for migrations
@@ -101,6 +101,7 @@ dependencies {
     // Lifecycle
     implementation(libs.lifecycle.viewmodel.compose)
     implementation(libs.lifecycle.runtime.compose)
+    implementation(libs.lifecycle.process)
 
     // Hilt
     implementation(libs.hilt.android)

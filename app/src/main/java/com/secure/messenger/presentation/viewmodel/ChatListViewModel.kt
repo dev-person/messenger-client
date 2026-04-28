@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
@@ -36,9 +37,16 @@ class ChatListViewModel @Inject constructor(
     private val tokenProvider: AuthTokenProvider,
 ) : ViewModel() {
 
-    // Список всех чатов — обновляется в реальном времени
+    // Список всех чатов — обновляется в реальном времени.
+    // distinctUntilChanged: Room эмитит при ЛЮБОМ изменении в JOIN'имых
+    // таблицах (chats / messages / users), но содержимое List<Chat> часто
+    // не меняется (например, WS user_status поменял isOnline, но мы его
+    // не показываем в списке). Без дедупликации каждый такой emit заставлял
+    // LazyColumn пересобирать все 20+ ChatRow — это и есть «блокировка
+    // скролла на ~секунду» при возврате из чата.
     val chats: StateFlow<List<Chat>> = chatRepository
         .observeChats()
+        .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     // Текущий авторизованный пользователь — для отображения в шапке
@@ -53,6 +61,15 @@ class ChatListViewModel @Inject constructor(
     val typingChats: StateFlow<Set<String>> = _typingChats.asStateFlow()
     private val typingResetJobs = mutableMapOf<String, Job>()
 
+    /**
+     * Чаты, в которых сейчас идёт групповой звонок (chatId).
+     * UI показывает иконку-«трубку» на аватаре в списке чатов.
+     */
+    private val _activeCallChats = MutableStateFlow<Set<String>>(emptySet())
+    val activeCallChats: StateFlow<Set<String>> = _activeCallChats.asStateFlow()
+    /** Map callId → chatId, нужен чтобы по group_call_ended убрать правильную метку. */
+    private val activeCallIdToChat = mutableMapOf<String, String>()
+
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
 
@@ -66,11 +83,58 @@ class ChatListViewModel @Inject constructor(
     init {
         syncChats()
         observeTyping()
+        observeActiveGroupCalls()
+        refreshActiveGroupCalls()
         // При каждом восстановлении WebSocket-соединения — повторно синхронизируем
         // список чатов. Это обновляет онлайн-статус собеседников: пока WS был
         // отключён, события user_status могли быть пропущены, а сервер при
         // GET /chats возвращает актуальные is_online из БД.
         observeReconnect()
+    }
+
+    /**
+     * Обновляет [activeCallChats] по WS-событиям: invite добавляет, ended убирает.
+     * Состояние ловит групповые звонки live, без поллинга.
+     */
+    private fun observeActiveGroupCalls() {
+        viewModelScope.launch {
+            signalingClient.events.collect { event ->
+                when (event) {
+                    is SignalingEvent.GroupCallInvite -> {
+                        activeCallIdToChat[event.callId] = event.chatId
+                        _activeCallChats.value = _activeCallChats.value + event.chatId
+                    }
+                    is SignalingEvent.GroupCallEnded -> {
+                        val chatId = activeCallIdToChat.remove(event.callId)
+                        if (chatId != null) {
+                            _activeCallChats.value = _activeCallChats.value - chatId
+                        }
+                    }
+                    else -> Unit
+                }
+            }
+        }
+    }
+
+    /**
+     * При старте приложения подтягиваем для каждой группы её активный звонок
+     * (если есть). Без этого пропустили бы звонки, которые шли пока юзер
+     * был офлайн — их WS-events уже не повторяются.
+     */
+    private fun refreshActiveGroupCalls() {
+        viewModelScope.launch {
+            // Ждём первой непустой загрузки чатов
+            val groups = chats.first { it.isNotEmpty() || _isInitialLoading.value.not() }
+                .filter { it.type.name == "GROUP" }
+            for (chat in groups) {
+                runCatching { chatRepository.getActiveGroupCall(chat.id).getOrNull() }
+                    .getOrNull()
+                    ?.let { gc ->
+                        activeCallIdToChat[gc.id] = chat.id
+                        _activeCallChats.value = _activeCallChats.value + chat.id
+                    }
+            }
+        }
     }
 
     private fun observeReconnect() {
@@ -117,10 +181,30 @@ class ChatListViewModel @Inject constructor(
             // дальше пользователь увидит либо локальный кэш, либо «Нет чатов».
             _isInitialLoading.value = false
         }
+        // Параллельно (не блокируя UI) префетчим первые страницы сообщений
+        // для чатов с пустой историей — типичный кейс свежего логина.
+        // К моменту тапа на чат сообщения уже окажутся в локальной БД
+        // и observeMessages выдаст их мгновенно, без сетевого ожидания.
+        viewModelScope.launch {
+            runCatching { chatRepository.prefetchEmptyChatMessages() }
+                .onFailure { Timber.w(it, "prefetchEmptyChatMessages failed") }
+        }
     }
 
     fun clearError() {
         _error.value = null
+    }
+
+    /**
+     * Запускает в фоне fetchMessages для чата при тапе на него — чтобы
+     * к моменту монтирования ChatScreen сетевой запрос уже летел или был
+     * выполнен. Идемпотентно: повторный fetch в init ChatViewModel'я просто
+     * перезапишет ту же страницу.
+     */
+    fun prefetchChat(chatId: String) {
+        viewModelScope.launch {
+            runCatching { chatRepository.fetchMessages(chatId) }
+        }
     }
 
     // ── Действия с чатами ─────────────────────────────────────────────────────

@@ -33,11 +33,13 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ExitToApp
+import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.PersonAdd
@@ -76,6 +78,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import com.secure.messenger.BuildConfig
 import com.secure.messenger.presentation.ui.components.AvatarCropDialog
+import com.secure.messenger.presentation.ui.components.collapsibleAvatarDismissOnSwipe
 import java.io.ByteArrayOutputStream
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -112,6 +115,7 @@ private fun User.isOutdated(): Boolean =
 fun GroupInfoScreen(
     onBack: () -> Unit,
     onLeft: () -> Unit,
+    onGroupCall: (chatId: String, isVideo: Boolean) -> Unit = { _, _ -> },
     viewModel: GroupInfoViewModel = hiltViewModel(),
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -164,6 +168,13 @@ fun GroupInfoScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(paddingValues)
+                // Свайп-вверх в любой точке экрана сворачивает раскрытый
+                // аватар. Применяется ДО verticalScroll, чтобы успеть
+                // перехватить жест до скролла.
+                .collapsibleAvatarDismissOnSwipe(
+                    expanded = showAvatarFullscreen,
+                    onCollapse = { showAvatarFullscreen = false },
+                )
                 .verticalScroll(rememberScrollState()),
         ) {
             // ── Шапка: стрелка-«назад» + крупный заголовок в одной строке.
@@ -310,10 +321,46 @@ fun GroupInfoScreen(
                     }
                 }
                 Text(
-                    text = "${uiState.members.size} участник(а)",
+                    // Состав читается из локального кеша (chat_members JOIN
+                    // users), поэтому при первом открытии после сохранённой
+                    // сессии цифра уже есть. Спиннер не нужен — данные
+                    // мгновенные. Кейс «совсем нет данных» (логин на чистом
+                    // устройстве) попадает на короткое окно перед syncChats.
+                    text = if (uiState.members.isEmpty()) {
+                        "загрузка участников…"
+                    } else {
+                        "${uiState.members.size} участник(а)"
+                    },
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.bodyMedium,
                 )
+
+                // Кнопки группового звонка: показываем для GROUP с 2-4
+                // участниками (mesh-лимит). Две круглые таблетки рядом —
+                // «Аудио» и «Видео», с иконкой и подписью. Стилистика
+                // совпадает с подобными action-кнопками в Telegram /
+                // WhatsApp профиле контакта.
+                val canCall = uiState.members.size in 2..4
+                if (canCall) {
+                    Spacer(Modifier.height(20.dp))
+                    Row(
+                        modifier = Modifier.padding(horizontal = 16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        GroupCallActionButton(
+                            icon = Icons.Default.Call,
+                            label = "Аудио",
+                            onClick = { onGroupCall(chat.id, false) },
+                            modifier = Modifier.weight(1f),
+                        )
+                        GroupCallActionButton(
+                            icon = Icons.Default.Videocam,
+                            label = "Видео",
+                            onClick = { onGroupCall(chat.id, true) },
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                }
             }
 
             // ── Уведомления ──────────────────────────────────────────────────
@@ -397,6 +444,24 @@ fun GroupInfoScreen(
                             onKick = { viewModel.removeMember(member.id) },
                             onTransferOwnership = { viewModel.transferOwnership(member.id) },
                         )
+                    }
+
+                    // Состав теперь читается из локального кеша (chat_members),
+                    // спиннер обычно не нужен — данные есть мгновенно. Только
+                    // если кеш совсем пуст (свежий логин до syncChats) показываем
+                    // тонкий индикатор, чтобы экран не выглядел сломанным.
+                    if (uiState.members.isEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 16.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(22.dp),
+                                strokeWidth = 2.dp,
+                            )
+                        }
                     }
                 }
             }
@@ -610,6 +675,48 @@ private fun GroupAvatar(
 private fun Bitmap.toJpegBytes(quality: Int = 85): ByteArray =
     ByteArrayOutputStream().also { compress(Bitmap.CompressFormat.JPEG, quality, it) }.toByteArray()
 
+/**
+ * Кнопка-таблетка для действий «Аудио» / «Видео» в шапке группы.
+ * Округлый фон в primary-контейнере + иконка + подпись. Стилистически
+ * согласуется с action-кнопками в Telegram-профиле.
+ */
+@Composable
+private fun GroupCallActionButton(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.primaryContainer,
+        modifier = modifier.height(64.dp),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(vertical = 8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = label,
+                tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                modifier = Modifier.size(22.dp),
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onPrimaryContainer,
+            )
+        }
+    }
+}
+
 @Composable
 private fun MemberRow(
     member: User,
@@ -631,12 +738,27 @@ private fun MemberRow(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         // Единый стиль аватара: фото с сервера если есть, иначе дефолт-медведь
-        // на палитро-цветном фоне (как в списке чатов).
-        com.secure.messenger.presentation.ui.chat.AvatarImage(
-            url = member.avatarUrl,
-            name = member.displayName,
-            size = 40,
-        )
+        // на палитро-цветном фоне (как в списке чатов). Поверх — зелёная
+        // точка-индикатор «онлайн» (если участник в сети).
+        Box {
+            com.secure.messenger.presentation.ui.chat.AvatarImage(
+                url = member.avatarUrl,
+                name = member.displayName,
+                size = 40,
+            )
+            if (member.isOnline) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .size(12.dp)
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.surface)
+                        .padding(2.dp)
+                        .clip(CircleShape)
+                        .background(Color(0xFF4CAF50)),
+                )
+            }
+        }
         Spacer(Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {

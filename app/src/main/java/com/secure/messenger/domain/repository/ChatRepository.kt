@@ -42,7 +42,23 @@ interface ChatRepository {
     suspend fun editMessage(messageId: String, newContent: String): Result<Message>
 
     suspend fun syncChats(myUserId: String): Result<Unit>
-    suspend fun fetchMessages(chatId: String): Result<Unit>
+    /**
+     * Тянет последнюю страницу сообщений с сервера. Возвращает `true`, если
+     * сервер отдал полную страницу — значит, скорее всего есть ещё более
+     * старые сообщения и пагинация имеет смысл. `false` — сервер отдал
+     * меньше страницы (или ноль) → старее уже нет, UI может выключить
+     * индикатор подгрузки.
+     */
+    suspend fun fetchMessages(chatId: String): Result<Boolean>
+
+    /**
+     * Префетч первой страницы сообщений для всех чатов, где локально пусто.
+     * Вызывается фоном после syncChats: следующий тап на любой чат сразу
+     * показывает историю, не ждёт сетевой fetchMessages. Идёт последовательно
+     * (а не параллельно) — не хочется ронять сеть N параллельными
+     * /v1/chats/{id}/messages при 20+ чатов.
+     */
+    suspend fun prefetchEmptyChatMessages()
     suspend fun fetchOlderMessages(chatId: String, beforeTimestamp: Long): Result<Boolean>
 
     suspend fun markAsRead(chatId: String): Result<Unit>
@@ -61,7 +77,24 @@ interface ChatRepository {
 
     // ── Группы (1.0.68) ──────────────────────────────────────────────────
 
-    /** Участники конкретной группы из локального chat_members (с ролями). */
+    /**
+     * Реактивный поток состава группы из локальной БД (chat_members JOIN users).
+     * Эмитит instantly при подписке — UI рисует список / счётчик из кеша
+     * без ожидания сети, а [getGroupMembers] отдельно обновляет данные
+     * поверх. Раньше каждое открытие GroupInfoScreen дёргало сеть и
+     * флешило спиннер.
+     */
+    fun observeGroupMembers(chatId: String): kotlinx.coroutines.flow.Flow<List<User>>
+
+    /** Реактивный счётчик участников из локального кеша. */
+    fun observeGroupMemberCount(chatId: String): kotlinx.coroutines.flow.Flow<Int>
+
+    /**
+     * Сетевой fetch актуального состава группы. Параллельно записывает
+     * результат в локальный chat_members — UI, подписанный на
+     * [observeGroupMembers], получит обновление автоматически. Возвращает
+     * свежий список для совместимости со старыми вызовами.
+     */
     suspend fun getGroupMembers(chatId: String): List<User>
 
     /** Редактирование названия группы. Требует CREATOR/ADMIN. */
@@ -111,6 +144,37 @@ interface ChatRepository {
      * WS-событие group_deleted. Локально чат и сообщения тоже чистим.
      */
     suspend fun deleteGroup(chatId: String): Result<Unit>
+
+    /**
+     * Шарит со свежедобавленным участником группы СВОИ старые sender keys
+     * (всех epoch'ов). После этого новый участник сможет расшифровать
+     * историю моих сообщений в группе. Чужие ключи не шарим.
+     *
+     * Вызывается на каждом клиенте (адресате group_member_added для других),
+     * чтобы новенький получил историю всех существующих участников.
+     */
+    suspend fun shareHistoryWithNewMember(chatId: String, newMemberId: String): Result<Unit>
+
+    // ── Групповые звонки (1.0.71+) ──────────────────────────────────────────
+
+    /**
+     * Старт группового звонка в чате. Если уже идёт — возвращает существующий.
+     * [inviteUserIds] — кому показать full-screen ringing. null = всем участникам.
+     */
+    suspend fun startGroupCall(
+        chatId: String,
+        isVideo: Boolean,
+        inviteUserIds: List<String>? = null,
+    ): Result<com.secure.messenger.data.remote.api.dto.GroupCallDto>
+
+    /** Узнать идёт ли сейчас групповой звонок в чате. null → не идёт. */
+    suspend fun getActiveGroupCall(chatId: String): Result<com.secure.messenger.data.remote.api.dto.GroupCallDto?>
+
+    /** Присоединиться к идущему групповому звонку. */
+    suspend fun joinGroupCall(callId: String): Result<com.secure.messenger.data.remote.api.dto.GroupCallDto>
+
+    /** Выйти из группового звонка. */
+    suspend fun leaveGroupCall(callId: String): Result<Unit>
 
     /**
      * Генерирует свой sender key для группы (или берёт существующий

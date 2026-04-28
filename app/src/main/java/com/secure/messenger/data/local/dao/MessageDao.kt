@@ -38,12 +38,28 @@ interface MessageDao {
     @Query("SELECT * FROM messages WHERE id = :messageId")
     suspend fun getById(messageId: String): MessageEntity?
 
+    /** Бэтчевый lookup для batch-upsert: один SQL вместо N getById в цикле. */
+    @Query("SELECT * FROM messages WHERE id IN (:ids)")
+    suspend fun getByIds(ids: List<String>): List<MessageEntity>
+
     @Query("SELECT * FROM messages WHERE chatId = :chatId ORDER BY timestamp DESC LIMIT 1")
     suspend fun getLastMessage(chatId: String): MessageEntity?
 
     /** Помечает исходящие сообщения как прочитанные собеседником */
     @Query("UPDATE messages SET status = 'READ' WHERE chatId = :chatId AND senderId != :readerId AND status IN ('SENT', 'DELIVERED')")
     suspend fun markChatMessagesRead(chatId: String, readerId: String)
+
+    /** Кол-во сообщений в чате (любого типа). Нужен для префетча: если 0,
+     *  фоновый syncChats тянет первую страницу заранее, чтобы при тапе на
+     *  чат сообщения уже были локально и не было «долгой загрузки». */
+    @Query("SELECT COUNT(*) FROM messages WHERE chatId = :chatId")
+    suspend fun countByChat(chatId: String): Int
+
+    /** Сколько в локальной БД сообщений СТАРЕЕ заданного timestamp.
+     *  Нужен для пагинации: если есть локально, расширяем окно UI без сетевого
+     *  запроса; если 0 — идём за следующей страницей на сервер. */
+    @Query("SELECT COUNT(*) FROM messages WHERE chatId = :chatId AND timestamp < :before")
+    suspend fun countOlderThan(chatId: String, before: Long): Int
 
     /** Все ID не-системных сообщений чата с timestamp >= sinceTimestamp */
     @Query("SELECT id FROM messages WHERE chatId = :chatId AND timestamp >= :sinceTimestamp AND type != 'SYSTEM'")

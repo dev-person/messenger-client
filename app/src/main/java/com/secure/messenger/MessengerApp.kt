@@ -7,12 +7,21 @@ import android.app.NotificationManager
 import android.media.AudioAttributes
 import android.media.RingtoneManager
 import android.os.Build
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
 import coil.ImageLoader
 import coil.ImageLoaderFactory
 import coil.decode.GifDecoder
 import coil.decode.ImageDecoderDecoder
+import com.secure.messenger.data.remote.websocket.SignalingClient
+import com.secure.messenger.di.AuthTokenProvider
 import com.secure.messenger.service.MessagingService
+import dagger.hilt.EntryPoint
+import dagger.hilt.InstallIn
+import dagger.hilt.android.EntryPointAccessors
 import dagger.hilt.android.HiltAndroidApp
+import dagger.hilt.components.SingletonComponent
 import timber.log.Timber
 
 @HiltAndroidApp
@@ -20,13 +29,23 @@ class MessengerApp : Application(), ImageLoaderFactory {
 
     companion object {
         /**
-         * Глобальный флаг: приложение на переднем плане (Activity видима).
-         * Устанавливается из MainActivity.onStart() / onStop().
-         * Используется в FcmService и MessagingService для подавления уведомлений
-         * когда пользователь уже смотрит на экран.
+         * Глобальный флаг: приложение на переднем плане (есть хотя бы одна
+         * видимая Activity). Обновляется через ProcessLifecycleOwner — это
+         * надёжнее чем Activity.onStart/onStop, потому что охватывает весь
+         * процесс и гарантированно срабатывает на смене foreground/background
+         * (включая случаи когда Samsung-lifecycle ведёт себя странно).
          */
         @Volatile
         var isInForeground: Boolean = false
+    }
+
+    /** Hilt-EntryPoint для доступа к Singleton-зависимостям из Application,
+     *  где конструкторный @Inject не поддерживается. */
+    @EntryPoint
+    @InstallIn(SingletonComponent::class)
+    interface AppEntryPoint {
+        fun signalingClient(): SignalingClient
+        fun authTokenProvider(): AuthTokenProvider
     }
 
     override fun onCreate() {
@@ -35,6 +54,46 @@ class MessengerApp : Application(), ImageLoaderFactory {
             Timber.plant(Timber.DebugTree())
         }
         createNotificationChannels()
+        registerProcessLifecycleObserver()
+    }
+
+    /**
+     * Подписываемся на жизненный цикл процесса (а не отдельной Activity).
+     * Срабатывает когда первая Activity процесса попадает в foreground
+     * (onStart) и когда последняя уходит в background (onStop, ~700мс
+     * debounce от Lifecycle).
+     *
+     * Раньше presence слался из MainActivity.onStart/onStop, и на Samsung
+     * One UI бывало что Activity «зависала» в onStarted при выключении
+     * экрана — сервер видел юзера online хотя телефон лежал в кармане.
+     * ProcessLifecycleOwner это гарантированно ловит на уровне процесса.
+     */
+    private fun registerProcessLifecycleObserver() {
+        ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
+            override fun onStart(owner: LifecycleOwner) {
+                isInForeground = true
+                val entryPoint = EntryPointAccessors.fromApplication(
+                    this@MessengerApp, AppEntryPoint::class.java,
+                )
+                if (entryPoint.authTokenProvider().hasToken()) {
+                    val ws = entryPoint.signalingClient()
+                    ws.isAppForeground = true
+                    ws.sendPresence(true)
+                }
+            }
+
+            override fun onStop(owner: LifecycleOwner) {
+                isInForeground = false
+                val entryPoint = EntryPointAccessors.fromApplication(
+                    this@MessengerApp, AppEntryPoint::class.java,
+                )
+                if (entryPoint.authTokenProvider().hasToken()) {
+                    val ws = entryPoint.signalingClient()
+                    ws.isAppForeground = false
+                    ws.sendPresence(false)
+                }
+            }
+        })
     }
 
     /**

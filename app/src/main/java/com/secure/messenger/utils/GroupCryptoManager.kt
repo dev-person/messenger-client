@@ -127,6 +127,7 @@ class GroupCryptoManager @Inject constructor() {
         plaintext: String,
         senderKey: ByteArray,
         messageId: String,
+        aad: ByteArray? = null,
     ): String {
         val messageKey = hkdf(
             inputKeyMaterial = senderKey,
@@ -134,14 +135,30 @@ class GroupCryptoManager @Inject constructor() {
             info = HKDF_INFO_MSG.toByteArray(Charsets.UTF_8),
             outputLength = KEY_LENGTH_BYTES,
         )
-        return aesGcmEncrypt(plaintext.toByteArray(Charsets.UTF_8), messageKey)
+        return aesGcmEncrypt(plaintext.toByteArray(Charsets.UTF_8), messageKey, aad)
     }
 
-    /** null если дешифровка не удалась. */
+    /**
+     * null если дешифровка не удалась. Если [aad] задан — пробуем сначала
+     * с ним, потом без (fallback на pre-AAD сообщения). См. CryptoManager.
+     */
     fun decryptGroupMessage(
         encryptedBase64: String,
         senderKey: ByteArray,
         messageId: String,
+        aad: ByteArray? = null,
+    ): String? {
+        if (aad != null && aad.isNotEmpty()) {
+            decryptGroupInternal(encryptedBase64, senderKey, messageId, aad)?.let { return it }
+        }
+        return decryptGroupInternal(encryptedBase64, senderKey, messageId, null)
+    }
+
+    private fun decryptGroupInternal(
+        encryptedBase64: String,
+        senderKey: ByteArray,
+        messageId: String,
+        aad: ByteArray?,
     ): String? = runCatching {
         val messageKey = hkdf(
             inputKeyMaterial = senderKey,
@@ -149,12 +166,16 @@ class GroupCryptoManager @Inject constructor() {
             info = HKDF_INFO_MSG.toByteArray(Charsets.UTF_8),
             outputLength = KEY_LENGTH_BYTES,
         )
-        String(aesGcmDecrypt(encryptedBase64, messageKey), Charsets.UTF_8)
+        String(aesGcmDecrypt(encryptedBase64, messageKey, aad), Charsets.UTF_8)
+    }.onFailure { e ->
+        timber.log.Timber.v(
+            "decryptGroupMessage: failed for msg=$messageId aad=${aad != null}: ${e.javaClass.simpleName}",
+        )
     }.getOrNull()
 
     // ── Внутренности ──────────────────────────────────────────────────────
 
-    private fun aesGcmEncrypt(plaintext: ByteArray, key: ByteArray): String {
+    private fun aesGcmEncrypt(plaintext: ByteArray, key: ByteArray, aad: ByteArray? = null): String {
         val iv = ByteArray(IV_LENGTH_BYTES).also { secureRandom.nextBytes(it) }
         val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
         cipher.init(
@@ -162,6 +183,7 @@ class GroupCryptoManager @Inject constructor() {
             SecretKeySpec(key, "AES"),
             GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv),
         )
+        if (aad != null && aad.isNotEmpty()) cipher.updateAAD(aad)
         val ct = cipher.doFinal(plaintext)
         val out = ByteArray(iv.size + ct.size)
         System.arraycopy(iv, 0, out, 0, iv.size)
@@ -169,7 +191,7 @@ class GroupCryptoManager @Inject constructor() {
         return Base64.encodeToString(out, Base64.NO_WRAP)
     }
 
-    private fun aesGcmDecrypt(encryptedBase64: String, key: ByteArray): ByteArray {
+    private fun aesGcmDecrypt(encryptedBase64: String, key: ByteArray, aad: ByteArray? = null): ByteArray {
         val data = Base64.decode(encryptedBase64, Base64.NO_WRAP)
         val iv = data.copyOfRange(0, IV_LENGTH_BYTES)
         val ct = data.copyOfRange(IV_LENGTH_BYTES, data.size)
@@ -179,6 +201,7 @@ class GroupCryptoManager @Inject constructor() {
             SecretKeySpec(key, "AES"),
             GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv),
         )
+        if (aad != null && aad.isNotEmpty()) cipher.updateAAD(aad)
         return cipher.doFinal(ct)
     }
 

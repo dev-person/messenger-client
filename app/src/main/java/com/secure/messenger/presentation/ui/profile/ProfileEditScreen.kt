@@ -12,12 +12,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.luminance
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -79,6 +75,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import com.secure.messenger.BuildConfig
 import com.secure.messenger.presentation.ui.chat.AvatarImage
+import com.secure.messenger.presentation.ui.components.collapsibleAvatarDismissOnSwipe
 import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
 
@@ -265,7 +262,14 @@ fun ProfileEditScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.surfaceContainerLow),
+            .background(MaterialTheme.colorScheme.surfaceContainerLow)
+            // Свайп-вверх в любой точке экрана сворачивает раскрытый аватар.
+            // Применяется ДО внутреннего verticalScroll — gesture detector
+            // успевает перехватить жест до скролла.
+            .collapsibleAvatarDismissOnSwipe(
+                expanded = avatarExpanded,
+                onCollapse = { avatarExpanded = false },
+            ),
     ) {
         // ── OneUI-стиль: большой заголовок ─────────────────────────────────
         //  Скрывается когда аватар развернут — освобождает status-bar и
@@ -314,21 +318,9 @@ fun ProfileEditScreen(
                 }
             }
 
-            // Свайп ВНИЗ по карточке-аватару — свернуть. Триггер: totalDrag
-            // больше 20% expandedHeight (~10% высоты экрана). При движении
-            // карточка визуально следует за пальцем (translationY) — это даёт
-            // тактильный feedback, без него пользователю казалось, что свайп
-            // вообще не реагирует.
-            val swipeThresholdPx = with(LocalDensity.current) {
-                expandedHeightDp.toPx() * 0.20f
-            }
-            val dragY = remember { androidx.compose.animation.core.Animatable(0f) }
-            val swipeScope = rememberCoroutineScope()
-            // Сброс смещения при ручном collapse (через тап/back), иначе
-            // следующее открытие началось бы с уже сдвинутой карточки.
-            LaunchedEffect(avatarExpanded) {
-                if (!avatarExpanded) dragY.snapTo(0f)
-            }
+            // Карточка-аватар: только тап. Свайп-вверх для свёртывания
+            // вешается на уровень всего экрана (см. collapsibleAvatarDismissOnSwipe
+            // выше) — так юзер может смахнуть аватар откуда угодно.
             Surface(
                 shape = RoundedCornerShape(avatarCorner),
                 color = MaterialTheme.colorScheme.surface,
@@ -336,45 +328,6 @@ fun ProfileEditScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(avatarHeight)
-                    .graphicsLayer { translationY = dragY.value }
-                    .pointerInput(avatarExpanded) {
-                        if (!avatarExpanded) return@pointerInput
-                        var totalDrag = 0f
-                        detectVerticalDragGestures(
-                            onVerticalDrag = { change, delta ->
-                                if (delta > 0 || totalDrag > 0) {
-                                    totalDrag = (totalDrag + delta).coerceAtLeast(0f)
-                                    swipeScope.launch { dragY.snapTo(totalDrag) }
-                                    // Помечаем event'ы как использованные —
-                                    // иначе родительский verticalScroll
-                                    // ниже мог перехватывать жест.
-                                    change.consume()
-                                }
-                            },
-                            onDragEnd = {
-                                if (totalDrag > swipeThresholdPx) {
-                                    avatarExpanded = false
-                                } else {
-                                    swipeScope.launch {
-                                        dragY.animateTo(
-                                            0f,
-                                            androidx.compose.animation.core.tween(180),
-                                        )
-                                    }
-                                }
-                                totalDrag = 0f
-                            },
-                            onDragCancel = {
-                                swipeScope.launch {
-                                    dragY.animateTo(
-                                        0f,
-                                        androidx.compose.animation.core.tween(180),
-                                    )
-                                }
-                                totalDrag = 0f
-                            },
-                        )
-                    }
                     // Тап: если есть аватар — раскрываем/сворачиваем карточку
                     // (Telegram-style); если фото нет — сразу bottom sheet
                     // с выбором фото (нечего показывать в полном размере).

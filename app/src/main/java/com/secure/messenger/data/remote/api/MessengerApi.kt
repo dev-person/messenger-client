@@ -146,6 +146,32 @@ interface MessengerApi {
     @DELETE("chats/{chatId}")
     suspend fun deleteGroup(@Path("chatId") chatId: String): ApiResponse<Unit>
 
+    @GET("chats/{chatId}")
+    suspend fun getChatById(@Path("chatId") chatId: String): ApiResponse<ChatDto>
+
+    // ── Групповые звонки (1.0.71+) ──────────────────────────────────────────
+
+    @POST("chats/{chatId}/calls")
+    suspend fun startGroupCall(
+        @Path("chatId") chatId: String,
+        @Body body: com.secure.messenger.data.remote.api.dto.StartGroupCallDto,
+    ): ApiResponse<com.secure.messenger.data.remote.api.dto.GroupCallDto>
+
+    @GET("chats/{chatId}/calls/active")
+    suspend fun getActiveGroupCall(
+        @Path("chatId") chatId: String,
+    ): ApiResponse<com.secure.messenger.data.remote.api.dto.GroupCallDto?>
+
+    @POST("calls/group/{callId}/join")
+    suspend fun joinGroupCall(
+        @Path("callId") callId: String,
+    ): ApiResponse<com.secure.messenger.data.remote.api.dto.GroupCallDto>
+
+    @POST("calls/group/{callId}/leave")
+    suspend fun leaveGroupCall(
+        @Path("callId") callId: String,
+    ): ApiResponse<com.secure.messenger.data.remote.api.dto.GroupCallDto>
+
     @PATCH("chats/{chatId}/members/{userId}/role")
     suspend fun changeGroupRole(
         @Path("chatId") chatId: String,

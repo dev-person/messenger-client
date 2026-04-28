@@ -122,6 +122,22 @@ class WebRtcManager @Inject constructor(
         factoryInitialized = true
     }
 
+    /**
+     * Доступ к разделяемому [PeerConnectionFactory] и [eglBase] для других
+     * WebRTC-классов (например, GroupCallManager). Гарантирует что factory
+     * инициализирован.
+     */
+    fun sharedFactory(): PeerConnectionFactory {
+        ensureFactoryInitialized()
+        return peerConnectionFactory
+    }
+
+    /** Доступ для GroupCallManager — те же ICE-серверы (с TTL-кешем). */
+    suspend fun fetchIceServersForGroupCall(): List<PeerConnection.IceServer> {
+        refreshIceServersIfNeeded()
+        return cachedIceServers?.takeIf { it.isNotEmpty() } ?: fallbackIceServers()
+    }
+
     // ── Обработка сигнальных событий ──────────────────────────────────────────
 
     private fun listenToSignalingEvents() {
@@ -410,26 +426,31 @@ class WebRtcManager @Inject constructor(
         val videoSource = peerConnectionFactory.createVideoSource(videoCapturer!!.isScreencast)
 
         videoCapturer?.initialize(surfaceTextureHelper, context, videoSource.capturerObserver)
-        // Адаптация под качество сети: разрешение/частота кадров — золотая
-        // середина 960x540@24. 720p@30 на нестабильном интернете заваливал
-        // encoder и аудио (он отбирал bandwidth, congestion control не
-        // успевал за ним). Полный HD большинству пользователей не нужен —
-        // на 6" экране 540p выглядит чисто, а сеть успевает.
-        videoCapturer?.startCapture(960, 540, 24)
+        // Захват в 720p@30 — потолок качества для 1:1 звонка. Реальное
+        // отдаваемое видео полностью адаптивно: Google Congestion Control
+        // (TWCC) на каждой стороне меряет пропускную способность канала и
+        // сам подстраивает битрейт/разрешение в обе стороны.
+        //
+        // Раньше захватывали 960x540@24 потому что 720p@30 при cap'е 800 kbps
+        // «душил» аудио — encoder отбирал bandwidth, congestion control не
+        // успевал. Теперь cap поднят до 1.5 Mbps (стандарт LiveKit/Meet/Zoom
+        // для 720p@30 H.264) — encoder больше не «грызётся» с аудио.
+        videoCapturer?.startCapture(1280, 720, 30)
 
         localVideoTrack = peerConnectionFactory.createVideoTrack("video_track", videoSource)
         _localVideoTrack.value = localVideoTrack
         val sender = peerConnection?.addTrack(localVideoTrack!!)
 
-        // Cap на bitrate видео + предпочтение по деградации:
-        //  - maxBitrate 800 kbps — потолок при отличной сети; congestion
-        //    control будет уменьшать до 100-300 kbps при плохой;
-        //  - degradationPreference=MAINTAIN_FRAMERATE — лучше резать
-        //    разрешение, чем превращать видео в слайд-шоу.
+        // Адаптация под качество сети:
+        //  - maxBitrate 1.5 Mbps — потолок при отличной сети;
+        //    при плохой WebRTC сам сожмёт до 100-300 kbps;
+        //  - degradationPreference=MAINTAIN_FRAMERATE — на просадке режется
+        //    разрешение, fps остаётся плавным (лучше «чуть мыльно но плавно»,
+        //    чем «чётко но слайд-шоу»).
         sender?.parameters?.let { params ->
             params.encodings.forEach { enc ->
-                enc.maxBitrateBps = 800_000
-                enc.maxFramerate = 24
+                enc.maxBitrateBps = 1_500_000
+                enc.maxFramerate = 30
             }
             params.degradationPreference =
                 org.webrtc.RtpParameters.DegradationPreference.MAINTAIN_FRAMERATE

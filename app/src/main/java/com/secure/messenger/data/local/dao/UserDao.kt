@@ -26,6 +26,10 @@ interface UserDao {
     @Query("SELECT * FROM users WHERE id = :userId")
     suspend fun getById(userId: String): UserEntity?
 
+    /** Бэтчевый lookup для batch-upsert: один SQL вместо N getById в цикле. */
+    @Query("SELECT * FROM users WHERE id IN (:userIds)")
+    suspend fun getByIds(userIds: List<String>): List<UserEntity>
+
     @Query("SELECT * FROM users WHERE id = :userId")
     fun observeById(userId: String): Flow<UserEntity?>
 

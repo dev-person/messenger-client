@@ -113,6 +113,10 @@ object AppModule {
                 AppDatabase.MIGRATION_1_2,
                 AppDatabase.MIGRATION_2_3,
                 AppDatabase.MIGRATION_3_4,
+                AppDatabase.MIGRATION_4_5,
+                AppDatabase.MIGRATION_5_6,
+                AppDatabase.MIGRATION_6_7,
+                AppDatabase.MIGRATION_7_8,
             )
             .fallbackToDestructiveMigration()
             .addCallback(object : androidx.room.RoomDatabase.Callback() {
@@ -134,6 +138,7 @@ object AppModule {
     @Provides fun provideMessageDao(db: AppDatabase) = db.messageDao()
     @Provides fun provideUserDao(db: AppDatabase) = db.userDao()
     @Provides fun provideGroupSenderKeyDao(db: AppDatabase) = db.groupSenderKeyDao()
+    @Provides fun provideChatMemberDao(db: AppDatabase) = db.chatMemberDao()
 }
 
 /**

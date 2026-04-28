@@ -35,6 +35,17 @@ import okhttp3.RequestBody.Companion.toRequestBody
  */
 class FcmService : FirebaseMessagingService() {
 
+    companion object {
+        /** Extra-ключ Intent'а уведомления — chatId, который надо открыть после тапа. */
+        const val EXTRA_OPEN_CHAT_ID = "open_chat_id"
+
+        /** Extras для тапа по FCM-уведомлению о входящем звонке. */
+        const val EXTRA_INCOMING_CALL_ID    = "incoming_call_id"
+        const val EXTRA_INCOMING_CALLER_ID  = "incoming_caller_id"
+        const val EXTRA_INCOMING_CALL_VIDEO = "incoming_call_video"
+        const val EXTRA_INCOMING_CALLER_NAME = "incoming_caller_name"
+    }
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // EncryptedSharedPreferences для чтения auth-токена без DI
@@ -137,9 +148,18 @@ class FcmService : FirebaseMessagingService() {
 
     private fun showMessageNotification(data: Map<String, String>) {
         val senderName = data["senderName"]?.takeIf { it.isNotBlank() } ?: "Grizzly Messenger"
+        val chatId = data["chatId"]
+        // Уникальный requestCode на каждый чат — иначе FLAG_UPDATE_CURRENT ломает
+        // extras: уведомления разных чатов делят один и тот же PendingIntent и
+        // открывали бы один и тот же чат.
+        val requestCode = chatId?.hashCode() ?: 0
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            if (chatId != null) putExtra(EXTRA_OPEN_CHAT_ID, chatId)
+        }
         val openIntent = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, MainActivity::class.java),
+            this, requestCode,
+            intent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
 
@@ -203,10 +223,24 @@ class FcmService : FirebaseMessagingService() {
     private fun showCallNotification(data: Map<String, String>) {
         val callerName = data["callerName"]?.takeIf { it.isNotBlank() } ?: "Grizzly Messenger"
         val isVideo = data["isVideo"] == "true"
+        val callId = data["callId"].orEmpty()
+        val callerId = data["callerId"].orEmpty()
         val title = if (isVideo) "Входящий видеозвонок" else "Входящий звонок"
+
+        // ВАЖНО: кладём данные звонка в extras. Без них тап по уведомлению
+        // открывает MainActivity «голым» — экран звонка не появляется
+        // (а WS-event incoming_call мог не дойти если процесс был убит,
+        // FCM-fallback это и должен покрывать). MainActivity по этим
+        // extras сам поднимет CallScreen в RINGING-состоянии.
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(EXTRA_INCOMING_CALL_ID, callId)
+            putExtra(EXTRA_INCOMING_CALLER_ID, callerId)
+            putExtra(EXTRA_INCOMING_CALL_VIDEO, isVideo)
+            putExtra(EXTRA_INCOMING_CALLER_NAME, callerName)
+        }
         val openIntent = PendingIntent.getActivity(
-            this, 1,
-            Intent(this, MainActivity::class.java),
+            this, 1, intent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
 

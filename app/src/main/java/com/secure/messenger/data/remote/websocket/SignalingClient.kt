@@ -42,6 +42,37 @@ sealed class SignalingEvent {
     data class GroupRoleChanged(val chatId: String, val userId: String, val role: String) : SignalingEvent()
     data class GroupDeleted(val chatId: String) : SignalingEvent()
     data class GroupSenderKeyReady(val chatId: String, val ownerId: String, val epoch: Int) : SignalingEvent()
+    // ── Групповые звонки (1.0.71+) ─────────────────────────────────────────
+    /**
+     * Пришёл групповой звонок в чате [chatId]. Юзер должен показать UI входящего.
+     * [invitedUserIds] — кому показывать full-screen ringing. Пустой список означает,
+     * что инициатор не указал явного приглашения (приглашает всех). Если мой userId
+     * не в этом списке — показываем только плашку «Идёт групповой звонок» в чате
+     * без рингтона / fullscreen.
+     */
+    data class GroupCallInvite(
+        val callId: String,
+        val chatId: String,
+        val startedBy: String,
+        val type: String,   // AUDIO / VIDEO
+        val invitedUserIds: List<String>,
+    ) : SignalingEvent()
+    /** Кто-то присоединился к идущему групповому звонку — установить с ним peer connection. */
+    data class GroupCallParticipantJoined(val callId: String, val userId: String) : SignalingEvent()
+    /** Кто-то вышел — закрыть с ним peer connection. */
+    data class GroupCallParticipantLeft(val callId: String, val userId: String) : SignalingEvent()
+    /** Звонок завершился (последний вышел). UI закрывает экран и очищает peers. */
+    data class GroupCallEnded(val callId: String) : SignalingEvent()
+    /** Mesh-сигналинг: SDP offer от одного пира к другому в рамках группового звонка. */
+    data class GroupCallOffer(val callId: String, val from: String, val sdp: String) : SignalingEvent()
+    data class GroupCallAnswer(val callId: String, val from: String, val sdp: String) : SignalingEvent()
+    data class GroupCallIce(
+        val callId: String,
+        val from: String,
+        val candidate: String,
+        val sdpMid: String?,
+        val sdpMLineIndex: Int,
+    ) : SignalingEvent()
     object Connected : SignalingEvent()
     object Disconnected : SignalingEvent()
 }
@@ -251,6 +282,46 @@ class SignalingClient @Inject constructor(
                 ownerId = payload["ownerId"] as? String ?: return,
                 epoch = (payload["epoch"] as? Double)?.toInt() ?: 0,
             )
+            // ── Групповые звонки (1.0.71+) ───────────────────────────────
+            "group_call_invite" -> {
+                @Suppress("UNCHECKED_CAST")
+                val invited = (payload["invitedUserIds"] as? List<String>).orEmpty()
+                SignalingEvent.GroupCallInvite(
+                    callId = payload["callId"] as? String ?: return,
+                    chatId = payload["chatId"] as? String ?: return,
+                    startedBy = payload["startedBy"] as? String ?: return,
+                    type = payload["type"] as? String ?: "AUDIO",
+                    invitedUserIds = invited,
+                )
+            }
+            "group_call_participant_joined" -> SignalingEvent.GroupCallParticipantJoined(
+                callId = payload["callId"] as? String ?: return,
+                userId = payload["userId"] as? String ?: return,
+            )
+            "group_call_participant_left" -> SignalingEvent.GroupCallParticipantLeft(
+                callId = payload["callId"] as? String ?: return,
+                userId = payload["userId"] as? String ?: return,
+            )
+            "group_call_ended" -> SignalingEvent.GroupCallEnded(
+                callId = payload["callId"] as? String ?: return,
+            )
+            "group_call_offer" -> SignalingEvent.GroupCallOffer(
+                callId = payload["callId"] as? String ?: return,
+                from = payload["from"] as? String ?: return,
+                sdp = payload["sdp"] as? String ?: return,
+            )
+            "group_call_answer" -> SignalingEvent.GroupCallAnswer(
+                callId = payload["callId"] as? String ?: return,
+                from = payload["from"] as? String ?: return,
+                sdp = payload["sdp"] as? String ?: return,
+            )
+            "group_call_ice" -> SignalingEvent.GroupCallIce(
+                callId = payload["callId"] as? String ?: return,
+                from = payload["from"] as? String ?: return,
+                candidate = payload["candidate"] as? String ?: return,
+                sdpMid = payload["sdpMid"] as? String,
+                sdpMLineIndex = (payload["sdpMLineIndex"] as? Double)?.toInt() ?: 0,
+            )
             else -> {
                 Timber.w("Unknown signaling type: ${msg.type}")
                 return
@@ -340,6 +411,43 @@ class SignalingClient @Inject constructor(
             "chatId" to chatId,
             "messageId" to messageId,
             "encryptedContent" to encryptedContent,
+        ))
+    }
+
+    // ── Mesh-сигналинг для групповых звонков (1.0.71+) ─────────────────────
+    // В отличие от 1-1 (где peerUserId хранится в стейте клиента), здесь
+    // адрес peer'а явно передаётся в [toUserId] на каждый вызов — у нас N
+    // одновременных peer connection'ов в одном групповом звонке.
+
+    fun sendGroupCallOffer(callId: String, toUserId: String, sdp: String) {
+        send("group_call_offer", mapOf(
+            "callId" to callId,
+            "to" to toUserId,
+            "sdp" to sdp,
+        ))
+    }
+
+    fun sendGroupCallAnswer(callId: String, toUserId: String, sdp: String) {
+        send("group_call_answer", mapOf(
+            "callId" to callId,
+            "to" to toUserId,
+            "sdp" to sdp,
+        ))
+    }
+
+    fun sendGroupCallIce(
+        callId: String,
+        toUserId: String,
+        candidate: String,
+        sdpMid: String?,
+        sdpMLineIndex: Int,
+    ) {
+        send("group_call_ice", mapOf(
+            "callId" to callId,
+            "to" to toUserId,
+            "candidate" to candidate,
+            "sdpMid" to sdpMid,
+            "sdpMLineIndex" to sdpMLineIndex,
         ))
     }
 }

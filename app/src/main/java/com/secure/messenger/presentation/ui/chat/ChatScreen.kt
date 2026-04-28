@@ -94,6 +94,7 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
@@ -227,6 +228,13 @@ fun ChatScreen(
     onBack: () -> Unit,
     onCallClick: (userId: String, isVideo: Boolean, peerName: String) -> Unit,
     onGroupInfoClick: (chatId: String) -> Unit = {},
+    /** Тап по кнопке звонка в шапке группы — открывает picker (выбор участников). */
+    onGroupCallClick: (chatId: String, isVideo: Boolean) -> Unit = { _, _ -> },
+    /**
+     * Тап по плашке «Идёт групповой звонок» — присоединяемся к идущему звонку
+     * напрямую, без picker'а. Picker имеет смысл только для нового звонка.
+     */
+    onJoinGroupCall: (chatId: String, callId: String, isVideo: Boolean) -> Unit = { _, _, _ -> },
     viewModel: ChatViewModel = hiltViewModel(),
 ) {
     val messages by viewModel.messages.collectAsStateWithLifecycle()
@@ -244,6 +252,7 @@ fun ChatScreen(
     val isTyping by viewModel.isTyping.collectAsStateWithLifecycle()
     val isRecording by viewModel.isRecording.collectAsStateWithLifecycle()
     val recordingSeconds by viewModel.recordingSeconds.collectAsStateWithLifecycle()
+    val activeCall by viewModel.activeCall.collectAsStateWithLifecycle()
     val recordingWaveform by viewModel.recordingWaveform.collectAsStateWithLifecycle()
     val pendingVoice by viewModel.pendingVoice.collectAsStateWithLifecycle()
     val albumProgress by viewModel.albumSendProgress.collectAsStateWithLifecycle()
@@ -335,6 +344,7 @@ fun ChatScreen(
         UserProfileDialog(
             user = user,
             isOnline = isOtherOnline,
+            myPublicKey = viewModel.myPublicKey,
             onDismiss = { showProfileUser = null },
         )
     }
@@ -371,13 +381,16 @@ fun ChatScreen(
 
     // ── Умная подгрузка старых сообщений ──────────────────────────────────
     // В reverseLayout=true листание ВВЕРХ (к старым) = увеличение индекса.
-    // Триггерим подгрузку, когда до верхнего конца списка осталось ≤ 5
-    // айтемов — так, чтобы новые сообщения успели подъехать невидимо для
-    // пользователя. loadOlderMessages() сам защищён от retry-шторма.
+    // Триггерим префетч когда юзер прокрутил уже 80% от текущего размера
+    // списка (т.е. до верха осталось ~20%) — даём сети время подсосать
+    // следующую страницу до того, как юзер реально доскроллит до края.
+    // Минимум 5 айтемов, чтобы на коротких списках не дёргать сразу при
+    // первой отрисовке. loadOlderMessages() сам защищён от retry-шторма.
     LaunchedEffect(listState, reversedItems.size) {
         if (reversedItems.isEmpty()) return@LaunchedEffect
+        val threshold = maxOf(5, (reversedItems.size * 0.2f).toInt())
         snapshotFlow { listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1 }
-            .filter { it >= 0 && it >= reversedItems.size - 5 }
+            .filter { it >= 0 && it >= reversedItems.size - threshold }
             .collect { viewModel.loadOlderMessages() }
     }
 
@@ -441,9 +454,20 @@ fun ChatScreen(
                         drawContent()
                     },
             ) {
-                // Плашка-подсказка когда чат пустой
-                if (messages.isEmpty() && !uiState.isLoadingOlder) {
-                    EmptyChatHint()
+                // Skeleton vs пустой чат vs реальный контент.
+                // Skeleton показываем только пока init-fetch ещё не завершён И
+                // в кеше пусто — после этого либо реальный список, либо плашка
+                // «нет сообщений». Раньше при холодном кеше юзер видел сразу
+                // EmptyChatHint и потом резко прыгающий настоящий список.
+                if (messages.isEmpty()) {
+                    if (uiState.isInitialLoading) {
+                        ChatMessagesSkeleton(
+                            topPadding = topBarHeightDp + 8.dp,
+                            bottomPadding = inputBarHeightDp + 8.dp,
+                        )
+                    } else if (!uiState.isLoadingOlder) {
+                        EmptyChatHint()
+                    }
                 }
 
                 LazyColumn(
@@ -587,25 +611,58 @@ fun ChatScreen(
                     chatInfo = chatInfo,
                     currentUserId = currentUserId,
                     isOtherOnline = isOtherOnline,
+                    otherUserLastSeen = otherUser?.lastSeen ?: 0L,
                     isTyping = isTyping,
                     groupMemberCount = groupMembers.size,
                     groupOnlineCount = groupOnlineCount,
                     groupTypingNames = groupTypingNames.values.toList(),
                     onBack = onBack,
                     onCallClick = onCallClick,
+                    onGroupCallClick = onGroupCallClick,
                     onAvatarClick = { otherUser?.let { showProfileUser = it } },
                     onGroupInfoClick = { chatInfo?.id?.let(onGroupInfoClick) },
                 )
-                if (chatInfo?.type == ChatType.GROUP && hasOutdatedMembers) {
+
+                // Плашка «Идёт звонок · вернуться» — под шапкой чата.
+                // Появляется когда юзер свернул экран звонка (back/PiP) и
+                // даёт быстрый способ вернуться, не путаясь по приложению.
+                activeCall?.let { call ->
+                    com.secure.messenger.presentation.navigation.OngoingCallBar(
+                        isVideo = call.type == com.secure.messenger.domain.model.CallType.VIDEO,
+                        onClick = {
+                            onCallClick(
+                                call.callerId,
+                                call.type == com.secure.messenger.domain.model.CallType.VIDEO,
+                                otherUser?.displayName.orEmpty().ifEmpty { call.callerId },
+                            )
+                        },
+                    )
+                }
+                // Плашку «не обновили приложение» можно скрыть крестиком
+                // навсегда — флаг хранится в SharedPreferences по chatId.
+                // В GroupInfoScreen плашка остаётся в любом случае (там она
+                // полезна — видно конкретно кто отстал по версиям).
+                val outdatedBannerCtx = androidx.compose.ui.platform.LocalContext.current
+                val outdatedPrefs = remember {
+                    outdatedBannerCtx.getSharedPreferences(
+                        "outdated_banner_hidden", android.content.Context.MODE_PRIVATE,
+                    )
+                }
+                var hideOutdatedBanner by remember(chatInfo?.id) {
+                    mutableStateOf(
+                        chatInfo?.id?.let { outdatedPrefs.getBoolean(it, false) } ?: false,
+                    )
+                }
+                if (chatInfo?.type == ChatType.GROUP && hasOutdatedMembers && !hideOutdatedBanner) {
                     Surface(
                         color = MaterialTheme.colorScheme.errorContainer,
                         shadowElevation = 0.dp,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { chatInfo?.id?.let(onGroupInfoClick) },
+                        modifier = Modifier.fillMaxWidth(),
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(start = 16.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Icon(
@@ -619,7 +676,66 @@ fun ChatScreen(
                                 text = "Кто-то из участников ещё не обновил приложение и не сможет читать сообщения",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable { chatInfo?.id?.let(onGroupInfoClick) },
                             )
+                            IconButton(onClick = {
+                                hideOutdatedBanner = true
+                                chatInfo?.id?.let { id ->
+                                    outdatedPrefs.edit().putBoolean(id, true).apply()
+                                }
+                            }) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Скрыть",
+                                    tint = MaterialTheme.colorScheme.onErrorContainer,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Плашка «Идёт групповой звонок · Присоединиться»
+                val activeGroupCall by viewModel.activeGroupCall.collectAsStateWithLifecycle()
+                activeGroupCall?.let { gc ->
+                    Surface(
+                        color = Color(0xFF2E7D32), // success green
+                        shadowElevation = 0.dp,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                onJoinGroupCall(gc.chatId, gc.id, gc.type == "VIDEO")
+                            },
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                imageVector = if (gc.type == "VIDEO") Icons.Default.Videocam
+                                              else Icons.Default.Call,
+                                contentDescription = null,
+                                tint = Color.White,
+                                modifier = Modifier.size(18.dp),
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = if (gc.type == "VIDEO") "Идёт групповой видеозвонок"
+                                           else "Идёт групповой звонок",
+                                    color = Color.White,
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                                val activeCount = gc.participants.count { it.leftAt == null }
+                                Text(
+                                    text = "$activeCount ${pluralRu(activeCount, "участник", "участника", "участников")} · Тапните чтобы присоединиться",
+                                    color = Color.White.copy(alpha = 0.9f),
+                                    fontSize = 12.sp,
+                                )
+                            }
                         }
                     }
                 }
@@ -723,12 +839,14 @@ private fun ChatTopBar(
     chatInfo: Chat?,
     currentUserId: String?,
     isOtherOnline: Boolean,
+    otherUserLastSeen: Long,
     isTyping: Boolean,
     groupMemberCount: Int = 0,
     groupOnlineCount: Int = 0,
     groupTypingNames: List<String> = emptyList(),
     onBack: () -> Unit,
     onCallClick: (userId: String, isVideo: Boolean, peerName: String) -> Unit,
+    onGroupCallClick: (chatId: String, isVideo: Boolean) -> Unit = { _, _ -> },
     onAvatarClick: () -> Unit = {},
     onGroupInfoClick: () -> Unit = {},
 ) {
@@ -792,20 +910,34 @@ private fun ChatTopBar(
                     // экран информации; для direct — профиль собеседника.
                     .clickable(onClick = if (isDirectChat) onAvatarClick else onGroupInfoClick),
             ) {
-                Text(
-                    text = chatInfo?.title ?: "Чат",
-                    style = MaterialTheme.typography.headlineMedium,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 22.sp,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                if (chatInfo?.title.isNullOrBlank()) {
+                    // Skeleton-полоска вместо фолбэка «Чат» пока chatInfo не
+                    // подъехал из БД. Раньше юзер успевал увидеть слово «Чат»
+                    // в шапке — Eagerly StateFlow + skeleton убирают это окно.
+                    Box(
+                        modifier = Modifier
+                            .height(28.dp)
+                            .fillMaxWidth(0.45f)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f)),
+                    )
+                } else {
+                    Text(
+                        text = chatInfo?.title.orEmpty(),
+                        style = MaterialTheme.typography.headlineMedium,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 22.sp,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
                 val isGroupTyping = chatInfo?.type == ChatType.GROUP && groupTypingNames.isNotEmpty()
                 val subtitle = chatSubtitle(
                     chat = chatInfo,
                     isDirectChat = isDirectChat,
                     isOtherOnline = isOtherOnline,
+                    otherUserLastSeen = otherUserLastSeen,
                     isDirectTyping = isTyping,
                     groupMemberCount = groupMemberCount,
                     groupOnlineCount = groupOnlineCount,
@@ -824,6 +956,11 @@ private fun ChatTopBar(
                     )
                 }
             }
+
+            // Кнопки группового звонка теперь живут в шапке экрана
+            // «Информация о группе» (большие таблетки «Аудио» / «Видео»).
+            // В шапке chat'а их не показываем — иконки в шапке оставлены
+            // только для DIRECT-чатов (1-на-1 звонки).
 
             // Кнопка меню действий (3 точки) — звонки и др. (скрыто для бота)
             val isBotPeer = peerId == "00000000-0000-0000-0000-000000000001"
@@ -929,6 +1066,7 @@ private fun chatSubtitle(
     chat: Chat?,
     isDirectChat: Boolean,
     isOtherOnline: Boolean,
+    otherUserLastSeen: Long,
     isDirectTyping: Boolean,
     groupMemberCount: Int,
     groupOnlineCount: Int,
@@ -937,7 +1075,10 @@ private fun chatSubtitle(
     // DIRECT
     isDirectChat && isDirectTyping -> "печатает..."
     isDirectChat && isOtherOnline -> "в сети"
-    isDirectChat -> "не в сети"
+    isDirectChat -> {
+        val rel = com.secure.messenger.utils.RelativeTimeFormatter.format(otherUserLastSeen)
+        if (rel != null) "был(а) в сети $rel" else "не в сети"
+    }
     // GROUP
     chat?.type == ChatType.GROUP && groupTypingNames.isNotEmpty() ->
         groupTypingSubtitle(groupTypingNames)
@@ -977,12 +1118,60 @@ private fun GroupSenderLabel(
     )
 }
 
+/**
+ * Версия label'а с собственной плашкой-фоном — для случаев когда имя
+ * рендерится поверх стикера / картинки / jumbo-эмодзи (без bubble).
+ * Без фона текст терялся бы на пёстром контенте.
+ */
+@Composable
+private fun GroupSenderBadge(
+    name: String,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
+        modifier = modifier,
+    ) {
+        Text(
+            text = name,
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.primary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+        )
+    }
+}
+
+/**
+ * Превращает серверный raw-текст системного сообщения о звонке в текст
+ * с учётом стороны зрителя:
+ *  - я звонил («исходящий») → «Исходящий звонок · 5:23», «Звонок без ответа»
+ *  - мне звонили («входящий») → «Входящий звонок · 5:23», «Пропущенный звонок»
+ *
+ * isOwnMessage = true когда senderId системного сообщения совпадает с моим
+ * userId (для звонка senderId = callerId). Не-звонковые системные сообщения
+ * возвращаются как есть.
+ */
 private fun displaySystemMessageText(rawText: String, isOwnMessage: Boolean): String {
-    if (!isOwnMessage) return rawText
-    return when {
-        rawText == "Пропущенный Звонок"      -> "Звонок без ответа"
-        rawText == "Пропущенный Видеозвонок" -> "Видеозвонок без ответа"
-        else                                  -> rawText
+    return when (rawText) {
+        // Пропущенные / без ответа
+        "Пропущенный Звонок"      -> if (isOwnMessage) "Звонок без ответа" else "Пропущенный звонок"
+        "Пропущенный Видеозвонок" -> if (isOwnMessage) "Видеозвонок без ответа" else "Пропущенный видеозвонок"
+        // Отклонённые
+        "Звонок отклонён"      -> if (isOwnMessage) "Исходящий звонок отклонён" else "Входящий звонок отклонён"
+        "Видеозвонок отклонён" -> if (isOwnMessage) "Исходящий видеозвонок отклонён" else "Входящий видеозвонок отклонён"
+        else -> {
+            // Завершённые: «Звонок · 5:23» / «Видеозвонок · 5:23»
+            val direction = if (isOwnMessage) "Исходящий" else "Входящий"
+            when {
+                rawText.startsWith("Звонок · ")      -> "$direction звонок · ${rawText.removePrefix("Звонок · ")}"
+                rawText.startsWith("Видеозвонок · ") -> "$direction видеозвонок · ${rawText.removePrefix("Видеозвонок · ")}"
+                else -> rawText
+            }
+        }
     }
 }
 
@@ -1058,6 +1247,67 @@ private fun EmptyChatHint() {
     }
 }
 
+// ── Skeleton для пустого/загружающегося чата ─────────────────────────────────
+// Несколько серых «псевдо-пузырей» вместо «нет сообщений» пока init-fetch не
+// завершился. Юзер видит знакомый телеграмо-подобный плейсхолдер, а не голый
+// EmptyChatHint, который потом резко сменяется реальной перепиской.
+
+@Composable
+private fun ChatMessagesSkeleton(
+    topPadding: androidx.compose.ui.unit.Dp,
+    bottomPadding: androidx.compose.ui.unit.Dp,
+) {
+    val pulse by androidx.compose.animation.core.rememberInfiniteTransition(label = "skeleton")
+        .animateFloat(
+            initialValue = 0.5f,
+            targetValue = 1f,
+            animationSpec = androidx.compose.animation.core.infiniteRepeatable(
+                animation = androidx.compose.animation.core.tween(900),
+                repeatMode = androidx.compose.animation.core.RepeatMode.Reverse,
+            ),
+            label = "skeleton-pulse",
+        )
+    val placeholderColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f * pulse + 0.04f)
+
+    // Заранее подготовленный список «пузырей» — чередуем чужие/свои разных
+    // ширин для естественности. Снизу самые свежие (как в reverseLayout).
+    val bubbles = remember {
+        listOf(
+            BubbleSpec(isOutgoing = false, widthFraction = 0.55f),
+            BubbleSpec(isOutgoing = true,  widthFraction = 0.40f),
+            BubbleSpec(isOutgoing = false, widthFraction = 0.70f),
+            BubbleSpec(isOutgoing = true,  widthFraction = 0.50f),
+            BubbleSpec(isOutgoing = false, widthFraction = 0.35f),
+            BubbleSpec(isOutgoing = true,  widthFraction = 0.60f),
+            BubbleSpec(isOutgoing = false, widthFraction = 0.45f),
+        )
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(top = topPadding, bottom = bottomPadding, start = 12.dp, end = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        bubbles.forEach { spec ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = if (spec.isOutgoing) Arrangement.End else Arrangement.Start,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(spec.widthFraction)
+                        .height(36.dp)
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(placeholderColor),
+                )
+            }
+        }
+    }
+}
+
+private data class BubbleSpec(val isOutgoing: Boolean, val widthFraction: Float)
+
 // ── Пузырь сообщения ──────────────────────────────────────────────────────────
 
 @Composable
@@ -1112,6 +1362,14 @@ private fun MessageBubble(
     // Активируется для IMAGE без цитаты. Стикеры дополнительно скрывают мета-оверлей.
     val isMediaOnly = message.type == MessageType.IMAGE && replyTo == null
 
+    // Большой режим для emoji-only сообщений (1-3 эмодзи без текста).
+    // Рендерим без bubble и крупным размером — как в Telegram/WhatsApp.
+    val isJumboEmoji = remember(message.id, message.content, message.type) {
+        message.type == MessageType.TEXT &&
+            replyTo == null &&
+            com.secure.messenger.utils.EmojiUtils.isJumboCandidate(message.content)
+    }
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -1123,9 +1381,9 @@ private fun MessageBubble(
                 modifier = Modifier
                     .widthIn(max = if (isMediaOnly) 260.dp else 280.dp)
                     .then(
-                        // В медиа-режиме (стикеры/анимации/картинки) не клипаем углы —
-                        // у медиа собственная форма с прозрачностью, скругление искажает её.
-                        if (isMediaOnly) Modifier
+                        // В медиа-режиме (стикеры/анимации/картинки) и в jumbo-emoji
+                        // режиме не клипаем углы и не рисуем фон — контент сам по себе.
+                        if (isMediaOnly || isJumboEmoji) Modifier
                         else Modifier.clip(shape).background(bubbleColor)
                     )
                     .longPressActionable(
@@ -1136,17 +1394,24 @@ private fun MessageBubble(
                     )
                     .then(
                         if (isMediaOnly) Modifier
+                        else if (isJumboEmoji) Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
                         else Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
                     )
                     .animateContentSize(),
             ) {
                 // Имя автора в групповом чате (только для чужих сообщений).
-                // Показываем ВНУТРИ bubble сверху; для медиа-режима (стикеры,
-                // одиночные картинки) подавляем — там нет фона, имя смотрелось
-                // бы инородно поверх контента.
-                if (senderName != null && !isOutgoing && !isMediaOnly) {
-                    GroupSenderLabel(name = senderName)
-                    Spacer(modifier = Modifier.height(2.dp))
+                //   - В обычных bubble-сообщениях имя цветное primary, без фона.
+                //   - В медиа-режиме (стикер, картинка) и для jumbo-эмодзи
+                //     bubble-фона нет, имя на пёстром контенте теряется —
+                //     показываем плашку с полупрозрачным фоном.
+                if (senderName != null && !isOutgoing) {
+                    if (isMediaOnly || isJumboEmoji) {
+                        GroupSenderBadge(name = senderName)
+                        Spacer(modifier = Modifier.height(4.dp))
+                    } else {
+                        GroupSenderLabel(name = senderName)
+                        Spacer(modifier = Modifier.height(2.dp))
+                    }
                 }
 
                 // Цитата (если ответ на другое сообщение)
@@ -1175,11 +1440,24 @@ private fun MessageBubble(
                                 menuVisible = true
                             },
                         )
-                        else -> Text(
-                            text = message.content,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = textColor,
-                        )
+                        else -> {
+                            if (isJumboEmoji) {
+                                // Один-три эмодзи без bubble — выводим крупно,
+                                // чтобы выглядело выразительно (стиль Telegram).
+                                Text(
+                                    text = message.content,
+                                    fontSize = 56.sp,
+                                    lineHeight = 64.sp,
+                                    color = textColor,
+                                )
+                            } else {
+                                Text(
+                                    text = message.content,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = textColor,
+                                )
+                            }
+                        }
                     }
 
                     // В медиа-режиме метаданные оверлеем поверх правого нижнего угла
@@ -2813,8 +3091,10 @@ private fun LiveWaveform(
 private fun UserProfileDialog(
     user: User,
     isOnline: Boolean,
+    myPublicKey: String?,
     onDismiss: () -> Unit,
 ) {
+    var showSafetyDialog by remember { mutableStateOf(false) }
     val serverRoot = BuildConfig.API_BASE_URL.removeSuffix("v1/").trimEnd('/')
     val resolvedAvatarUrl = user.avatarUrl?.let { url ->
         when {
@@ -2939,9 +3219,124 @@ private fun UserProfileDialog(
                             value = user.bio,
                         )
                     }
+
+                    // ── Сквозное шифрование ──────────────────────────────
+                    // Опциональная фича для тех, кому важна паранойя — даём
+                    // возможность сверить отпечаток ключа с собеседником.
+                    // Большинству юзеров это не нужно, но секция остаётся
+                    // невыпирающей: «Шифрование» + история смен ключа, тап
+                    // раскрывает подробности.
+                    if (!myPublicKey.isNullOrBlank() && user.publicKey.isNotBlank()) {
+                        val ctx = androidx.compose.ui.platform.LocalContext.current
+                        val history = remember(user.id) {
+                            com.secure.messenger.data.local.KeyChangeTracker
+                                .getHistory(ctx, user.id)
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { showSafetyDialog = true }
+                                .padding(top = 4.dp),
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.padding(12.dp),
+                            ) {
+                                Icon(
+                                    Icons.Filled.Lock,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(22.dp),
+                                )
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "Сквозное шифрование",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.Medium,
+                                    )
+                                    Text(
+                                        text = if (history.isEmpty())
+                                            "Сверить код безопасности"
+                                        else
+                                            "Сверить код безопасности · ключ менялся ${history.size} ${pluralRu(history.size, "раз", "раза", "раз")}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.primary,
+                                    )
+                                }
+                            }
+                        }
+
+                        // ── История смен ключа ──────────────────────────
+                        // Показываем последние ~5 записей: дата + короткий
+                        // отпечаток. Мотивация — юзер видит «А, у Боба
+                        // ключ менялся в марте — он переустанавливал телефон,
+                        // помню». Если внезапная смена «вчера» — повод
+                        // насторожиться и сверить код.
+                        if (history.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "Изменения ключа",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontSize = 11.sp,
+                                modifier = Modifier.padding(start = 4.dp),
+                            )
+                            history.take(5).forEach { entry ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 4.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(6.dp)
+                                            .clip(CircleShape)
+                                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)),
+                                    )
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Text(
+                                        text = formatTimestampRu(entry.timestampMs),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    Text(
+                                        text = entry.fingerprint,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        fontSize = 11.sp,
+                                    )
+                                }
+                            }
+                            if (history.size > 5) {
+                                Text(
+                                    text = "и ещё ${history.size - 5}…",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    fontSize = 11.sp,
+                                    modifier = Modifier.padding(start = 16.dp),
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
+
+    // Диалог safety code — показывается отдельно поверх профиля
+    if (showSafetyDialog && !myPublicKey.isNullOrBlank() && user.publicKey.isNotBlank()) {
+        com.secure.messenger.presentation.ui.components.SafetyCodeDialog(
+            partnerName = user.displayName,
+            myPublicKey = myPublicKey,
+            theirPublicKey = user.publicKey,
+            onDismiss = { showSafetyDialog = false },
+        )
     }
 }
 
@@ -2978,6 +3373,35 @@ private fun ProfileInfoRow(
             )
         }
     }
+}
+
+/** Русское склонение для числительных: 1 раз, 2 раза, 5 раз. */
+private fun pluralRu(count: Int, one: String, few: String, many: String): String {
+    val mod10 = count % 10
+    val mod100 = count % 100
+    return when {
+        mod100 in 11..14 -> many
+        mod10 == 1 -> one
+        mod10 in 2..4 -> few
+        else -> many
+    }
+}
+
+/** Форматирует timestamp в человекочитаемую строку («25 апреля, 14:30»). */
+private fun formatTimestampRu(timestampMs: Long): String {
+    val months = listOf(
+        "января", "февраля", "марта", "апреля", "мая", "июня",
+        "июля", "августа", "сентября", "октября", "ноября", "декабря",
+    )
+    val cal = java.util.Calendar.getInstance().apply { timeInMillis = timestampMs }
+    val day = cal.get(java.util.Calendar.DAY_OF_MONTH)
+    val month = months[cal.get(java.util.Calendar.MONTH)]
+    val year = cal.get(java.util.Calendar.YEAR)
+    val hour = cal.get(java.util.Calendar.HOUR_OF_DAY)
+    val minute = cal.get(java.util.Calendar.MINUTE)
+    val nowYear = java.util.Calendar.getInstance().get(java.util.Calendar.YEAR)
+    val datePart = if (year == nowYear) "$day $month" else "$day $month $year"
+    return "%s, %02d:%02d".format(datePart, hour, minute)
 }
 
 // ── Обои чата: либо картинка из настроек, либо ничего (NONE) ────────────────

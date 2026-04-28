@@ -40,7 +40,6 @@ interface ChatDao {
         FROM chats c
         LEFT JOIN messages m ON m.id = (
             SELECT id FROM messages WHERE chatId = c.id
-            AND decryptedContent NOT IN ('[Не удалось расшифровать]', '[Групповые чаты не поддерживаются]')
             ORDER BY timestamp DESC LIMIT 1
         )
         LEFT JOIN users u ON u.id = c.otherUserId
@@ -48,6 +47,13 @@ interface ChatDao {
         ORDER BY c.isPinned DESC, c.updatedAt DESC
     """)
     fun observeAllWithLastMessage(): Flow<List<ChatWithLastMessage>>
+
+    /**
+     * Снимок всех видимых чатов — для фонового префетча сообщений.
+     * Не реактивный (не Flow): VM сам решает когда дёрнуть.
+     */
+    @Query("SELECT * FROM chats WHERE isHidden = 0 ORDER BY isPinned DESC, updatedAt DESC")
+    suspend fun getAllSync(): List<ChatEntity>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(chat: ChatEntity)
@@ -63,6 +69,15 @@ interface ChatDao {
 
     @Query("UPDATE chats SET unreadCount = unreadCount + 1, updatedAt = :timestamp WHERE id = :chatId")
     suspend fun incrementUnread(chatId: String, timestamp: Long)
+
+    /**
+     * Обновляет ТОЛЬКО updatedAt — нужно когда сам отправил сообщение
+     * (свой счётчик непрочитанных трогать нельзя, но чат должен подняться
+     * в списке наверх). Без этого собственное только что отправленное
+     * сообщение оставляло чат на старой позиции до следующего syncChats.
+     */
+    @Query("UPDATE chats SET updatedAt = :timestamp WHERE id = :chatId")
+    suspend fun touchUpdatedAt(chatId: String, timestamp: Long)
 
     @Query("UPDATE chats SET isPinned = :pinned WHERE id = :chatId")
     suspend fun setPinned(chatId: String, pinned: Boolean)

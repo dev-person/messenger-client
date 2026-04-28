@@ -1,6 +1,7 @@
 package com.secure.messenger.presentation.ui.calls
 
 import android.Manifest
+import android.os.Build
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -118,6 +119,9 @@ fun CallScreen(
     isIncoming: Boolean,      // true если экран открыт по входящему звонку
     onCallEnd: () -> Unit,
     viewModel: CallViewModel = hiltViewModel(),
+    /** true когда активность в Picture-in-Picture (свёрнута поверх других
+     *  приложений). В PiP убираем все контролы — оставляем только видео. */
+    isInPipMode: Boolean = false,
 ) {
     val uiState        by viewModel.uiState.collectAsStateWithLifecycle()
     val webRtcState    by viewModel.webRtcState.collectAsStateWithLifecycle()
@@ -140,6 +144,34 @@ fun CallScreen(
             // снова управляла мультимедиа.
             activity?.volumeControlStream =
                 previous ?: android.media.AudioManager.USE_DEFAULT_STREAM_TYPE
+        }
+    }
+
+    // Back-кнопка во время активного звонка не должна закрывать экран
+    // (звонок продолжается в фоне через CallService, но юзер теряет UI и
+    // не может вернуться). Вместо этого переводим Activity в PiP — окошко
+    // плавает поверх других приложений, тап возвращает в полный экран.
+    // Завершить звонок можно только красной кнопкой, как в Telegram.
+    //
+    // Включаем BackHandler если call активен или нет ещё (исходящий + connected).
+    // Для входящего В СОСТОЯНИИ RINGING оставляем дефолтный back — юзер должен
+    // мочь свернуть рингтон без принудительного PiP. После accept (CALLING/CONNECTED)
+    // BackHandler уже включён — у того кто принял звонок back тоже идёт в PiP.
+    val isRinging = uiState.call?.state == CallState.RINGING
+    androidx.activity.compose.BackHandler(enabled = !isRinging) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && activity != null) {
+            runCatching {
+                val params = android.app.PictureInPictureParams.Builder()
+                    .setAspectRatio(android.util.Rational(9, 16))
+                    .build()
+                activity.enterPictureInPictureMode(params)
+            }.onFailure {
+                // Если PiP не поддерживается на устройстве — fallback'ом
+                // отдаём управление дефолтному back, юзер выйдет на чат.
+                activity.moveTaskToBack(true)
+            }
+        } else {
+            activity?.moveTaskToBack(true)
         }
     }
 
@@ -207,7 +239,7 @@ fun CallScreen(
     }
 
     val isVideoCall = uiState.call?.type == CallType.VIDEO || isVideo
-    val isRinging   = uiState.call?.state == CallState.RINGING
+    // isRinging определён выше для BackHandler — здесь не дублируем.
     val isConnected = webRtcState == WebRtcCallState.CONNECTED
     // Имя собеседника: сначала загруженное из БД, потом плейсхолдер из nav-args
     val displayName = resolvedName.ifBlank { peerName.ifBlank { "..." } }
@@ -243,10 +275,29 @@ fun CallScreen(
         }
     }
 
+    // Видимость контролов (только для видео; в аудио кнопки нужны всегда —
+    // там почти нет фонового контента, скрывать нечего).
+    var controlsVisible by remember { mutableStateOf(true) }
+    // Автопоказ при изменении состояния (RINGING → CONNECTED и т.д.) —
+    // юзер должен видеть критичные кнопки в эти моменты.
+    LaunchedEffect(uiState.call?.state) { controlsVisible = true }
+    // В PiP контролы всегда скрыты; видео — наоборот, всегда видно.
+    val effectiveControlsVisible = controlsVisible && !isInPipMode
+
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(CallBackgroundGradient),
+            .background(CallBackgroundGradient)
+            // Тап по фону скрывает/показывает контролы — только для видео-звонка
+            // и только в активной фазе (после CONNECTED). На RINGING управление
+            // должно быть видимым всегда, чтобы юзер мог принять/отклонить.
+            .then(
+                if (isVideoCall && isConnected && !isInPipMode) {
+                    Modifier.pointerInput(Unit) {
+                        detectTapGestures(onTap = { controlsVisible = !controlsVisible })
+                    }
+                } else Modifier,
+            ),
     ) {
         // ── Видео собеседника на весь экран ──────────────────────────────────
         if (isVideoCall && remoteVideo != null) {
@@ -281,13 +332,28 @@ fun CallScreen(
         }
 
         // ── Локальное видео в углу (PiP) ─────────────────────────────────────
+        // В системном PiP-режиме окно само по себе крошечное — внутри него
+        // показывать ещё один уменьшенный «свой» поток бессмысленно (он
+        // практически не виден и съедает место собеседнику).
+        // Размещаем в правом НИЖНЕМ углу, как в Telegram/WhatsApp. Динамически
+        // меняем отступ снизу: когда controls видны — поднимаем preview выше
+        // них (≈260dp); когда controls скрыты тапом — опускаем к нижнему краю.
+        // Без этой логики preview ложился прямо на красную кнопку «Завершить».
+        // Высота нижней панели controls = ~56 (toggle row) + 24 (label под ней)
+        // + 12 padding-bottom + 12 inner padding = ~100dp. Поднимаем self-preview
+        // на 120dp чтобы был компактный зазор и при этом превью не закрывало
+        // controls. Когда controls скрыты тапом — preview опускается к низу.
+        val selfPreviewBottomPadding by androidx.compose.animation.core.animateDpAsState(
+            targetValue = if (effectiveControlsVisible && !isRinging) 120.dp else 24.dp,
+            label = "self-preview-bottom",
+        )
         AnimatedVisibility(
-            visible = isVideoCall && localVideo != null && uiState.isCameraOn,
+            visible = isVideoCall && localVideo != null && uiState.isCameraOn && !isInPipMode,
             enter = fadeIn(), exit = fadeOut(),
             modifier = Modifier
-                .align(Alignment.TopEnd)
-                .statusBarsPadding()
-                .padding(top = 8.dp, end = 16.dp)
+                .align(Alignment.BottomEnd)
+                .navigationBarsPadding()
+                .padding(bottom = selfPreviewBottomPadding, end = 16.dp)
                 .size(110.dp, 150.dp)
                 .clip(RoundedCornerShape(18.dp)),
         ) {
@@ -312,9 +378,15 @@ fun CallScreen(
         }
 
         // ── Шапка: аватар + имя + статус ─────────────────────────────────────
+        // Скрываем когда юзер тапнул для очистки картинки (видеозвонок),
+        // и в PiP-режиме (там вообще ничего поверх видео).
+        AnimatedVisibility(
+            visible = effectiveControlsVisible,
+            enter = fadeIn(), exit = fadeOut(),
+            modifier = Modifier.align(Alignment.TopCenter),
+        ) {
         Column(
             modifier = Modifier
-                .align(Alignment.TopCenter)
                 .statusBarsPadding()
                 .padding(top = 56.dp, start = 24.dp, end = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -368,7 +440,9 @@ fun CallScreen(
 
             Text(
                 text = when {
-                    isRinging                                   -> "Входящий звонок..."
+                    isRinging && isVideoCall                    -> "Входящий видеозвонок..."
+                    isRinging                                   -> "Входящий аудиозвонок..."
+                    webRtcState == WebRtcCallState.CALLING && isVideoCall      -> "Видеовызов..."
                     webRtcState == WebRtcCallState.CALLING      -> "Вызов..."
                     webRtcState == WebRtcCallState.CONNECTING   -> "Подключение..."
                     isConnected                                 -> formatCallDuration(elapsedSeconds)
@@ -380,8 +454,13 @@ fun CallScreen(
                 fontSize = 15.sp,
             )
         }
+        } // end AnimatedVisibility (header)
 
         // ── Управление ───────────────────────────────────────────────────────
+        // Контролы тоже скрываются вместе с шапкой по тапу. Но при RINGING
+        // показываем всегда — юзер должен мочь принять/отклонить, на это
+        // visibility-логика не распространяется.
+        val controlsForActiveCall = effectiveControlsVisible && !isRinging
         if (isRinging) {
             // Входящий звонок: отклонить / принять
             Row(
@@ -417,66 +496,62 @@ fun CallScreen(
         } else {
             // Активный звонок: медиа-контролы + завершение.
             // Контролы вынесены в «стеклянную» панель внизу.
-            Column(
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .navigationBarsPadding()
-                    .padding(bottom = 36.dp, start = 16.dp, end = 16.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
+            // Скрываем по тапу для видеозвонков, и в PiP вообще не рендерим.
+            AnimatedVisibility(
+                visible = controlsForActiveCall,
+                enter = fadeIn(), exit = fadeOut(),
+                modifier = Modifier.align(Alignment.BottomCenter),
             ) {
-                // Верхний ряд: переключатели (микрофон / камера / громкая)
-                Row(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(32.dp))
-                        .background(Color.White.copy(alpha = 0.10f))
-                        .padding(horizontal = 14.dp, vertical = 14.dp),
-                    horizontalArrangement = Arrangement.spacedBy(if (isVideoCall) 14.dp else 26.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
+            // Все контролы в один ряд — включая красную «завершить».
+            // Красная подсветка (неактивная иконка на красном фоне) сразу
+            // выделяет кнопку среди стеклянных тогглов.
+            Row(
+                modifier = Modifier
+                    .navigationBarsPadding()
+                    .padding(bottom = 12.dp, start = 16.dp, end = 16.dp)
+                    .clip(RoundedCornerShape(32.dp))
+                    .background(Color.White.copy(alpha = 0.10f))
+                    .padding(horizontal = 12.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(if (isVideoCall) 12.dp else 22.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                GlassToggleButton(
+                    icon = if (uiState.isMuted) Icons.Default.MicOff else Icons.Default.Mic,
+                    label = if (uiState.isMuted) "Без звука" else "Микрофон",
+                    active = uiState.isMuted,
+                    onClick = viewModel::toggleMute,
+                )
+                GlassToggleButton(
+                    icon = Icons.AutoMirrored.Filled.VolumeUp,
+                    label = "Динамик",
+                    active = uiState.isSpeakerOn,
+                    onClick = viewModel::toggleSpeaker,
+                )
+                if (isVideoCall) {
                     GlassToggleButton(
-                        icon = if (uiState.isMuted) Icons.Default.MicOff else Icons.Default.Mic,
-                        label = if (uiState.isMuted) "Без звука" else "Микрофон",
-                        active = uiState.isMuted,
-                        onClick = viewModel::toggleMute,
+                        icon = if (uiState.isCameraOn) Icons.Default.Videocam else Icons.Default.VideocamOff,
+                        label = if (uiState.isCameraOn) "Камера" else "Камера выкл",
+                        active = !uiState.isCameraOn,
+                        onClick = viewModel::toggleCamera,
                     )
                     GlassToggleButton(
-                        icon = Icons.AutoMirrored.Filled.VolumeUp,
-                        label = "Динамик",
-                        active = uiState.isSpeakerOn,
-                        onClick = viewModel::toggleSpeaker,
+                        icon = Icons.Default.Cameraswitch,
+                        label = "Перевернуть",
+                        active = false,
+                        onClick = viewModel::switchCamera,
                     )
-                    if (isVideoCall) {
-                        GlassToggleButton(
-                            icon = if (uiState.isCameraOn) Icons.Default.Videocam else Icons.Default.VideocamOff,
-                            label = if (uiState.isCameraOn) "Камера" else "Камера выкл",
-                            active = !uiState.isCameraOn,
-                            onClick = viewModel::toggleCamera,
-                        )
-                        GlassToggleButton(
-                            icon = Icons.Default.Cameraswitch,
-                            label = "Перевернуть",
-                            active = false,
-                            onClick = viewModel::switchCamera,
-                        )
-                    }
                 }
-
-                Spacer(modifier = Modifier.height(24.dp))
-
-                // Большая красная кнопка завершения
-                CallControlButton(
-                    icon = Icons.Default.CallEnd,
-                    label = "",
-                    background = Color(0xFFE53935),
-                    iconTint = Color.White,
-                    size = 72,
+                // Красная «Завершить» — в общем ряду справа. Чтобы выделять
+                // её среди стеклянных тогглов, рендерим как persistent-active
+                // через GlassToggleButton с красным background-overlay'ем.
+                EndCallToggleButton(
                     onClick = {
                         viewModel.hangUp()
                         safeCallEnd()
                     },
                 )
             }
+            } // end AnimatedVisibility (active controls)
         }
 
         // ── Чёрный оверлей при поднесении телефона к уху ──────────────────
@@ -636,7 +711,7 @@ private fun BlurredAvatarBackground(avatarUrl: String?, fallbackName: String) {
 
 /** Большая круглая кнопка (принять / отклонить / завершить). */
 @Composable
-private fun CallControlButton(
+internal fun CallControlButton(
     icon: ImageVector,
     label: String,
     background: Color,
@@ -677,7 +752,7 @@ private fun CallControlButton(
  * Когда [active] = true (например, mute включён) — заливка светлее.
  */
 @Composable
-private fun GlassToggleButton(
+internal fun GlassToggleButton(
     icon: ImageVector,
     label: String,
     active: Boolean,
@@ -705,6 +780,39 @@ private fun GlassToggleButton(
         Spacer(modifier = Modifier.height(6.dp))
         Text(
             text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = Color.White.copy(alpha = 0.85f),
+            fontSize = 11.sp,
+        )
+    }
+}
+
+/**
+ * «Завершить звонок» в виде той же кнопки-таблетки что и остальные controls,
+ * но с красной заливкой и иконкой положенной трубки. Чтобы кнопка выделялась
+ * визуально, фон сплошной красный (#E53935) — не зависит от mute/active state.
+ */
+@Composable
+private fun EndCallToggleButton(onClick: () -> Unit) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(
+            modifier = Modifier
+                .size(56.dp)
+                .clip(CircleShape)
+                .background(Color(0xFFE53935))
+                .clickable(onClick = onClick),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = Icons.Default.CallEnd,
+                contentDescription = "Завершить",
+                tint = Color.White,
+                modifier = Modifier.size(24.dp),
+            )
+        }
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            text = "Завершить",
             style = MaterialTheme.typography.labelSmall,
             color = Color.White.copy(alpha = 0.85f),
             fontSize = 11.sp,

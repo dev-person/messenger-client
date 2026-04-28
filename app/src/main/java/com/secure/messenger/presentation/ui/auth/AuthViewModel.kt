@@ -360,14 +360,17 @@ class AuthViewModel @Inject constructor(
 
             serverResult
                 .onSuccess {
-                    if (state.hasPassword) {
-                        // Новое устройство: скачиваем legacy-ключи и сохраняем
-                        // локально — они нужны для расшифровки сообщений, которые
-                        // были отправлены ДО установки пароля (тогда ключ был
-                        // случайным и не синхронизировался).
+                    val kdfVersion = if (state.hasPassword) {
+                        // Новое устройство: скачиваем legacy-ключи. Возвращаемая
+                        // версия указывает каким KDF (PBKDF2 v1 / Argon2id v2)
+                        // выводился identity-keypair на других устройствах —
+                        // должны использовать тот же, иначе keypair не сойдётся.
                         legacyKeyManager.downloadAndSaveLegacyKeys(state.fullPhone, password)
+                    } else {
+                        // Первичная установка пароля → всегда v2 (Argon2id).
+                        LegacyKeyManager.KdfVersion.V2_ARGON2ID
                     }
-                    generateKeyFromPassword(state.fullPhone, password)
+                    generateKeyFromPassword(state.fullPhone, password, kdfVersion)
                     onSuccess(!state.hasPassword)
                 }
                 .onFailure { e ->
@@ -471,8 +474,17 @@ class AuthViewModel @Inject constructor(
      * Генерирует детерминированную пару ключей X25519 из телефон+пароль
      * и загружает публичный ключ на сервер.
      */
-    private suspend fun generateKeyFromPassword(phone: String, password: String) {
-        val (publicKey, privateKey) = cryptoManager.deriveKeyPairFromPassword(phone, password)
+    private suspend fun generateKeyFromPassword(
+        phone: String,
+        password: String,
+        kdfVersion: LegacyKeyManager.KdfVersion,
+    ) {
+        // Identity-keypair выводится той же KDF, которой шифруется legacy-blob
+        // на сервере — иначе на разных устройствах одного юзера будут разные
+        // ключи и переписка перестанет расшифровываться.
+        val (publicKey, privateKey) = legacyKeyManager.deriveIdentityKeypair(
+            kdfVersion, phone, password,
+        )
         val publicKeyBase64 = Base64.encodeToString(publicKey, Base64.NO_WRAP)
         val privateKeyBase64 = Base64.encodeToString(privateKey, Base64.NO_WRAP)
         localKeyStore.saveKeyPair(publicKeyBase64, privateKeyBase64, fromPassword = true)

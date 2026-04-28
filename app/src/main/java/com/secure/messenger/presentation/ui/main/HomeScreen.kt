@@ -2,10 +2,15 @@ package com.secure.messenger.presentation.ui.main
 
 import android.app.Activity
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -152,29 +157,41 @@ fun HomeScreen(
                 .fillMaxSize()
                 .padding(padding),
         ) {
-            when (selectedTab) {
-                0 -> ChatListScreen(
-                    onChatClick = onChatClick,
-                    onNewChatClick = { selectedTab = 1 },
-                    onCreateGroupClick = onCreateGroupClick,
-                    onProfileClick = { selectedTab = 2 },
-                )
-                1 -> ContactsScreen(
-                    onBack = { selectedTab = 0 },
-                    onStartChat = onChatClick,
-                )
-                2 -> ProfileEditScreen(
-                    showBackButton = true,
-                    onBack = { selectedTab = 0 },
-                    onLogout = onLogout,
-                    onRequestCrop = { bmp, onResult ->
-                        cropRequest = CropRequest(bmp, onResult)
-                    },
-                )
-                3 -> SettingsScreen(
-                    onBack = { selectedTab = 0 },
-                    onOpenDiagnostics = onDiagnosticsClick,
-                )
+            // AnimatedContent: плавный crossfade между табами вместо мгновенной
+            // смены через when. Длительность 180мс — короткая, не мешает тапам,
+            // но даёт ощущение «живого» переключения как в нативных Material3 apps.
+            AnimatedContent(
+                targetState = selectedTab,
+                transitionSpec = {
+                    fadeIn(animationSpec = tween(180)) togetherWith
+                        fadeOut(animationSpec = tween(180))
+                },
+                label = "home-tab-switch",
+            ) { tab ->
+                when (tab) {
+                    0 -> ChatListScreen(
+                        onChatClick = onChatClick,
+                        onNewChatClick = { selectedTab = 1 },
+                        onCreateGroupClick = onCreateGroupClick,
+                        onProfileClick = { selectedTab = 2 },
+                    )
+                    1 -> ContactsScreen(
+                        onBack = { selectedTab = 0 },
+                        onStartChat = onChatClick,
+                    )
+                    2 -> ProfileEditScreen(
+                        showBackButton = true,
+                        onBack = { selectedTab = 0 },
+                        onLogout = onLogout,
+                        onRequestCrop = { bmp, onResult ->
+                            cropRequest = CropRequest(bmp, onResult)
+                        },
+                    )
+                    3 -> SettingsScreen(
+                        onBack = { selectedTab = 0 },
+                        onOpenDiagnostics = onDiagnosticsClick,
+                    )
+                }
             }
         }
     }

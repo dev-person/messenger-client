@@ -162,3 +162,35 @@ data class LeaveResponseDto(
     val newCreatorId: String? = null,
     val groupDeleted: Boolean = false,
 )
+
+// ── Групповые звонки (1.0.71+) ────────────────────────────────────────────────
+
+/** POST /chats/{chatId}/calls — старт группового звонка. */
+data class StartGroupCallDto(
+    val type: String, // AUDIO / VIDEO
+    /** Кого приглашать full-screen ringing'ом. null/пусто = вся группа. */
+    val inviteUserIds: List<String>? = null,
+)
+
+data class GroupCallParticipantDto(
+    val userId: String,
+    val joinedAt: String,
+    val leftAt: String? = null,
+)
+
+/**
+ * Ответ Start/Join/Leave/GetActive. Сервер возвращает null для GetActive если
+ * сейчас нет активного звонка в чате.
+ */
+data class GroupCallDto(
+    val id: String,
+    val chatId: String,
+    val startedBy: String,
+    val type: String,
+    val state: String,
+    val maxParticipants: Int,
+    val startedAt: String,
+    val endedAt: String? = null,
+    val createdAt: String,
+    val participants: List<GroupCallParticipantDto> = emptyList(),
+)

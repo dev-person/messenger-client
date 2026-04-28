@@ -5,7 +5,6 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.secure.messenger.domain.model.Chat
 import com.secure.messenger.domain.model.ChatRole
-import com.secure.messenger.domain.model.Contact
 import com.secure.messenger.domain.model.User
 import com.secure.messenger.domain.repository.AuthRepository
 import com.secure.messenger.domain.repository.ChatRepository
@@ -16,7 +15,6 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import timber.log.Timber
@@ -38,6 +36,11 @@ data class GroupInfoUiState(
  * в зависимости от своей роли.
  *
  * [chatId] передаётся через SavedStateHandle из нав-аргумента.
+ *
+ * Состав группы хранится в локальной БД (chat_members JOIN users) и читается
+ * реактивно — экран открывается мгновенно из кеша, а сетевой fetch обновляет
+ * данные «поверх» без визуального сброса. Раньше каждое открытие дёргало
+ * сеть и UI флешил спиннер «загрузка участников».
  */
 @HiltViewModel
 class GroupInfoViewModel @Inject constructor(
@@ -86,26 +89,55 @@ class GroupInfoViewModel @Inject constructor(
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     init {
-        refresh()
+        observeLocal()
+        refreshFromNetwork()
     }
 
-    fun refresh() {
+    /**
+     * Реактивно слушает локальную БД: chat (название, аватар, роль), members
+     * (с ролями и онлайн-статусом). UI получает данные мгновенно из кеша
+     * и обновляется live при WS-events (user_status, group_member_*, и т.п.).
+     */
+    private fun observeLocal() {
         viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isLoading = true)
             val myId = runCatching { authRepository.currentUser.first()?.id }
                 .getOrNull().orEmpty()
-            val chat = chatRepository.observeChats().first()
-                .firstOrNull { it.id == chatId }
-            val members = runCatching { chatRepository.getGroupMembers(chatId) }
-                .getOrDefault(emptyList())
-            _uiState.value = _uiState.value.copy(
-                isLoading = false,
-                chat = chat,
-                members = members,
-                myUserId = myId,
-            )
+            _uiState.value = _uiState.value.copy(myUserId = myId, isLoading = false)
+        }
+        viewModelScope.launch {
+            chatRepository.observeChats().collect { chats ->
+                val chat = chats.firstOrNull { it.id == chatId }
+                if (chat != _uiState.value.chat) {
+                    _uiState.value = _uiState.value.copy(chat = chat)
+                }
+            }
+        }
+        viewModelScope.launch {
+            chatRepository.observeGroupMembers(chatId).collect { members ->
+                if (members != _uiState.value.members) {
+                    _uiState.value = _uiState.value.copy(members = members)
+                }
+            }
         }
     }
+
+    /**
+     * Сетевой refresh актуального состава. Запускается при открытии экрана
+     * и после действий, меняющих состав (add/remove/transfer). Никаких
+     * UI-спиннеров не выставляет — данные уже видны из локального кеша,
+     * сеть просто перезатирает их «поверх» через chatMemberDao.
+     */
+    fun refreshFromNetwork() {
+        viewModelScope.launch {
+            runCatching { chatRepository.getGroupMembers(chatId) }
+                .onFailure { e ->
+                    Timber.w(e, "GroupInfoViewModel: refresh failed (offline?)")
+                }
+        }
+    }
+
+    /** Алиас для совместимости со старым именем — поведение то же. */
+    fun refresh() = refreshFromNetwork()
 
     fun updateAvatar(jpegBytes: ByteArray) {
         _uiState.value = _uiState.value.copy(isSaving = true)
@@ -142,8 +174,9 @@ class GroupInfoViewModel @Inject constructor(
         viewModelScope.launch {
             chatRepository.addGroupMember(chatId, userId)
                 .onSuccess {
+                    // addGroupMember сам пишет свежий состав в chat_members,
+                    // observeGroupMembers выдаст обновление автоматически.
                     _uiState.value = _uiState.value.copy(isSaving = false)
-                    refresh()
                 }
                 .onFailure { e -> reportError("Не удалось добавить: ${e.message}") }
         }
@@ -154,10 +187,9 @@ class GroupInfoViewModel @Inject constructor(
         viewModelScope.launch {
             chatRepository.removeGroupMember(chatId, userId)
                 .onSuccess {
-                    _uiState.value = _uiState.value.copy(
-                        isSaving = false,
-                        members = _uiState.value.members.filterNot { it.id == userId },
-                    )
+                    // removeGroupMember сам удаляет запись из chat_members
+                    // (плюс перезатирает свежим snapshot'ом).
+                    _uiState.value = _uiState.value.copy(isSaving = false)
                 }
                 .onFailure { e -> reportError("Не удалось исключить: ${e.message}") }
         }
@@ -169,13 +201,9 @@ class GroupInfoViewModel @Inject constructor(
         viewModelScope.launch {
             chatRepository.changeGroupRole(chatId, userId, role)
                 .onSuccess {
+                    // changeGroupRole оптимистично пишет новую роль в chat_members,
+                    // observeGroupMembers подхватит изменение.
                     _uiState.value = _uiState.value.copy(isSaving = false)
-                    // Обновляем локально — чтобы UI отреагировал сразу
-                    _uiState.value = _uiState.value.copy(
-                        members = _uiState.value.members.map {
-                            if (it.id == userId) it.copy(groupRole = role) else it
-                        },
-                    )
                 }
                 .onFailure { e -> reportError("Не удалось сменить роль: ${e.message}") }
         }
@@ -183,8 +211,9 @@ class GroupInfoViewModel @Inject constructor(
 
     /**
      * Передаёт роль CREATOR другому участнику. Только текущий CREATOR
-     * может вызвать; на сервере это перепроверяется. После успеха
-     * перезагружаем участников чтобы новые роли отобразились в UI.
+     * может вызвать; на сервере это перепроверяется. После успеха просим
+     * сервер свежий состав — сервер каскадом меняет роли (бывший creator
+     * становится admin'ом) и cacheChatMembers перезатрёт обе роли.
      */
     fun transferOwnership(userId: String) {
         _uiState.value = _uiState.value.copy(isSaving = true)
@@ -192,7 +221,7 @@ class GroupInfoViewModel @Inject constructor(
             chatRepository.transferGroupOwnership(chatId, userId)
                 .onSuccess {
                     _uiState.value = _uiState.value.copy(isSaving = false)
-                    refresh()
+                    refreshFromNetwork()
                 }
                 .onFailure { e -> reportError("Не удалось передать владельца: ${e.message}") }
         }
