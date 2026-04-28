@@ -88,11 +88,17 @@ interface MessengerApi {
     @GET("users/search")
     suspend fun searchUsers(@Query("q") query: String): ApiResponse<List<UserDto>>
 
+    // @JvmSuppressWildcards: Kotlin компилирует Map<String, List<String>>
+    // в Map<String, ? extends List<String>> из-за declaration-site variance,
+    // и Retrofit это отвергает с IllegalArgumentException ("Parameter type
+    // must not include a type variable or wildcard"). Аннотация заставляет
+    // компилятор оставить инвариантную сигнатуру, и Retrofit может построить
+    // RequestFactory.
     @POST("users/lookup-phones")
-    suspend fun lookupPhones(@Body body: Map<String, List<String>>): ApiResponse<List<UserDto>>
+    suspend fun lookupPhones(@Body body: @JvmSuppressWildcards Map<String, List<String>>): ApiResponse<List<UserDto>>
 
     @POST("users/lookup-hashes")
-    suspend fun lookupByHash(@Body body: Map<String, List<String>>): ApiResponse<List<UserDto>>
+    suspend fun lookupByHash(@Body body: @JvmSuppressWildcards Map<String, List<String>>): ApiResponse<List<UserDto>>
 
     // ── Contacts ──────────────────────────────────────────────────────────────
 
